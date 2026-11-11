@@ -3995,8 +3995,10 @@ xkit_install_body() {
   choose_certificate "$XKIT_HOST" "$HOST_KIND" || return 1
   XKIT_CRT="$FINAL_CRT"; XKIT_KEY="$FINAL_KEY"; XKIT_CERT_MODE="$CERT_MODE"
 
-  step "Установка панели 3X-UI (официальный инсталлятор, неинтерактивно)"
+  # (UX, проверка 7.4.0): вопрос о версиях задаём ДО заголовка шага — иначе
+  # «неинтерактивно» в заголовке выглядело противоречием с нашим промптом
   versions_installer_select || return 1
+  step "Установка панели 3X-UI (официальный инсталлятор, неинтерактивно)"
   install_3xui_auto || return 1
   # v7.2.4: reconcile продления — инсталлятор 3X-UI мог доставить пакетный
   # certbot; приводим автопродление к ровно одному пути (drop-in вместо
@@ -5209,6 +5211,44 @@ EOS
   reality_scan_choose "$out"
 }
 
+# (7.4.0, переустановка): состояние 3X-UI на ноде ДО установки — чтобы не
+# оставлять «куски» прежней попытки (отменили установку на полпути, панель
+# осталась, инсталлятор падал и т.п.). none — чистый сервер; panel — рабочая
+# панель; leftovers — остатки без рабочего бинарника/юнита.
+node_xui_detect() { # $1 rec -> stdout: none|panel|leftovers
+  local rec="$1" st
+  st="$(node_ssh "$rec" 'bash -s' <<'EOS' 2>/dev/null || true
+alive=0
+if [ -x /usr/local/x-ui/x-ui ] && /usr/local/x-ui/x-ui -v >/dev/null 2>&1; then alive=1; fi
+if [ "$alive" = 1 ]; then echo panel; exit 0; fi
+if [ -f /etc/systemd/system/x-ui.service ] || [ -d /usr/local/x-ui ] || [ -d /etc/x-ui ] || command -v x-ui >/dev/null 2>&1; then
+  echo leftovers
+else
+  echo none
+fi
+EOS
+)"
+  st="$(tail -n1 <<<"$st" 2>/dev/null | tr -d '[:space:]')"
+  case "$st" in panel|leftovers) printf '%s' "$st" ;; *) printf 'none' ;; esac
+}
+
+# Снос прежней установки 3X-UI на ноде. Прежняя БД (клиенты/настройки) уезжает
+# в /root/x-ui-backup-<ts>.tar.gz — переустановка не значит «потерять данные
+# молча»; после чистки нода в состоянии none.
+node_xui_purge() { # $1 rec -> 0/1
+  local rec="$1" ts; ts="$(date +%Y%m%d-%H%M%S)"
+  log "Снимаю прежнюю установку 3X-UI с ноды (старая БД -> /root/x-ui-backup-${ts}.tar.gz)..."
+  node_ssh "$rec" "bash -s" <<EOS || { err "Не удалось очистить ноду от прежней установки 3X-UI"; return 1; }
+systemctl stop x-ui >/dev/null 2>&1 || true
+systemctl disable x-ui >/dev/null 2>&1 || true
+if [ -d /etc/x-ui ]; then tar -czf /root/x-ui-backup-${ts}.tar.gz -C / etc/x-ui 2>/dev/null || true; chmod 600 /root/x-ui-backup-${ts}.tar.gz 2>/dev/null || true; fi
+rm -rf /usr/local/x-ui /etc/x-ui /usr/bin/x-ui /etc/systemd/system/x-ui.service
+systemctl daemon-reload >/dev/null 2>&1 || true
+echo PURGED
+EOS
+  ok "Прежняя установка 3X-UI удалена (бэкап старой БД: /root/x-ui-backup-${ts}.tar.gz)"
+}
+
 node_add() {
   require_root
   command -v ssh >/dev/null 2>&1 || apt-get install -y -qq openssh-client >/dev/null 2>&1
@@ -5290,18 +5330,48 @@ node_add() {
     | ssh-keygen -lf - 2>/dev/null | head -n1 | awk '{print $2, $4}')"
   [ -n "$fp" ] && ok "Ключ хоста ноды зафиксирован (TOFU; можно сверить с консолью провайдера): ${fp}"
 
-  # (з.6, аудит v5.2.1): официальный установщик на ноде тоже бежит от root —
-  # спрашиваем явно, если 3X-UI там ещё нет (XKIT_YES — для автоматизации)
-  if ! node_ssh "$rec" "command -v x-ui >/dev/null 2>&1" >/dev/null 2>&1; then
-    confirm "Скачать и запустить официальный установщик 3X-UI на ноде (от root)? [Y/n] " y \
-      || { warn "Установка 3X-UI на ноде отменена"; return 1; }
-  fi
-  log "Устанавливаю 3X-UI на ноду (если его нет)..."
+  # (7.4.0, переустановка + минимум вопросов): чистый сервер ставим БЕЗ вопроса
+  # (з.6 аудита v5.2.1 о root-установщике закрыт тем, что добавление ноды —
+  # это и есть установка; приглашение осталось в XKIT_YES-совместимом виде).
+  # Если на ноде уже панель или куски прежней попытки — спрашиваем, что делать.
+  local _xui_state _need_install=0 _ra
+  _xui_state="$(node_xui_detect "$rec")"
+  case "$_xui_state" in
+    none) _need_install=1 ;;
+    panel)
+      warn "На ноде ${nhost} уже установлена рабочая панель 3X-UI."
+      echo "  1) Подключить ноду к существующей панели (xkit задаст новые случайные реквизиты, инбаунды остаются)"
+      echo "  2) Снести и поставить заново (чистая установка; старая БД уедет в бэкап на ноде)"
+      read -r -p "Что делать? [1]: " _ra || { echo; return 1; }
+      _ra="${_ra:-1}"
+      if [ "$_ra" = "2" ]; then
+        node_xui_purge "$rec" || return 1
+        _need_install=1
+      else
+        ok "Использую существующую панель — реквизиты будут заменены на новые (случайные)"
+      fi ;;
+    leftovers)
+      warn "На ноде ${nhost} найдены куски прежней установки 3X-UI (рабочей панели нет)."
+      echo "  1) Очистить и поставить заново (рекомендуется)"
+      echo "  2) Отменить добавление ноды"
+      read -r -p "Что делать? [1]: " _ra || { echo; return 1; }
+      _ra="${_ra:-1}"
+      [ "$_ra" = "1" ] || { warn "Добавление ноды отменено — куски прежней установки не тронуты"; return 1; }
+      node_xui_purge "$rec" || return 1
+      _need_install=1 ;;
+  esac
+  if [ "$_need_install" = "1" ]; then
+  log "Устанавливаю 3X-UI на ноду (официальный установщик, от root)..."
   # K-02: тот же тег-релиз, что и на мастере; URL валидирован в xui_install_url
   local xuiu; xuiu="$(xui_install_url)"
   node_ssh "$rec" "XUI_URL='${xuiu}' bash -s" <<'EOS' || { err "Установка 3X-UI на ноде не удалась"; return 1; }
 export DEBIAN_FRONTEND=noninteractive
-command -v curl >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq curl sqlite3 >/dev/null 2>&1; }
+# (баг, найден при проверке установки ноды 7.4.0): sqlite3 ставился ТОЛЬКО вместе
+# с curl — если curl уже есть, а sqlite3 CLI нет (типичный Ubuntu 24.04), вставка
+# самоподписанного серта в x-ui.db молча пропускалась и панель оставалась на HTTP
+miss=""
+for b in curl sqlite3; do command -v "$b" >/dev/null 2>&1 || miss="$miss $b"; done
+[ -z "$miss" ] || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq $miss >/dev/null 2>&1; }
 if ! command -v x-ui >/dev/null 2>&1; then
   DL="$(mktemp)"
   curl -fsSL "${XUI_URL:?}" -o "$DL" \
@@ -5312,9 +5382,12 @@ if ! command -v x-ui >/dev/null 2>&1; then
 fi
 systemctl enable --now x-ui >/dev/null 2>&1 || true
 EOS
+  fi
 
   local np_user np_pass np_port
-  np_user="kit$(rand_hex 2)"
+  # (7.4.0): логин панели ноды — случайные 10 символов [a-z0-9]; раньше было
+  # «kit»+2 hex (256 вариантов и палевный префикс «kit»)
+  np_user="$(rand_str 10 | tr 'A-Z' 'a-z')"
   np_pass="$(rand_str 32)"
   np_port="$(shuf -i 20000-50000 -n 1)"
   log "Настраиваю панель ноды (случайный логин/пароль/порт)..."
@@ -5339,6 +5412,10 @@ if [ -s "$C" ] && [ -s "$K" ] && command -v sqlite3 >/dev/null 2>&1; then
       || sqlite3 /etc/x-ui/x-ui.db "INSERT OR REPLACE INTO settings (key,value) VALUES('$key','$val');" 2>/dev/null || true
   done
   systemctl restart x-ui
+else
+  # (баг 7.4.0): раньше этот пропуск был МОЛЧАЛИВЫМ — WARN про HTTP появлялся
+  # только позже, при логине, и выглядел загадочно
+  echo "WARN: сертификат панели не применён (нет openssl-файлов или sqlite3) — панель останется на HTTP"
 fi
 EOS
   sleep 3
@@ -5386,42 +5463,71 @@ EOS
     fi
   fi
 
-  local tport tp
-  if node_ssh "$rec" "ss -ltn 2>/dev/null | grep -q ':443 '" 2>/dev/null; then
-    warn "На ноде порт 443 занят — предлагаю 8443"
-    tport=8443
-  else
+  # (7.4.0, минимум вопросов): порт туннеля больше не спрашиваем — это
+  # внутренняя кухня каскада, туда ходит только мастер. Выбираем автоматически:
+  # случайный порт 20000-50000, проверка ss на ноде (до 8 попыток); всё занято —
+  # 443, если свободен; иначе отказ. С camo/nginx (порт 80) не конфликтует.
+  local tport="" _cand _try
+  for _try in 1 2 3 4 5 6 7 8; do
+    _cand="$(shuf -i 20000-50000 -n 1)"
+    if node_ssh "$rec" "ss -ltn 2>/dev/null | grep -q ':${_cand} '" 2>/dev/null; then
+      continue
+    fi
+    tport="$_cand"; break
+  done
+  if [ -z "$tport" ]; then
+    if node_ssh "$rec" "ss -ltn 2>/dev/null | grep -q ':443 '" 2>/dev/null; then
+      err "Не нашёл свободного порта для туннеля на ноде — повторите добавление ноды"
+      return 1
+    fi
     tport=443
   fi
-  # (з.9, аудит v5.2.1): EOF/Ctrl-D отменяет ввод, как у соседних полей, а не молча ставит дефолт
-  read -r -p "Порт туннеля на ноде [${tport}]: " tp || { echo; return 1; }; tp="${tp:-$tport}"; is_port "$tp" || { err "Порт"; return 1; }
+  ok "Порт туннеля на ноде: ${tport} (выбран автоматически, случайный — туда ходит только мастер)"
 
-  echo "Dest (прикрытие) для Reality на ноде:"
-  echo "  1) 1.1.1.1 (быстро и надёжно)   2) известный список   3) СКАН С САМОЙ НОДЫ"
+  # (7.4.0, минимум вопросов): Dest (прикрытие) Reality на ноде больше не
+  # спрашиваем — это внутренняя кухня каскада, а не пользовательский выбор.
+  # Автоматически: как на мастере (единая маскировка кластера), иначе 1.1.1.1.
+  # Полное ручное меню остаётся для особых случаев: XKIT_NODE_DEST_MENU=1.
   local mdest msni
   mdest="$(jq -r '[.[]|select(.streamSettings|fromjson?|.security? == "reality")][0].streamSettings|fromjson?|.realitySettings.dest // ""' <<<"${INBOUNDS:-[]}" 2>/dev/null)"
   msni="$(jq -r '[.[]|select(.streamSettings|fromjson?|.security? == "reality")][0].streamSettings|fromjson?|.realitySettings.serverNames[0] // ""' <<<"${INBOUNDS:-[]}" 2>/dev/null)"
-  if [ -n "$mdest" ] && [ -n "$msni" ]; then
-    echo "  4) как на мастере (${mdest}, SNI ${msni})"
+  local ndest="" nsni="" RDEST="" RSNI="" dc=""
+  if [ "${XKIT_NODE_DEST_MENU:-0}" = "1" ]; then
+    echo "Dest (прикрытие) для Reality на ноде:"
+    echo "  1) 1.1.1.1 (быстро и надёжно)   2) известный список   3) СКАН С САМОЙ НОДЫ"
+    if [ -n "$mdest" ] && [ -n "$msni" ]; then
+      echo "  4) как на мастере (${mdest}, SNI ${msni})"
+    else
+      echo "  4) как на мастере (на мастере Reality-инбаунд не найден — недоступно)"
+    fi
+    echo "  5) вручную"
+    read -r -p "Выбор [1]: " dc; dc="${dc:-1}"
+    case "$dc" in
+      2) reality_known_pick || return 1; ndest="$RDEST"; nsni="$RSNI" ;;
+      3) node_reality_scan_pick "$rec" || return 1; ndest="$RDEST"; nsni="$RSNI" ;;
+      4) [ -n "$mdest" ] && [ -n "$msni" ] || { err "На мастере нет Reality — выберите другой вариант"; return 1; }
+         ndest="$mdest"; nsni="$msni" ;;
+      5)
+        local dh dp
+        dh="$(read_host "dest -> ")"
+        read -r -p "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
+        nsni="$(read_host "SNI -> ")"
+        ndest="${dh}:${dp}" ;;
+      *) ndest="1.1.1.1:443"; nsni="cloudflare-dns.com" ;;
+    esac
+  elif [ -n "${XKIT_NODE_DEST:-}" ]; then
+    # точечный override окружением: XKIT_NODE_DEST=host:port [XKIT_NODE_SNI=...]
+    ndest="$XKIT_NODE_DEST"; nsni="${XKIT_NODE_SNI:-}"
+    [[ "$ndest" == *:* ]] || ndest="${ndest}:443"
+    [ -n "$nsni" ] || nsni="${ndest%%:*}"
+    ok "Dest задан окружением: ${ndest} (SNI ${nsni})"
+  elif [ -n "$mdest" ] && [ -n "$msni" ]; then
+    ndest="$mdest"; nsni="$msni"
+    ok "Dest Reality на ноде: как на мастере — ${ndest} (SNI ${nsni}) — единая маскировка кластера"
   else
-    echo "  4) как на мастере (на мастере Reality-инбаунд не найден — недоступно)"
+    ndest="1.1.1.1:443"; nsni="cloudflare-dns.com"
+    ok "Dest Reality на ноде: ${ndest} (SNI ${nsni}) — на мастере Reality-прикрытие не найдено, беру надёжный дефолт"
   fi
-  echo "  5) вручную"
-  read -r -p "Выбор [1]: " dc; dc="${dc:-1}"
-  local ndest="" nsni="" RDEST="" RSNI=""
-  case "$dc" in
-    2) reality_known_pick || return 1; ndest="$RDEST"; nsni="$RSNI" ;;
-    3) node_reality_scan_pick "$rec" || return 1; ndest="$RDEST"; nsni="$RSNI" ;;
-    4) [ -n "$mdest" ] && [ -n "$msni" ] || { err "На мастере нет Reality — выберите другой вариант"; return 1; }
-       ndest="$mdest"; nsni="$msni" ;;
-    5)
-      local dh dp
-      dh="$(read_host "dest -> ")"
-      read -r -p "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
-      nsni="$(read_host "SNI -> ")"
-      ndest="${dh}:${dp}" ;;
-    *) ndest="1.1.1.1:443"; nsni="cloudflare-dns.com" ;;
-  esac
 
   log "Генерирую ключи Reality для ноды..."
   local priv pub tuuid tsid
@@ -5533,17 +5639,45 @@ EOS
     warn "Панель ноды: ${psch}://${nhost}:${np_port}${nbase} (UFW не управляется XKIT)"
   fi
   ok "Стратегия: ${XKIT_BAL_STRATEGY:-roundRobin} (сменить: Ноды -> стратегия)"
+  # (7.4.0): реквизиты панели ноды показываем в конце установки — пользователь
+  # должен видеть логин/пароль один раз глазами, не выковыривая их из реестра
+  echo ""
+  echo "Реквизиты панели ноды (сохранены в реестре /etc/xkit/nodes.json, 0600):"
+  echo "  URL:    ${psch}://${nhost}:${np_port}${nbase}"
+  echo "  Логин:  ${np_user}"
+  echo "  Пароль: ${np_pass}"
+  warn "Логин/пароль случайные — если развернёте camo-сьют, в браузере будет ФЕЙК-логин сайт-прикрытия, а настоящий — этот."
   xkit_summary_save >/dev/null 2>&1 || true
   # v7.3: сразу предложить серт/camo для панели ноды (пропуск = самоподписанный
   # серт из шага установки; вернуться позже: НОДЫ -> 9/10 или xkit nodes cert|camo)
+  # (7.4.0, минимум вопросов): предлагаем ТОЛЬКО релевантные варианты — по типу
+  # адреса ноды. IP: самоподписанный (уже стоит) или LE shortlived на IP (~6.5
+  # дней, автопродление). Домен: LE на домен, свой сертификат (файлы),
+  # subdomain+wildcard (dns-01 Cloudflare) или самоподписанный.
   if [ -t 0 ]; then
     local _cm=""
     echo ""
-    read -r -p "Сертификат панели ноды сейчас? self/ip/domain/wildcard (Enter — пропустить): " _cm || _cm=""
-    case "${_cm,,}" in
-      self|ip|domain|wildcard) node_cert_one "$nname" "${_cm,,}" "" || true ;;
-      *) ok "Панель ноды остаётся на самоподписанном серте (xkit nodes cert ${nname} — когда понадобится)" ;;
-    esac
+    if is_ip "$nhost"; then
+      read -r -p "Сертификат панели ноды: Enter = самоподписанный (уже стоит) | ip = Let's Encrypt на IP (~6.5 дней, автопродление): " _cm || _cm=""
+      case "${_cm,,}" in
+        ip|le|letsencrypt) node_cert_one "$nname" ip "" || true ;;
+        *) ok "Панель ноды остаётся на самоподписанном серте (xkit nodes cert ${nname} ip — когда понадобится)" ;;
+      esac
+    else
+      echo "Сертификат панели ноды (${nhost}):"
+      echo "  1) Let's Encrypt на домен — поддомен с A-записью на ${nhost} (автопродление на ноде) [Enter]"
+      echo "  2) свой сертификат — пути к fullchain/privkey на этом сервере"
+      echo "  3) subdomain+wildcard — база + *.база, dns-01 через Cloudflare (открывает vhost api./dev./login. camo)"
+      echo "  4) самоподписанный (уже стоит — пропустить)"
+      read -r -p "Выбор [1]: " _cm || _cm=""
+      case "${_cm:-1}" in
+        1|le|domain|letsencrypt) node_cert_one "$nname" domain "" || true ;;
+        2|own) node_cert_one "$nname" own "" || true ;;
+        3|wildcard|w) node_cert_one "$nname" wildcard "" || true ;;
+        4|self) ok "Панель ноды остаётся на самоподписанном серте" ;;
+        *) ok "Панель ноды остаётся на самоподписанном серте (xkit nodes cert ${nname} — когда понадобится)" ;;
+      esac
+    fi
     local _cy=""
     # (стиль v7.1): [y/N]-промпты только через confirm() (typed-guard, EOF = отказ)
     if confirm "Развернуть camo-сьют на ноде (сайт-прикрытие + фейк-логин)? [y/N] " _cy; then
@@ -6212,7 +6346,9 @@ expiry_cli_del() { # expiry del <master|имя ноды>
 
 dash_path() { printf '/d-%s/' "${XKIT_DASH_TOKEN:-CHANGE_ME}"; }
 
-dash_user_gen() { printf 'dash%s' "$(rand_hex 2)"; }
+# (7.4.0): логин дашборда — полностью случайный, без палевного префикса «dash»
+# и без 256-вариантного rand_hex 2: 10 символов [a-z0-9] (~57 бит)
+dash_user_gen() { rand_str 10 | tr 'A-Z' 'a-z'; }
 
 # htpasswd для Basic Auth дашборда (apr1-хэш — понимается nginx'ом)
 dash_htpasswd_write() { # из XKIT_DASH_USER / XKIT_DASH_PASS
@@ -9111,6 +9247,14 @@ version_probes() { # expected-xray expected-xui
   return 0
 }
 
+# (7.4.0) Список релизов официального репозитория 3x-ui (GitHub API без токена;
+# лимит 60 запросов/час на IP — при отказе остаётся ручной ввод тега).
+xui_releases_list() { # [$1 = сколько тегов, по умолчанию 10] -> stdout: теги
+  local n="${1:-10}"
+  curl -fsSL --max-time 15 "https://api.github.com/repos/MHSanaei/3x-ui/releases?per_page=${n}" 2>/dev/null \
+    | jq -r '.[].tag_name' 2>/dev/null | grep -E '^v[0-9]+(\.[0-9]+)+$' | head -n "$n"
+}
+
 versions_installer_select() {
   # Неинтерактивно: XKIT_3XUI_TAG=vX.Y.Z и XKIT_XRAY_VERSION=A.B.C.
   # Для выбранной вручную версии 3X-UI обязателен SHA-256 её install.sh.
@@ -9119,24 +9263,61 @@ versions_installer_select() {
     return 0
   fi
   [ -t 0 ] || return 0
-  local a u x
-  echo "Версии: Enter = стандартная установка; v = выбрать связку из манифеста"
+  local a u x rel
+  echo "Версии 3X-UI/Xray:"
+  echo "  1) свежий релиз официального репозитория (3x-ui latest + его Xray) [Enter]"
+  echo "  2) выбрать релиз из официального репозитория (последние GitHub releases)"
+  echo "  3) проверенная связка из манифеста xkit (3X-UI + Xray)"
   read -r -p "Ваш выбор: " a || return 0
-  [ "$a" = "v" ] || [ "$a" = "V" ] || return 0
-  versions_list || return 1
-  read -r -p "Версия 3X-UI: " u || return 1
-  read -r -p "Версия Xray (Enter = не менять): " x || return 1
-  u="$(version_norm "$u")" || return 1
-  XKIT_3XUI_TAG="v$u"
-  if [ -n "$x" ]; then
-    XKIT_XRAY_VERSION="$(version_norm "$x")" || return 1; XKIT_CORE_PIN="$XKIT_XRAY_VERSION"
-    [ "$(version_pair_status "$u" "$XKIT_XRAY_VERSION")" != unlisted ] || { err "Связка отсутствует в манифесте — используйте её после тестирования через versions install --allow-unlisted"; return 1; }
-  fi
-  # v7.2.2 (UX): пин SHA-256 больше не тупик для интерактивного выбора —
-  # на шаге установки он будет вычислен, показан и потребует подтверждения.
-  # Закрепить сразу: XKIT_XUI_SHA256=<64 hex> (актуальное значение — check-upstream.sh).
-  [ -n "${XKIT_XUI_SHA256:-}" ] || \
-    log "SHA-256 install.sh ${XKIT_3XUI_TAG} не закреплён — на шаге установки будет показан и потребует подтверждения"
+  a="${a:-1}"
+  case "$a" in
+    1) return 0 ;;
+    2)
+      # (7.4.0): «странный вариант v из манифеста» заменён явным выбором релиза
+      # из официального репозитория: теги берутся LIVE у MHSanaei/3x-ui, SHA-256
+      # install.sh выбранного тега на шаге установки показывается и требует
+      # подтверждения (v7.2.2) — пин XKIT_XUI_SHA256 по-прежнему можно задать сразу.
+      log "Запрашиваю релизы официального репозитория MHSanaei/3x-ui..."
+      rel="$(xui_releases_list 10)"
+      if [ -n "$rel" ]; then
+        echo "Официальные релизы (новые сверху):"
+        local i=1 t
+        while IFS= read -r t; do printf '  %2d) %s\n' "$i" "$t"; i=$((i+1)); done <<<"$rel"
+        read -r -p "Номер из списка или тег (Enter = последний): " u || return 1
+        u="${u:-$(head -n1 <<<"$rel")}"
+      else
+        warn "Список релизов недоступен (GitHub API лимит/сеть) — введите тег вручную"
+        read -r -p "Тег релиза (например v2.4.0): " u || return 1
+      fi
+      if [[ "$u" =~ ^[0-9]+$ ]]; then
+        u="$(sed -n "${u}p" <<<"$rel" | tr -d '[:space:]')"
+        [ -n "$u" ] || { err "Нет такого номера в списке"; return 1; }
+      fi
+      u="${u#v}"
+      u="$(version_norm "$u")" || { err "'$u' не похож на тег релиза (пример: v2.4.0)"; return 1; }
+      XKIT_3XUI_TAG="v$u"
+      ok "Выбран релиз официального репозитория: ${XKIT_3XUI_TAG} (Xray — тот, что бандлит его install.sh)"
+      [ -n "${XKIT_XUI_SHA256:-}" ] || \
+        log "SHA-256 install.sh ${XKIT_3XUI_TAG} не закреплён — на шаге установки будет показан и потребует подтверждения"
+      ;;
+    3)
+      versions_list || return 1
+      read -r -p "Версия 3X-UI: " u || return 1
+      read -r -p "Версия Xray (Enter = не менять): " x || return 1
+      u="$(version_norm "$u")" || return 1
+      XKIT_3XUI_TAG="v$u"
+      if [ -n "$x" ]; then
+        XKIT_XRAY_VERSION="$(version_norm "$x")" || return 1; XKIT_CORE_PIN="$XKIT_XRAY_VERSION"
+        [ "$(version_pair_status "$u" "$XKIT_XRAY_VERSION")" != unlisted ] || { err "Связка отсутствует в манифесте — используйте её после тестирования через versions install --allow-unlisted"; return 1; }
+      fi
+      # v7.2.2 (UX): пин SHA-256 больше не тупик для интерактивного выбора —
+      # на шаге установки он будет вычислен, показан и потребует подтверждения.
+      # Закрепить сразу: XKIT_XUI_SHA256=<64 hex> (актуальное значение — check-upstream.sh).
+      [ -n "${XKIT_XUI_SHA256:-}" ] || \
+        log "SHA-256 install.sh ${XKIT_3XUI_TAG} не закреплён — на шаге установки будет показан и потребует подтверждения"
+      ;;
+    *) return 0 ;;
+  esac
 }
 versions_list() {
   local m; m="$(versions_manifest)" || return 1
@@ -10665,6 +10846,40 @@ EOF
   return 0
 }
 
+# (7.4.0, режим own): доставка СВОЕГО сертификата (купленного/выпущенного
+# вне xkit) с мастера на ноду: base64 каждого файла через stdin node_ssh
+# (V-03) + sha256-сверка с обеих сторон до применения; продолжение пути
+# node_cert_push_to_node — sqlite webCertFile/webCertKey + restart x-ui.
+node_cert_push_files() { # $1 rec, $2 fullchain.pem, $3 privkey.pem -> 0/1
+  local rec="$1" cf="$2" kf="$3" b64c b64k h_chain h_key
+  [ -s "$cf" ] && [ -s "$kf" ] || { err "Нет файлов: $cf / $kf"; return 1; }
+  b64c="$(base64 -w0 "$cf")" || return 1
+  b64k="$(base64 -w0 "$kf")" || return 1
+  h_chain="$(sha256sum "$cf" | awk '{print $1}')"
+  h_key="$(sha256sum "$kf" | awk '{print $1}')"
+  log "Доставка своего сертификата на ноду (stdin, sha256-сверка)..."
+  node_ssh "$rec" 'bash -s' <<EOF || { err "Нода не применила сертификат"; return 1; }
+set -e
+d="\$(mktemp -d /tmp/.xkit-cert.XXXXXX)"
+printf '%s' '$b64c' | base64 -d > "\$d/fullchain.pem"
+printf '%s' '$b64k' | base64 -d > "\$d/privkey.pem"
+[ "\$(sha256sum "\$d/fullchain.pem" | awk '{print \$1}')" = '$h_chain' ] || { echo 'ERR: fullchain sha256 не сошёлся'; rm -rf "\$d"; exit 1; }
+[ "\$(sha256sum "\$d/privkey.pem" | awk '{print \$1}')" = '$h_key' ] || { echo 'ERR: privkey sha256 не сошёлся'; rm -rf "\$d"; exit 1; }
+install -m 644 "\$d/fullchain.pem" /etc/x-ui/panel-cert.pem
+install -m 600 "\$d/privkey.pem" /etc/x-ui/panel-key.pem
+rm -rf "\$d"
+if command -v sqlite3 >/dev/null 2>&1; then
+  for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
+    key="\${kv%%|*}"; val="\${kv#*|}"
+    sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null || true
+  done
+fi
+systemctl restart x-ui
+echo OK-OWN-CERT
+EOF
+  return 0
+}
+
 # Выпуск НА НОДЕ (режимы ip/domain/self): сертификат рождается на ноде и остаётся
 # там; webCertFile панели смотрит прямо в live/ или /etc/x-ui/. Продление — таймер
 # certbot на самой ноде (venv, дважды в сутки — для shortlived IP это обязательно).
@@ -10804,6 +11019,7 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
     echo "  3) domain           — отдельный домен, A -> IP ноды (http-01, продление на ноде)"
     echo "  4) subdomain+wildcard — база + *.база, выпускает мастер по dns-01 (Cloudflare),"
     echo "                        раздаётся ноде; открывает vhost api./dev./login. (camo-сьют)"
+    echo "  5) own              — свой сертификат: пути к fullchain/privkey на этом сервере"
     read -r -p "Режим [1]: " mode || return 1
     mode="${mode:-1}"
     case "$mode" in
@@ -10811,6 +11027,7 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       2|ip) mode="ip" ;;
       3|domain) mode="domain" ;;
       4|wildcard|w) mode="wildcard" ;;
+      5|own) mode="own" ;;
       *) err "Нет такого режима"; return 1 ;;
     esac
   fi
@@ -10854,7 +11071,28 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       node_cert_timer_install || true
       warn "Wildcard: только dns-01; * покрывает ровно один уровень (api.$d — да, x.api.$d — нет)"
       ;;
-    *) err "Режим '$mode' не знаю (self|ip|domain|wildcard)"; return 1 ;;
+    own)
+      # (7.4.0): свой сертификат — купленный/выпущенный вне xkit. Файлы лежат
+      # на МАСТЕРЕ (куда пользователь их и положил); проверяем соответствие
+      # пары (pubkey серта == pubkey ключа), доставляем на ноду с sha256-сверкой.
+      local cf kf
+      read -r -p "Путь к сертификату (fullchain.pem) на этом сервере: " cf || return 1
+      [ -s "$cf" ] || { err "Файл не найден или пуст: $cf"; return 1; }
+      read -r -p "Путь к приватному ключу (privkey.pem): " kf || return 1
+      [ -s "$kf" ] || { err "Файл не найден или пуст: $kf"; return 1; }
+      openssl x509 -in "$cf" -noout >/dev/null 2>&1 || { err "$cf — это не сертификат X.509"; return 1; }
+      local cm km
+      cm="$(openssl x509 -in "$cf" -noout -pubkey 2>/dev/null | sha256sum | awk '{print $1}')"
+      km="$(openssl pkey -in "$kf" -pubout 2>/dev/null | sha256sum | awk '{print $1}')"
+      [ -n "$cm" ] && [ -n "$km" ] && [ "$cm" = "$km" ] || { err "Сертификат и ключ не подходят друг другу (pubkey не совпал)"; return 1; }
+      local kfperm; kfperm="$(stat -Lc '%a' "$kf" 2>/dev/null)"
+      [ "$kfperm" = "600" ] || [ "$kfperm" = "400" ] || warn "Ключ $kf доступен не только владельцу (${kfperm}) — рекомендую chmod 600"
+      certdomain="$(openssl x509 -in "$cf" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/.*commonName *= *//p' | head -n1 | tr -d ' ')"
+      node_cert_push_files "$rec" "$cf" "$kf" || return 1
+      lineage="-"; renew="none"
+      ok "Свой сертификат доставлен и применён панелью ноды; продление — на вашей стороне (обновить: xkit nodes cert $nname own)"
+      ;;
+    *) err "Режим '$mode' не знаю (self|ip|domain|wildcard|own)"; return 1 ;;
   esac
   node_cert_reg_set "$nname" --argjson c "$(jq -nc --arg m "$mode" --arg d "$certdomain" --arg l "$lineage" --arg r "$renew" \
       '{mode:$m, domain:$d, lineage:$l, renew:$r}')" \
@@ -10884,7 +11122,7 @@ node_cert_dispatch() { # $1 sub, $2...
   load_xkit_env || die "Сначала установка (пункт 1)"
   local sub="${1:-}"
   case "$sub" in
-    "") die "nodes cert: <имя|all> [self|ip|domain|wildcard] [домен]" ;;
+    "") die "nodes cert: <имя|all> [self|ip|domain|wildcard|own] [домен]" ;;
     show) node_cert_show "${2:-all}" ;;
     renew)
       if [ "${2:-}" = "--cron" ]; then node_cert_renew_cron; return $?; fi
@@ -10904,7 +11142,7 @@ node_cert_dispatch() { # $1 sub, $2...
       fi
       node_cert_renew_cron || rc=1
       return $rc ;;
-    -h|--help|help) die "nodes cert <имя|all> [self|ip|domain|wildcard] [домен] | nodes cert show | nodes cert-renew" ;;
+    -h|--help|help) die "nodes cert <имя|all> [self|ip|domain|wildcard|own] [домен] | nodes cert show | nodes cert-renew" ;;
     all)
       local arr; arr="$(nodes_load)"
       [ "$(jq 'length' <<<"$arr")" -gt 0 ] || { warn "Нод нет"; return 0; }
