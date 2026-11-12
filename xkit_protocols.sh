@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v7.4.0 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v7.4.1 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -213,9 +213,21 @@ proto_hy2_download() { # $1 destination
   base="$(jq -r --arg n "$asset" '.assets[]|select(.name==$n)|.browser_download_url' "$meta" | head -n1)"
   [ -n "$tag" ] && [ -n "$base" ] || { rm -f "$meta"; err "Не найден официальный бинарник $asset"; return 1; }
   sums="$(mktemp /tmp/.xkit-hy2-sums.XXXXXX)" || { rm -f "$meta"; return 1; }
-  curl -fsSL "${base%/*}/hashes.txt" -o "$sums" || { rm -f "$meta" "$sums"; return 1; }
-  want="$(awk -v n="$asset" '$2==n || $2=="*"n {print $1;exit}' "$sums")"
-  [ -n "$want" ] || { rm -f "$meta" "$sums"; err "В hashes.txt нет $asset — установка отменена"; return 1; }
+  # v7.4.1: в hashes.txt пути с префиксом «build/» (build/hysteria-linux-amd64) —
+  # сверяем по базовому имени; раньше точное совпадение $2==asset не находило
+  # строку и установка всегда падала («В hashes.txt нет hysteria-linux-amd64»).
+  # Если hashes.txt недоступен/без нужного файла — .digest из GitHub API
+  # (sha256:<hex>, есть у всех ассетов релиза).
+  want=""
+  if curl -fsSL --max-time 30 "${base%/*}/hashes.txt" -o "$sums"; then
+    want="$(awk -v n="$asset" '$2==n || $2=="*"n || $2 ~ ("/" n "$") {print $1;exit}' "$sums")"
+  else
+    warn "hashes.txt релиза недоступен — SHA-256 сверю по метаданным GitHub API"
+  fi
+  if [ -z "$want" ]; then
+    want="$(jq -r --arg n "$asset" '.assets[]?|select(.name==$n)|(.digest // "")|sub("^sha256:";"")' "$meta" 2>/dev/null | head -n1)"
+  fi
+  [ -n "$want" ] || { rm -f "$meta" "$sums"; err "Не удалось получить SHA-256 для $asset — установка отменена"; return 1; }
   curl -fsSL "$base" -o "$1" || { rm -f "$meta" "$sums"; return 1; }
   got="$(sha256sum "$1" | awk '{print $1}')"
   rm -f "$meta" "$sums"

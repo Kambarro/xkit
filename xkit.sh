@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.0 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.1 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.0"
+XKIT_VERSION="7.4.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -1717,6 +1717,40 @@ api_auth_args() {
   return 0
 }
 
+# v7.4.1: человекочитаемое сообщение об ошибке API. 3X-UI v3.11 отклоняет POST
+# на уровне middleware ПУСТЫМ телом (403 CSRF-middleware для сессии, 401 для
+# неверного bearer), а jq считает пустую строку в .msg «истиной» — раньше
+# ошибка печаталась как «add inbound: » без единой подсказки. Теперь видно,
+# что именно случилось (см. живой лог 7.4.0: «[ERR ] add inbound: »).
+api_err_msg() { # $1 тело ответа панели (может быть пустым или не-JSON)
+  local r="${1:-}"
+  if [ -z "$r" ]; then
+    printf 'пустой ответ панели — POST отклонён middleware (401: неверный API-токен, 403: CSRF-сессия); запрос повторён с обновлённой аутентификацией'
+  elif jq -e 'type=="object"' <<<"$r" >/dev/null 2>&1; then
+    jq -r 'if .success == true then "ok" elif (.msg // "") == "" then "отклонено панелью без пояснения (msg пуст)" else .msg end' <<<"$r" 2>/dev/null | head -c 300
+  else
+    printf 'не-JSON ответ панели: %s' "$(printf '%s' "$r" | tr '\n' ' ' | tr -s ' ' | head -c 150)"
+  fi
+}
+
+# v7.4.1: восстановление аутентификации панели после пустого/не-JSON ответа на
+# POST. Сначала обновляем CSRF-токен текущей сессии (истёк/сброшен панелью);
+# если сессии нет или она мертва — полный kit_login (креды из install-result.env).
+# Истина = можно повторить запрос. Bearer-путь не трогаем: при невалидном токене
+# kit_login создаёт cookie-сессию, и POST уходит уже через неё.
+_api_auth_recover() {
+  if [ -n "${COOKIE_JAR:-}" ] && [ -f "${COOKIE_JAR:-}" ]; then
+    csrf_fetch
+    # v7.4.1: только warn (stderr): функция вызывается внутри $(...) — log/ok
+    # (stdout) засорили бы ответ панели
+    [ -n "${CSRF_TOKEN:-}" ] && { warn "CSRF-токен обновлён — повторяю запрос..."; return 0; }
+  fi
+  [ -n "${PANEL_USER:-}" ] && [ -n "${PANEL_PASS:-}" ] || return 1
+  kit_login >/dev/null 2>&1 || return 1
+  [ -n "${CSRF_TOKEN:-}" ] && { warn "Сессия панели восстановлена — повторяю запрос..."; return 0; }
+  return 1
+}
+
 # проверка токена живой панелью: /panel/api/openapi.json с валидным Bearer =
 # HTTP 200 (невалидный токен -> 401, без авторизации -> 404). Токены появились
 # в 3x-ui v3.11 — 200 заодно подтверждает поколение API v3.
@@ -1802,26 +1836,47 @@ api_get() {
   curl "${a[@]}" "${API_AUTH_ARGS[@]}" "$url"
 }
 
-api_post() { # $1 путь, $2 JSON-тело (пусто = без тела)
-  local url; url="$(api_url)panel/api/inbounds/$1"
+# один POST-вызов без восстановления (внутренняя для api_post)
+_api_post_once() { # $1 url, $2 JSON-тело (пусто = без тела)
   local -a args=(-s --max-time 15 -X POST)
   [ "${PANEL_SCHEME:-http}" = "https" ] && args+=(-k)
   [ -n "${COOKIE_JAR:-}" ] && args+=(-b "$COOKIE_JAR")
-  [ -n "$CSRF_TOKEN" ] && args+=(-H "X-CSRF-Token: $CSRF_TOKEN")
+  [ -n "${CSRF_TOKEN:-}" ] && args+=(-H "X-CSRF-Token: $CSRF_TOKEN")
   api_auth_args
   if [ -n "${2:-}" ]; then
     # Тело может содержать пароли и ключи: только stdin, никогда argv процесса.
-    printf '%s' "$2" | curl "${args[@]}" -H 'Content-Type: application/json' --data-binary @- "$url"
+    printf '%s' "$2" | curl "${args[@]}" "${API_AUTH_ARGS[@]}" -H 'Content-Type: application/json' --data-binary @- "$1"
   else
-    curl "${args[@]}" "$url"
+    # v7.4.1: bearer и в ветке без тела (del/resetTraffic POST-ы без JSON-а —
+    # раньше ушли без Authorization и на bearer-сессии возвращали 401)
+    curl "${args[@]}" "${API_AUTH_ARGS[@]}" "$1"
   fi
+}
+
+# v7.4.1: общий каркас POST с восстановлением аутентификации: вызывает
+# $1 = имя функции-исполнителя (остальное — её аргументы); при пустом/не-JSON
+# ответе — _api_auth_recover и ОДИН повтор. Валидный JSON не трогаем.
+_api_post_guard_run() { # $1 fn, $2.. аргументы fn
+  local fn="$1"; shift
+  local resp
+  resp="$($fn "$@")" || return 1
+  if ! jq -e 'type=="object"' <<<"$resp" >/dev/null 2>&1; then
+    _api_auth_recover || true
+    resp="$($fn "$@")" || return 1
+  fi
+  printf '%s' "$resp"
+}
+
+api_post() { # $1 путь, $2 JSON-тело (пусто = без тела)
+  local url; url="$(api_url)panel/api/inbounds/$1"
+  _api_post_guard_run _api_post_once "$url" "${2:-}"
 }
 
 api_list() {
   local out
   out="$(api_get list)" || { err "Панель не отвечает на запрос списка инбаундов"; return 1; }
   if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
-    err "API list: $(jq -r '.msg // "неожиданный ответ (проверьте версию 3x-ui)"' <<<"$out" | head -c 200)"
+    err "API list: $(api_err_msg "$out" | head -c 200)"
     return 1
   fi
   jq '.obj // []' <<<"$out"
@@ -1840,7 +1895,7 @@ api_update_inbound() { # $1 id, $2 полный JSON инбаунда
   local resp
   resp="$(api_post "update/$1" "$2")" || return 1
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "update инбаунда #$1: $(jq -r '.msg // "ошибка"' <<<"$resp" | head -c 200)"
+    err "update инбаунда #$1: $(api_err_msg "$resp" | head -c 200)"
     return 1
   fi
   return 0
@@ -1851,39 +1906,47 @@ api_del_inbound() { # $1 id
   local resp
   resp="$(api_post "del/$1" "")" || return 1
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "del инбаунда #$1: $(jq -r '.msg // "ошибка"' <<<"$resp" | head -c 200)"
+    err "del инбаунда #$1: $(api_err_msg "$resp" | head -c 200)"
     return 1
   fi
   return 0
 }
 
-api_post_json() { # $1 путь от base, $2 JSON-тело — для эндпоинтов вне /panel/api/inbounds
-  local url; url="$(api_url)${1#/}"
+_api_post_json_once() { # $1 url, $2 JSON-тело
   local -a args=(-s --max-time 20 -X POST -H 'Content-Type: application/json')
   [ "${PANEL_SCHEME:-http}" = "https" ] && args+=(-k)
   [ -n "${COOKIE_JAR:-}" ] && args+=(-b "$COOKIE_JAR")   # v7.2.5: guard set -u
-  [ -n "$CSRF_TOKEN" ] && args+=(-H "X-CSRF-Token: $CSRF_TOKEN")
+  [ -n "${CSRF_TOKEN:-}" ] && args+=(-H "X-CSRF-Token: $CSRF_TOKEN")
   api_auth_args
-  printf '%s' "$2" | curl "${args[@]}" "${API_AUTH_ARGS[@]}" --data-binary @- "$url"
+  printf '%s' "$2" | curl "${args[@]}" "${API_AUTH_ARGS[@]}" --data-binary @- "$1"
+}
+
+api_post_json() { # $1 путь от base, $2 JSON-тело — для эндпоинтов вне /panel/api/inbounds
+  local url; url="$(api_url)${1#/}"
+  _api_post_guard_run _api_post_json_once "$url" "${2:-}"
 }
 
 # application/x-www-form-urlencoded без секретов в командной строке curl.
-api_post_form() { # $1 путь; далее key=value
-  local url; url="$(api_url)${1#/}"
+_api_post_form_once() { # $1 url, $2 готовое urlencoded-тело
   local -a args=(-s --max-time 20 -X POST -H 'Content-Type: application/x-www-form-urlencoded')
   [ "${PANEL_SCHEME:-http}" = "https" ] && args+=(-k)
   [ -n "${COOKIE_JAR:-}" ] && args+=(-b "$COOKIE_JAR")   # v7.2.5: guard set -u
-  [ -n "$CSRF_TOKEN" ] && args+=(-H "X-CSRF-Token: $CSRF_TOKEN")
+  [ -n "${CSRF_TOKEN:-}" ] && args+=(-H "X-CSRF-Token: $CSRF_TOKEN")
   api_auth_args
+  printf '%s' "$2" | curl "${args[@]}" "${API_AUTH_ARGS[@]}" --data-binary @- "$1"
+}
+
+api_post_form() { # $1 путь; далее key=value
+  local url; url="$(api_url)${1#/}"
   local body="" kv k v ek ev
-  for kv in "$@"; do
+  for kv in "${@:2}"; do
     k="${kv%%=*}"; v="${kv#*=}"
     ek="$(jq -rn --arg v "$k" '$v|@uri')" || return 1
     ev="$(jq -rn --arg v "$v" '$v|@uri')" || return 1
     [ -z "$body" ] || body+="&"
     body+="${ek}=${ev}"
   done
-  printf '%s' "$body" | curl "${args[@]}" "${API_AUTH_ARGS[@]}" --data-binary @- "$url"
+  _api_post_guard_run _api_post_form_once "$url" "$body"
 }
 
 # v4.9.1: 3X-UI v3 перенёс клиентов в /panel/api/clients/*:
@@ -1904,7 +1967,7 @@ api_add_client() { # $1 id инбаунда, $2 JSON ОДНОГО клиента
     resp="$(api_post addClient "$body")" || return 1
   fi
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "addClient: $(jq -r '.msg // "ошибка"' <<<"$resp" 2>/dev/null | head -c 200)"
+    err "addClient: $(api_err_msg "$resp" | head -c 200)"
     return 1
   fi
   return 0
@@ -1918,7 +1981,7 @@ api_del_client() { # $1 id инбаунда, $2 email, $3 clientId (uuid; нуж
     resp="$(api_post "$1/delClient/$3" "")" || return 1
   fi
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "delClient: $(jq -r '.msg // "ошибка"' <<<"$resp" 2>/dev/null | head -c 200)"
+    err "delClient: $(api_err_msg "$resp" | head -c 200)"
     return 1
   fi
   return 0
@@ -4223,7 +4286,7 @@ panel_settings_get() {
     fi
   fi
   if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
-    err "panel settings: $(jq -r '.msg // "нет ответа"' <<<"$out" 2>/dev/null | head -c 200)"
+    err "panel settings: $(api_err_msg "$out" 2>/dev/null | head -c 200)"
     return 1
   fi
   printf '%s' "$out"
@@ -4234,7 +4297,7 @@ panel_settings_set() { # пары key=value (form-urlencoded, панель об�
   if [ "$API_V3" = "1" ]; then p="panel/api/setting/update"; else p="panel/setting/update"; fi
   resp="$(api_post_form "$p" "$@")"
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "${p}: $(jq -r '.msg // "нет ответа"' <<<"$resp" 2>/dev/null | head -c 200)"
+    err "${p}: $(api_err_msg "$resp" 2>/dev/null | head -c 200)"
     return 1
   fi
   return 0
@@ -4273,7 +4336,8 @@ api_add_inbound() { # $1 полный JSON инбаунда
   local resp
   resp="$(api_post add "$1")" || return 1
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    err "add inbound: $(jq -r '.msg // "ошибка"' <<<"$resp" | head -c 200)"
+    # v7.4.1: api_err_msg — пустой .msg/пустое тело больше не печатаются молчком
+    err "add inbound: $(api_err_msg "$resp" | head -c 300)"
     return 1
   fi
   return 0
@@ -5418,7 +5482,18 @@ else
   echo "WARN: сертификат панели не применён (нет openssl-файлов или sqlite3) — панель останется на HTTP"
 fi
 EOS
-  sleep 3
+  # (7.4.1, живой лог 7.4.0): после restart панель поднимается не мгновенно
+  # (миграции БД, fail2ban, первый старт) — фиксированного sleep 3 не хватало:
+  # API-токен и HTTPS-логин падали «вхолостую» и мастер оставался на HTTP+CSRF.
+  # Ждём готовности порта на самой ноде (до 40 сек), с запасом — ретрай логина.
+  log "Жду готовности панели ноды (порт ${np_port}, до 40 сек)..."
+  node_ssh "$rec" "PORT='${np_port}' bash -s" <<'EOS' || warn "Панель ноды так и не поднялась на порту ${np_port} за 40 сек — продолжаю"
+for i in $(seq 1 20); do
+  if (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then exit 0; fi
+  sleep 2
+done
+exit 1
+EOS
   local nbase
   nbase="$(node_ssh "$rec" "/usr/local/x-ui/x-ui setting -show true 2>/dev/null" \
            | awk -F': ' '/webBasePath/{print $2; exit}' | tr -d '[:space:]')"
@@ -5436,7 +5511,12 @@ EOS
     local trec tck
     trec="$(jq -c --arg t "$ntok" '.panel.token = $t' <<<"$rec")"
     tck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)"
-    if node_token_ok "$trec" "$tck"; then
+    # (7.4.1): один ретрай токена через 5 сек — панели v3.11 после restart
+    # отвечают openapi.json не сразу
+    if ! node_token_ok "$trec" "$tck"; then
+      sleep 5; node_token_ok "$trec" "$tck" || trec=""
+    fi
+    if [ -n "$trec" ]; then
       rec="$trec"
       ok "API-токен панели ноды принят (Bearer) — для API логин по паролю не нужен"
     else
@@ -5446,9 +5526,13 @@ EOS
   fi
   local ck; ck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)"
   if ! node_login "$rec" "$ck"; then
-    warn "Логин по HTTPS не прошёл — пробую HTTP (сертификат панели не применился?)"
-    rec="$(jq -c '.panel.tls = false' <<<"$rec")"
-    node_login "$rec" "$ck" || { err "Логин в панель ноды (порт ${np_port}${nbase}) не прошёл"; rm -f "$ck"; return 1; }
+    # (7.4.1): ретрай HTTPS через 5 сек — рестарт с новым сертом мог не успеть
+    sleep 5
+    if ! node_login "$rec" "$ck"; then
+      warn "Логин по HTTPS не прошёл — пробую HTTP (сертификат панели не применился?)"
+      rec="$(jq -c '.panel.tls = false' <<<"$rec")"
+      node_login "$rec" "$ck" || { err "Логин в панель ноды (порт ${np_port}${nbase}) не прошёл"; rm -f "$ck"; return 1; }
+    fi
   fi
   local psch="http"; jq -e '.panel.tls == true' <<<"$rec" >/dev/null 2>&1 && psch="https"
   ok "Панель ноды: ${psch}://${nhost}:${np_port}${nbase}"
@@ -5544,18 +5628,18 @@ EOS
     {network:"tcp", security:"reality",
      realitySettings:{show:false, xver:0, dest:$dest, serverNames:[$sni], privateKey:$priv,
                       shortIds:[$sid], settings:{publicKey:$pub, fingerprint:"chrome", serverName:""}}}')"
-  nib="$(jq -nc --arg port "$tp" --arg tag "inbound-${tp}" --arg remark "xkit-tunnel-${nname}" \
+  nib="$(jq -nc --arg port "$tport" --arg tag "inbound-${tport}" --arg remark "xkit-tunnel-${nname}" \
         --arg s "$nsettings" --arg st "$nstream" '
     {up:0, down:0, total:0, remark:$remark, enable:true, expiryTime:0, listen:"",
      port:($port|tonumber), protocol:"vless", settings:$s, streamSettings:$st,
      sniffing:"{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"]}",
      allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",
      tag:$tag}')"
-  log "Создаю туннельный inbound на ноде (VLESS+Reality, порт ${tp})..."
+  log "Создаю туннельный inbound на ноде (VLESS+Reality, порт ${tport})..."
   local out
   out="$(node_api "$rec" "panel/api/inbounds/add" POST "$nib" "$ck")"
   if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
-    err "Нода: создание inbound не прошло: $(jq -r '.msg // "?"' <<<"$out" | head -c 200)"
+    err "Нода: создание inbound не прошло: $(api_err_msg "$out" | head -c 200)"
     rm -f "$ck"; return 1
   fi
   ok "Туннельный inbound на ноде создан"
@@ -5565,9 +5649,9 @@ EOS
   is_ip "$myip" || myip=""   # страховка: в env уходит либо валидный IP, либо пусто
   local node_ufw=0
   if node_ssh "$rec" "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'" >/dev/null 2>&1; then
-    log "UFW на ноде уже активен: добавляю SSH ${nport}, туннель ${tp}/tcp и правило панели..."
+    log "UFW на ноде уже активен: добавляю SSH ${nport}, туннель ${tport}/tcp и правило панели..."
     # Неактивный UFW никогда не включаем автоматически: это меняет политику всего сервера.
-    node_ssh "$rec" "env MYIP='${myip}' NPORT='${nport}' TP='${tp}' NPP='${np_port}' bash -s" <<'EOS' \
+    node_ssh "$rec" "env MYIP='${myip}' NPORT='${nport}' TP='${tport}' NPP='${np_port}' bash -s" <<'EOS' \
       && node_ufw=1 || warn "UFW на ноде НЕ настроен — проверьте firewall вручную"
 set -u
 : "${NPORT:?нет NPORT}"; : "${TP:?нет TP}"; : "${NPP:?нет NPP}"
@@ -5589,7 +5673,7 @@ EOS
     warn "Доступ к панели ноды — через SSH-туннель: ssh -p ${nport} -L ${np_port}:127.0.0.1:${np_port} ${nuser}@${nhost}"
   fi
 
-  rec="$(jq -c --argjson tport "$tp" --arg uuid "$tuuid" --arg pbk "$pub" --arg sid "$tsid" \
+  rec="$(jq -c --argjson tport "$tport" --arg uuid "$tuuid" --arg pbk "$pub" --arg sid "$tsid" \
          --arg sni "$nsni" --arg dest "$ndest" --arg tag "node-${nname}" --arg created "$(date -Is)" \
     '.tunnel = {port:$tport, proto:"vless", net:"tcp", sec:"reality", uuid:$uuid, pbk:$pbk,
                 sid:$sid, sni:$sni, dest:$dest, flow:"xtls-rprx-vision"}
@@ -5628,7 +5712,7 @@ EOS
     err "=== Нода '${nname}' в реестре, но конфиг НЕ применён — трафик на неё не пойдёт ==="
     warn "Выполните: xkit (меню) -> пункт 2 (автопроброс), затем НОДЫ -> health"
   fi
-  ok "Туннель: мастер -> ${nhost}:${tp} (VLESS+Reality, SNI ${nsni})"
+  ok "Туннель: мастер -> ${nhost}:${tport} (VLESS+Reality, SNI ${nsni})"
   if [ "$node_ufw" = "1" ]; then
     if [ -n "$myip" ]; then
       ok "Панель ноды: ${psch}://${nhost}:${np_port}${nbase} (UFW: только с IP мастера)"
@@ -6123,7 +6207,7 @@ client_reset() {
   if jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
     ok "Трафик '$email' сброшен"
   else
-    err "Не удалось сбросить: $(jq -r '.msg // "?"' <<<"$resp" 2>/dev/null | head -c 200)"
+    err "Не удалось сбросить: $(api_err_msg "$resp" 2>/dev/null | head -c 200)"
   fi
   return 0
 }
@@ -8683,8 +8767,23 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
     {up:0,down:0,total:0,remark:"xkit-probe",enable:true,expiryTime:0,listen:"127.0.0.1",
      port:$port,protocol:"'"$proto"'",settings:$s,streamSettings:$st,
      sniffing:"{\"enabled\":false}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:"xkit-probe"}')"
-  resp="$(api_post add "$ib" 2>/dev/null)" || { _proto_probe_cleanup; return 1; }
-  jq -e '.success == true' <<<"$resp" >/dev/null 2>&1 || { _proto_probe_cleanup; return 1; }
+  # v7.4.1: отказ ПРИМЕНЕНИЯ пробы (пустой/не-JSON ответ = 401 bearer / 403 CSRF)
+  # ≠ «ядро не умеет протокол». api_post уже повторил запрос с восстановленной
+  # аутентификацией; если всё равно не JSON — честно говорим, что вердикт о
+  # поддержке протокола недействителен (живой лог 7.4.0: «ядро НЕ умеет
+  # amneziawg» при живом POST-канале панели).
+  if ! resp="$(api_post add "$ib" 2>/dev/null)" || [ -z "$resp" ]; then
+    warn "проба '$proto': панель не ответила на создание пробного инбаунда (401/403 middleware?) — вердикт о поддержке протокола не выносится"
+    _proto_probe_cleanup; return 1
+  fi
+  if ! jq -e 'type=="object"' <<<"$resp" >/dev/null 2>&1; then
+    warn "проба '$proto': не-JSON ответ панели — вердикт о поддержке протокола не выносится"
+    _proto_probe_cleanup; return 1
+  fi
+  if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
+    warn "проба '$proto': панель отклонила протокол — $(api_err_msg "$resp" | head -c 140)"
+    _proto_probe_cleanup; return 1
+  fi
   sleep 2
   listening="$(ss -lunpH "sport = :$port" 2>/dev/null | grep -c . || true)"
   _proto_probe_cleanup
