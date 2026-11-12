@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.9 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.10 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.9"
+XKIT_VERSION="7.4.10"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5735,7 +5735,7 @@ node_panel_sync() { # $1 имя ноды
   id="$(jq -r '.panel_node_id // empty' <<<"$rec")"
   path="panel/api/nodes/add"; [ -n "$id" ] && path="panel/api/nodes/update/${id}"
   body="$(jq -nc --arg name "$n" --arg host "$(jq -r '.host' <<<"$rec")" \
-    --argjson port "$(jq -r '.panel.port' <<<"$rec")" --arg base "$(jq -r '.panel.path // "/"' <<<"$rec")" \
+    --argjson port "$(jq -r '.panel.port' <<<"$rec")" --arg base "$(jq -r '.panel.base // "/"' <<<"$rec")" \
     --arg token "$tok" --arg scheme "$scheme" --arg pin "$pin" \
     '{name:$name,remark:"XKIT",scheme:$scheme,address:$host,port:$port,basePath:$base,
       apiToken:$token,enable:true,allowPrivateAddress:true,
