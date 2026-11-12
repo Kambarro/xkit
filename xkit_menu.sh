@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v7.4.3
+#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v7.4.5
 #
 #  Меню вынесено из xkit.sh в отдельный файл: ядро (API, установка, nginx,
 #  подписки, ноды, дашборд) не раздувается, а правки меню не трогают xkit.sh.
@@ -99,6 +99,7 @@ menu_users() {
     echo " 4) Список пользователей + ссылки"
     echo " 5) Подписки: перегенерировать и показать URL"
     echo " 6) Пользователь во ВСЕ протоколы (одна подписка, v6)"
+    echo " 7) QR подписки (локально, SVG/PNG)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -109,6 +110,7 @@ menu_users() {
       4) client_list; pause_enter ;;
       5) sub_regen; pause_enter ;;
       6) client_add_all; pause_enter ;;
+      7) local sid fmt; read -r -p "subId: " sid; read -r -p "Формат [svg]: " fmt; sub_qr "$sid" "${fmt:-svg}"; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac
@@ -178,6 +180,8 @@ menu_service() {
     echo "15) Audit journal: последние 50 действий"
     echo "16) Бэкапы: расписание и хранение (интервал 24/48/168/свой)"
     echo "17) BBR: статус / включить (рекомендация для пропускной способности)"
+    echo "18) Socket options: TFO / TCP_NODELAY"
+    echo "19) Проверить обновление XKIT"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -199,6 +203,8 @@ menu_service() {
       15) audit_show 50; pause_enter ;;
       16) backup_settings_menu; pause_enter ;;
       17) menu_bbr; pause_enter ;;
+      18) sockopt_cmd; pause_enter ;;
+      19) xkit_update_check --force; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac

@@ -4,7 +4,7 @@
 
 **TUI и мастер-меню для nginx + 3X-UI: VPN-панель, подписки, REALITY, ноды, балансировка и мониторинг — в одном инструменте.**
 
-![Version](https://img.shields.io/badge/version-7.4.3-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-7.4.5-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -88,6 +88,14 @@ curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sud
 
 Установщик скачивает ядро, классическое меню, модуль протоколов и TUI нужной архитектуры. Каждый компонент проверяется по SHA-256; при отсутствии или несовпадении суммы установка прекращается.
 
+### Перенос мастера из бэкапа
+
+Положите `xkit-*.tar.gz` в `/root/xkit-restore/` (или используйте существующий `/var/backups/xkit/`) и запустите установку в интерактивной SSH-сессии. Установщик найдёт последний архив и предложит отдельно восстановить сертификаты, пользователей и панель, подписки вместе с панелью, ноды со сроками аренды или весь мастер.
+
+Сертификаты используются только после проверки адреса, срока действия и соответствия ключа. Подписки перегенерируются из восстановленной БД с прежним `XKIT_SUB_TOKEN`; старый nginx-конфиг не переносится. Ноды переподключаются по сохранённым SSH-ключам без переустановки: проверяются SSH/API, новый IP мастера добавляется в активный UFW, затем пересобираются маршруты, балансировка и записи в разделе «Узлы» 3X-UI. Если БД панели не выбрана, сохранённые числовые `panel_node_id` сбрасываются во избежание обновления чужих записей.
+
+Повторное добавление уже записанной ноды предлагает переподключение без нового туннеля. Если реестр потерян, существующий inbound `xkit-tunnel-ИМЯ` используется повторно; полная переустановка ноды остаётся только явным вариантом с бэкапом её БД. В неинтерактивном режиме `-y` автоматический поиск и восстановление не выполняются.
+
 В конце установки можно выбрать:
 
 ```text
@@ -120,7 +128,7 @@ sudo xkit update
 sudo xkit update https://raw.githubusercontent.com/kambarro/xkit/main
 ```
 
-Обновление сохраняет состояние, конфигурацию, подписки и резервные копии изменённых компонентов.
+Обновление сохраняет состояние, конфигурацию, подписки и резервные копии изменённых компонентов. `sudo xkit update --check` только проверяет версию (кэш 6 часов; `--force` — свежий запрос). TUI делает это в фоне и показывает плашку с новой версией; сетевой сбой не мешает работе.
 
 ### Неинтерактивный режим
 
@@ -351,7 +359,8 @@ sudo xkit protocols panel install   # панельный режим: AWG+Hy2 к�
 - HTTPS и пин публичного ключа для API панели ноды;
 - API-токен панели ноды (3X-UI v3.11+): авто-сбор из install-result.env по SSH при добавлении, Bearer вместо логина+CSRF (не зависит от пароля и 2FA); обновление — `xkit nodes relogin`;
 - стратегии `roundRobin`, `random`, `leastPing` и `leastLoad`;
-- health-check туннеля и панели, `repair`, `repin` и удаление ноды.
+- health-check туннеля и панели, `repair`, `repin` и удаление ноды;
+- автоматическая регистрация в родном разделе **«Узлы» 3X-UI v3.11+**: доступность, версии панели/Xray и штатные метрики. Всегда передаются `inboundSyncMode:"selected"`, `inboundTags:[]` и пустой `outboundTag`: инбаунды не импортируются, туннели и балансировка XKIT не меняются. Повтор — `xkit nodes panel-sync ИМЯ|all`; ошибка панели не откатывает ноду.
 
 </details>
 
@@ -404,6 +413,7 @@ xkit install                      # установка одним шагом
 xkit reinstall                    # чистая переустановка
 xkit uninstall [--full]           # удаление с обязательным бэкапом
 xkit update [URL]                 # обновление компонентов
+xkit update --check [--force]     # проверка новой версии без установки
 
 xkit protocols                    # меню протоколов
 xkit protocols list [--json]      # санитизированная сводка
@@ -422,6 +432,7 @@ xkit nodes apply --canary ИМЯ     # TCP+SSH+API canary перед apply
 xkit nodes apply --remaining      # остальные ноды, только после canary
 xkit nodes token set|remove ИМЯ   # scoped API token (если поддержан панелью)
 xkit nodes relogin ИМЯ|all [none]  # авто-токен панели ноды из install-result.env (Bearer)
+xkit nodes panel-sync ИМЯ|all      # «Узлы» 3X-UI без импорта инбаундов
 xkit nodes readdress ИМЯ IP --dry-run # preflight-план смены IP
 xkit nodes profile list|switch|benchmark # магистральный профиль и full-path test
 xkit nodes tune ИМЯ show|safe|balanced  # conservative BBR/fq tuning
@@ -623,7 +634,7 @@ sha256sum -c xkit.sh.sha256
 
 ## ✅ Тесты
 
-В пакете находятся **27 регрессионных наборов (1217 проверок)**, включая:
+В пакете находятся **28 регрессионных наборов (1234 проверки)**, включая:
 
 - unit-тесты TUI и самопроверку бинарников;
 - классический fallback и навигацию;
@@ -642,7 +653,8 @@ sha256sum -c xkit.sh.sha256
 - readdress dry-run, профильные XHTTP/Hysteria outbound, certificate pin, owned UFW и benchmark;
 - MTProto FakeTLS, Web Proxy link/pinning/rollback и nginx WebSocket/no-log блок;
 - генерацию nginx с проверкой реальным `nginx -t`;
-- бэкапы, восстановление, обновление и удаление.
+- бэкапы, восстановление, обновление и удаление;
+- регистрацию «Узлов» 3X-UI с пустым импортом, идемпотентный update, кэш и сравнение версий.
 
 Полный журнал проверок и ограничения тестирования — в CHANGES.md дерева разработки (в публичный репозиторий не входит).
 

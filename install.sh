@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT installer — установка xkit.sh одной командой (XKIT v7.4.3)
+#  XKIT installer — установка xkit.sh одной командой (XKIT v7.4.5)
 #
 #  GitHub (рекомендуемый вариант, все компоненты релиза в одном репо):
 #    curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
@@ -26,11 +26,11 @@ XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kambarro/xkit/main}"
 
 # (K-02, аудит №2) pin-хэши релиза: подставляются при сборке. Placeholder =
 # dev-режим — тогда сумма берётся из xkit.sh.sha256; нет ни того ни другого — отказ
-XKIT_PIN_SHA256="c59f88068c377db61b103e8f12475051c634b4e605172c2b731d3c74f8345017"
-XKIT_PIN_MENU_SHA256="aca6364be6db270c001b83c5e1a42fee6b7ae7f00c6ef9413f24530b7142a77f"
-XKIT_PIN_PROTOCOLS_SHA256="624d2d7a5e917120a74647aac75c07ac1c87cac13be2cb04cc809cb466bf0f22"
-XKIT_PIN_TUI_AMD64_SHA256="99ffac51d185293ba9bfe86c5c828a9ebff86091d7d3e2bda6eb8e60e7511323"
-XKIT_PIN_TUI_ARM64_SHA256="22eb92a5a4263ee482329e55514c7ce7399599a50aebecb5fe5ed4ea20d43981"
+XKIT_PIN_SHA256="7fecc3f8ae2a92a972233a04a583c8f46632ab81e3052f4c97c0ac6b11f8a4b8"
+XKIT_PIN_MENU_SHA256="f1ad96511bc81acacbce0b73d9b369eb27a371b63662b2566cabbd261485de2b"
+XKIT_PIN_PROTOCOLS_SHA256="0bd700466d6eba1108474a472fa49959ab4c28f4eb0654a2febcfa86bb52ab3a"
+XKIT_PIN_TUI_AMD64_SHA256="41243026d7f0d40a24558474480f674665003813137d70c5eef27c283ef7add7"
+XKIT_PIN_TUI_ARM64_SHA256="edebf2e936f68e2132639d74c0c6d1823795d531cb5936c5f78434c7ca3c15d4"
 
 # v6.0.0: Ed25519-подпись релиза (ssh-keygen -Y, namespace xkit-release).
 # Подставляется сборкой из ключей релиза; placeholder = dev-режим (фолбэк на пин-книгу).

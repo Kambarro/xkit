@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.2 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.5 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.3"
+XKIT_VERSION="7.4.5"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -186,6 +186,8 @@ xkit_install_cleanup() {
   xkit_log_capture_off   # v7.2.5: вернуть stdout/stderr даже при die()/INT/EXIT
   local f
   for f in "${XKIT_TMPS[@]:-}"; do [ -n "$f" ] && rm -f "$f" 2>/dev/null; done
+  case "${INSTALL_BACKUP_STAGE:-}" in /tmp/*) rm -rf -- "$INSTALL_BACKUP_STAGE" 2>/dev/null ;; esac
+  INSTALL_BACKUP_STAGE=""
   return 0
 }
 xkit_install_traps_on() {
@@ -1624,7 +1626,7 @@ save_xkit_env() {
 }
 
 load_xkit_env() {
-  # v7.4.3: XKIT_VERSION из xkit.env НЕ должен переопределять версию скрипта —
+  # v7.4.4: XKIT_VERSION из xkit.env НЕ должен переопределять версию скрипта —
   # старый env (сохранился от прошлой установки) показывал в сводке «XKIT v7.4.0»
   # под бинарём 7.4.x (живой лог 7.4.2: сводка после «починки поверх»).
   local _script_ver="${XKIT_VERSION:-}"
@@ -3712,45 +3714,147 @@ EOF
   fi
 }
 
-backup_restore() {
-  local file="${1:-}"
-  [ -z "$file" ] && file="$(ls -1t "$BACKUP_DIR"/xkit-*.tar.gz 2>/dev/null | head -n1)"
-  [ -n "$file" ] && [ -f "$file" ] || die "Бэкапы не найдены в $BACKUP_DIR"
-  # V-06 (аудит №2): чужой бэкап = root RCE через содержимое. Вне BACKUP_DIR —
-  # только через явное YES (или XKIT_ALLOW_UNTRUSTED_BACKUP=1)
+backup_stage() { # $1 архив; проверенная распаковка в BACKUP_STAGE
+  local file="$1" a
   case "$(readlink -f -- "$file" 2>/dev/null || echo "$file")" in
     "$BACKUP_DIR"/*) ;;
     *)
       if [ "${XKIT_ALLOW_UNTRUSTED_BACKUP:-0}" != "1" ]; then
         warn "Файл вне ${BACKUP_DIR}: $(basename -- "$file")"
-        local a; read -r -p "Чужой бэкап может выполнить команды от root. Точно восстановить? Введите YES (регистр не важен): " a || { echo; return 1; }
-        [ "${a^^}" = "YES" ] || { log "Отменено"; return 0; }
-      fi
-      ;;
+        read -r -p "Чужой бэкап может выполнить команды от root. Точно восстановить? Введите YES (регистр не важен): " a || { echo; return 1; }
+        [ "${a^^}" = "YES" ] || { log "Отменено"; return 1; }
+      fi ;;
   esac
-  log "Восстанавливаю из: $file"
-  # V-06: члены архива — без ../ и абсолютных путей (проверка ДО распаковки)
   if tar -tzf "$file" 2>/dev/null | grep -qE '(^/|(^|/)\.\.(/|$))'; then
-    err "Архив содержит небезопасные пути (../ или абсолютные) — восстановление отменено"
-    return 1
+    err "Архив содержит небезопасные пути (../ или абсолютные) — восстановление отменено"; return 1
   fi
-  local t; t="$(mktemp -d)"
-  tar xzf "$file" -C "$t" || { err "Архив битый"; rm -rf "$t"; return 1; }
-  # V-06: symlink-члены не должны указывать наружу (легитимные внутренние — можно)
+  BACKUP_STAGE="$(mktemp -d)" || return 1; chmod 700 "$BACKUP_STAGE"
+  tar xzf "$file" -C "$BACKUP_STAGE" || { err "Архив битый"; rm -rf "$BACKUP_STAGE"; return 1; }
   local badlink
-  badlink="$(find "$t" -type l 2>/dev/null | while read -r l; do
+  badlink="$(find "$BACKUP_STAGE" -type l 2>/dev/null | while read -r l; do
     lt="$(readlink -f "$l" 2>/dev/null || true)"
-    case "$lt" in "$t"|"$t"/*) ;; *) echo "$l"; break ;; esac
+    case "$lt" in "$BACKUP_STAGE"|"$BACKUP_STAGE"/*) ;; *) echo "$l"; break ;; esac
   done)"
   if [ -n "$badlink" ]; then
-    err "Архив содержит symlink наружу (${badlink#"$t"/}) — восстановление отменено (V-06)"
-    rm -rf "$t"; return 1
+    err "Архив содержит symlink наружу (${badlink#"$BACKUP_STAGE"/}) — восстановление отменено (V-06)"
+    rm -rf "$BACKUP_STAGE"; return 1
   fi
-  # V-06: xkit.env из архива НЕ исполняем вслепую — командная подстановка = отказ
-  if [ -f "$t${XKIT_ENV}" ] && grep -qE '`|\$\(|\$\{' "$t${XKIT_ENV}" 2>/dev/null; then
+  if [ -f "$BACKUP_STAGE$XKIT_ENV" ] && grep -qE '`|\$\(|\$\{' "$BACKUP_STAGE$XKIT_ENV" 2>/dev/null; then
     err "xkit.env в архиве содержит командную подстановку — восстановление отменено (V-06)"
-    rm -rf "$t"; return 1
+    rm -rf "$BACKUP_STAGE"; return 1
   fi
+}
+
+backup_env_value() { # $1 staged root, $2 key; env из архива не исполняется
+  local v; v="$(sed -n "s/^$2=//p" "$1$XKIT_ENV" 2>/dev/null | head -n1)"
+  v="${v%\"}"; v="${v#\"}"; v="${v%\'}"; v="${v#\'}"; printf '%s' "$v"
+}
+
+install_backup_offer() {
+  INSTALL_RESTORE_CERT=0; INSTALL_RESTORE_PANEL=0; INSTALL_RESTORE_SUBS=0; INSTALL_RESTORE_NODES=0
+  INSTALL_BACKUP_STAGE=""
+  [ -t 0 ] && [ "${XKIT_YES:-0}" != 1 ] || return 0
+  local file choice
+  file="$(ls -1t "$BACKUP_DIR"/xkit-*.tar.gz /root/xkit-restore/xkit-*.tar.gz 2>/dev/null | head -n1)"
+  [ -n "$file" ] || return 0
+  echo ""; ok "Найден бэкап XKIT: $file"
+  confirm "Восстановить данные на этом сервере? [y/N] " n || return 0
+  echo "  1) Только сертификаты"
+  echo "  2) Пользователи и панель"
+  echo "  3) Подписки (вместе с пользователями и панелью)"
+  echo "  4) Ноды и сроки аренды"
+  echo "  5) Полный перенос мастера (всё перечисленное)"
+  echo "  0) Не восстанавливать"
+  read -r -p "Выбор [5]: " choice || { echo; return 1; }
+  case "${choice:-5}" in
+    1) INSTALL_RESTORE_CERT=1 ;;
+    2) INSTALL_RESTORE_PANEL=1 ;;
+    3) INSTALL_RESTORE_PANEL=1; INSTALL_RESTORE_SUBS=1 ;;
+    4) INSTALL_RESTORE_NODES=1 ;;
+    5) INSTALL_RESTORE_CERT=1; INSTALL_RESTORE_PANEL=1; INSTALL_RESTORE_SUBS=1; INSTALL_RESTORE_NODES=1 ;;
+    0) return 0 ;;
+    *) warn "Нет такого пункта"; return 1 ;;
+  esac
+  backup_stage "$file" || return 1
+  INSTALL_BACKUP_STAGE="$BACKUP_STAGE"
+  if [ "$INSTALL_RESTORE_PANEL" = 1 ] && [ ! -f "$BACKUP_STAGE$XUI_DB" ]; then
+    err "В архиве нет SQLite БД панели; PostgreSQL восстанавливается средствами СУБД"
+    rm -rf -- "$INSTALL_BACKUP_STAGE"; INSTALL_BACKUP_STAGE=""; return 1
+  fi
+}
+
+install_restore_certs() {
+  [ "$INSTALL_RESTORE_CERT" = 1 ] || return 0
+  local d found=0
+  for d in /etc/nginx/ssl /etc/letsencrypt; do
+    if [ -d "$INSTALL_BACKUP_STAGE$d" ]; then
+      mkdir -p "$d"; cp -a "$INSTALL_BACKUP_STAGE$d/." "$d/" || return 1; found=1
+    fi
+  done
+  [ "$found" = 1 ] || { err "В архиве нет сертификатов"; return 1; }
+  ok "Сертификаты восстановлены; установщик проверит домен, срок и ключ перед использованием"
+}
+
+install_restore_panel() {
+  [ "$INSTALL_RESTORE_PANEL" = 1 ] || return 0
+  systemctl stop x-ui 2>/dev/null || true
+  [ ! -f "$XUI_DB" ] || cp -a "$XUI_DB" "${XUI_DB}.before-restore" || return 1
+  mkdir -p "$(dirname "$XUI_DB")" "$(dirname "$XUI_RESULT")"
+  if ! cp "$INSTALL_BACKUP_STAGE$XUI_DB" "$XUI_DB"; then
+    [ ! -f "${XUI_DB}.before-restore" ] || cp -a "${XUI_DB}.before-restore" "$XUI_DB"
+    err "БД панели не восстановлена; прежняя БД возвращена"; return 1
+  fi
+  if [ -f "$INSTALL_BACKUP_STAGE$XUI_RESULT" ]; then
+    cp "$INSTALL_BACKUP_STAGE$XUI_RESULT" "$XUI_RESULT" || { err "Реквизиты панели не восстановлены"; return 1; }
+  fi
+  chmod 600 "$XUI_DB" "$XUI_RESULT" 2>/dev/null || true
+  systemctl start x-ui || return 1
+  ok "Пользователи, инбаунды и БД панели восстановлены; свежая БД сохранена как x-ui.db.before-restore"
+}
+
+install_restore_state() {
+  [ "$INSTALL_RESTORE_SUBS" = 1 ] || [ "$INSTALL_RESTORE_NODES" = 1 ] || return 0
+  local v f key
+  if [ "$INSTALL_RESTORE_SUBS" = 1 ]; then
+    v="$(backup_env_value "$INSTALL_BACKUP_STAGE" XKIT_SUB_TOKEN)"
+    [[ "$v" =~ ^[A-Za-z0-9_-]+$ ]] || { err "SUB_TOKEN в архиве отсутствует или невалиден"; return 1; }
+    XKIT_SUB_TOKEN="$v"
+  fi
+  if [ "$INSTALL_RESTORE_NODES" = 1 ]; then
+    jq -e 'type=="array"' "$INSTALL_BACKUP_STAGE$XKIT_NODES" >/dev/null 2>&1 \
+      || { err "В архиве нет корректного реестра нод"; return 1; }
+    for f in "$XKIT_NODES" "$XKIT_EXPIRY" "$XKIT_DIR/known_hosts"; do
+      if [ -f "$INSTALL_BACKUP_STAGE$f" ]; then
+        mkdir -p "$(dirname "$f")" || return 1
+        cp "$INSTALL_BACKUP_STAGE$f" "$f" && chmod 600 "$f" || return 1
+      fi
+    done
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      if [ "$(dirname "$key")" != "$XKIT_DIR" ]; then
+        warn "Ключ вне $XKIT_DIR не восстанавливается: $key"; continue
+      fi
+      if [ -f "$INSTALL_BACKUP_STAGE$key" ]; then
+        cp "$INSTALL_BACKUP_STAGE$key" "$key" && chmod 600 "$key" || return 1
+      fi
+    done < <(jq -r '.[].key_path // empty' "$XKIT_NODES" 2>/dev/null)
+    if [ "$INSTALL_RESTORE_PANEL" != 1 ]; then
+      jq -c 'map(del(.panel_node_id))' "$XKIT_NODES" > "$XKIT_NODES.tmp" \
+        && mv "$XKIT_NODES.tmp" "$XKIT_NODES" || { rm -f "$XKIT_NODES.tmp"; return 1; }
+    fi
+    chmod 600 "$XKIT_NODES" 2>/dev/null || true
+    ok "Ноды, SSH-ключи и сроки аренды восстановлены без переустановки нод"
+  fi
+}
+
+backup_restore() {
+  local file="${1:-}"
+  [ -z "$file" ] && file="$(ls -1t "$BACKUP_DIR"/xkit-*.tar.gz 2>/dev/null | head -n1)"
+  [ -n "$file" ] && [ -f "$file" ] || die "Бэкапы не найдены в $BACKUP_DIR"
+  # V-06: доверие к архиву и безопасная распаковка проверяются в backup_stage.
+  log "Восстанавливаю из: $file"
+  backup_stage "$file" || return 1
+  local t="$BACKUP_STAGE"
 
   systemctl stop x-ui 2>/dev/null || true
   # FIX (v7.1.3, чистовая комната на bash 5.2.37): restore не должен МОЛЧА
@@ -3762,7 +3866,13 @@ backup_restore() {
   # провал копирования теперь честный err, а не тишина (симметрия с
   # backup_cron_install/save_xkit_env: провал записи = err + return 1);
   # хоть один член не восстановился — restore возвращает 1 (честный код для cron/CLI)
-  local rc_all=0
+  local rc_all=0 certdir
+  for certdir in /etc/nginx/ssl /etc/letsencrypt; do
+    if [ -d "$t$certdir" ]; then
+      mkdir -p "$certdir"
+      cp -a "$t$certdir/." "$certdir/" || { err "Сертификаты $certdir НЕ восстановлены"; rc_all=1; }
+    fi
+  done
   if [ -f "$t${XUI_DB}" ]; then
     mkdir -p "$(dirname "$XUI_DB")" 2>/dev/null || true
     backup_file "$XUI_DB" >/dev/null
@@ -4238,6 +4348,7 @@ xkit_install_body() {
   require_root
   check_os
   preflight || return 1
+  install_backup_offer || return 1
   # ветка «поверх» (или XKIT_FORCE): подхватываем текущее состояние — прежний
   # адрес, SUB_TOKEN (ссылки подписок у клиентов НЕ меняются), TG/dash-токены.
   # При чистой установке/reinstall env отсутствует — load вернёт 1, не страшно
@@ -4272,6 +4383,7 @@ xkit_install_body() {
   fi
 
   step "Домен/IP и SSL-сертификат"
+  install_restore_certs || return 1
   if [ -n "${XKIT_HOST:-}" ]; then
     confirm "Использовать прежний адрес ${XKIT_HOST}? [Y/n] " y || XKIT_HOST=""
   fi
@@ -4294,9 +4406,10 @@ xkit_install_body() {
   # certbot; приводим автопродление к ровно одному пути (drop-in вместо
   # своего таймера, если пакетный unit появился)
   certbot_renewal_unit 2>/dev/null || true
+  install_restore_panel || return 1
   read_panel_settings || return 1
   if [ -n "${XKIT_XRAY_VERSION:-}" ]; then core_pin_install "$XKIT_XRAY_VERSION" || return 1; fi
-  if [ "${XUI_JUST_INSTALLED:-0}" = "1" ]; then panel_password_strengthen || return 1; fi
+  if [ "${XUI_JUST_INSTALLED:-0}" = "1" ] && [ "$INSTALL_RESTORE_PANEL" = 0 ]; then panel_password_strengthen || return 1; fi
   # №17 (аудит): XUI_NONINTERACTIVE зависит от версии инсталлятора 3X-UI — если
   # пароль в install-result.env не попал, пункт 3 (логин в панель) не пройдёт
   if [ -z "$PANEL_PASS" ]; then
@@ -4330,10 +4443,12 @@ xkit_install_body() {
   # существует, и touch падал («cannot touch '/etc/xkit/routes.tsv': No such file
   # or directory», живой баг v7.2.4 в [5/7])
   mkdir -p "$XKIT_DIR"; touch "$XKIT_ROUTES"; chmod 600 "$XKIT_ROUTES"
+  install_restore_state || return 1
   save_xkit_env
 
   step "Конфиг nginx (панель + подписки), перезапуск"
   regen_conf_and_apply || return 1
+  if [ "$INSTALL_RESTORE_SUBS" = 1 ]; then sub_regen || warn "Подписки не перегенерированы — повторите: xkit sub"; fi
   systemctl enable nginx >/dev/null 2>&1 || true
 
   step "Фаервол"
@@ -4408,6 +4523,9 @@ xkit_install_body() {
     *) warn "Нет такого пункта — позже: xkit route (проброс) или xkit nodes (ноды)" ;;
   esac
 
+  if [ "$INSTALL_RESTORE_NODES" = 1 ]; then nodes_restore_reconnect || warn "Часть нод требует ручной проверки: xkit nodes check all --deep"; fi
+  case "${INSTALL_BACKUP_STAGE:-}" in /tmp/*) rm -rf -- "$INSTALL_BACKUP_STAGE" ;; esac
+  INSTALL_BACKUP_STAGE=""
   echo ""
   xkit_info   # вся сводка в терминал + /root/xkit-info.txt (chmod 600)
   xkit_install_traps_off
@@ -5571,6 +5689,86 @@ EOS
   ok "Прежняя установка 3X-UI удалена (бэкап старой БД: /root/x-ui-backup-${ts}.tar.gz)"
 }
 
+# Проекция ноды в родной раздел «Узлы» мастер-панели. Импорт инбаундов
+# всегда выключен явно: selected + пустой список; outbound XKIT не трогаем.
+node_panel_sync() { # $1 имя ноды
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  local n="${1:-}" rec tok scheme pin id path body resp
+  [ -n "$n" ] || { err "xkit nodes panel-sync <имя|all>"; return 1; }
+  if [ "$n" = all ]; then
+    local nn rc=0
+    while IFS= read -r nn; do [ -z "$nn" ] || node_panel_sync "$nn" || rc=1; done < <(nodes_load | jq -r '.[].name')
+    return "$rc"
+  fi
+  rec="$(nodes_load | jq -c --arg n "$n" '[.[]|select(.name==$n)][0] // empty')"
+  [ -n "$rec" ] || { err "Нода '$n' не найдена"; return 1; }
+  tok="$(jq -r '.panel.token // empty' <<<"$rec")"
+  [ -n "$tok" ] || { err "${n}: нет API-токена; выполните xkit nodes relogin ${n}"; return 1; }
+  scheme="http"; [ "$(jq -r '.panel.tls // false' <<<"$rec")" = "true" ] && scheme="https"
+  pin="$(jq -r '.panel.pincert // empty' <<<"$rec")"
+  if [ "$scheme" = "https" ] && [ -z "$pin" ]; then
+    err "${n}: для HTTPS нужен certificate pin (xkit nodes repin ${n})"; return 1
+  fi
+  kit_session || { err "Нет сессии мастер-панели"; return 1; }
+  id="$(jq -r '.panel_node_id // empty' <<<"$rec")"
+  path="panel/api/nodes/add"; [ -n "$id" ] && path="panel/api/nodes/update/${id}"
+  body="$(jq -nc --arg name "$n" --arg host "$(jq -r '.host' <<<"$rec")" \
+    --argjson port "$(jq -r '.panel.port' <<<"$rec")" --arg base "$(jq -r '.panel.path // "/"' <<<"$rec")" \
+    --arg token "$tok" --arg scheme "$scheme" --arg pin "$pin" \
+    '{name:$name,remark:"XKIT",scheme:$scheme,address:$host,port:$port,basePath:$base,
+      apiToken:$token,enable:true,allowPrivateAddress:true,
+      tlsVerifyMode:(if $scheme=="https" then "pin" else "verify" end),pinnedCertSha256:$pin,
+      inboundSyncMode:"selected",inboundTags:[],outboundTag:""}')"
+  resp="$(api "$path" POST "$body")" || { err "${n}: мастер-панель не приняла ноду"; return 1; }
+  jq -e '.success == true' <<<"$resp" >/dev/null 2>&1 || {
+    err "${n}: $(jq -r '.msg // "ошибка регистрации в разделе Узлы"' <<<"$resp")"; return 1;
+  }
+  if [ -z "$id" ]; then
+    id="$(jq -r '.obj.id // empty' <<<"$resp")"
+    [[ "$id" =~ ^[0-9]+$ ]] || { err "${n}: панель не вернула ID ноды"; return 1; }
+    nodes_load | jq -c --arg n "$n" --argjson id "$id" \
+      'map(if .name==$n then .panel_node_id=$id else . end)' > "${XKIT_NODES}.tmp" \
+      && mv "${XKIT_NODES}.tmp" "$XKIT_NODES" && chmod 600 "$XKIT_NODES" || return 1
+  fi
+  ok "${n}: добавлена/обновлена в «Узлах» 3X-UI; импорт инбаундов отключён"
+}
+
+node_reconnect_one() { # $1 record: SSH чинит только доступ нового мастера к панели
+  local rec="$1" n myip pp
+  n="$(jq -r '.name' <<<"$rec")"
+  node_ssh "$rec" true || { err "${n}: SSH недоступен; нода оставлена в реестре без изменений"; return 1; }
+  myip="$(pubip)"; pp="$(jq -r '.panel.port' <<<"$rec")"
+  is_port "$pp" || { err "${n}: некорректный порт панели в реестре"; return 1; }
+  if is_ip "$myip" && node_ssh "$rec" "command -v ufw >/dev/null && ufw status | grep -q '^Status: active'"; then
+    node_ssh "$rec" "ufw allow from '${myip}' to any port '${pp}' proto tcp comment 'XKIT:node-panel'" \
+      || { err "${n}: не удалось разрешить новый IP мастера в UFW"; return 1; }
+  fi
+  local ck; ck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)" || return 1
+  if ! node_login "$rec" "$ck"; then rm -f "$ck"; err "${n}: API панели недоступен после SSH-проверки"; return 1; fi
+  local resp; resp="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck")"
+  if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
+    rm -f "$ck"; err "${n}: API панели не ответил после SSH-проверки"; return 1
+  fi
+  rm -f "$ck"; ok "${n}: существующая панель и туннель переподключены без переустановки"
+}
+
+node_reconnect_existing() {
+  local n="$1" rec; rec="$(node_record "$n")"; [ -n "$rec" ] || return 1
+  node_reconnect_one "$rec" || return 1
+  nodes_repair || return 1
+  node_panel_sync "$n" || warn "${n}: повторите xkit nodes panel-sync ${n}"
+  nodes_metrics_collect "$n" >/dev/null 2>&1 || true
+}
+
+nodes_restore_reconnect() {
+  local n rc=0
+  while IFS= read -r n; do [ -z "$n" ] || node_reconnect_one "$(node_record "$n")" || rc=1; done < <(nodes_load | jq -r '.[].name')
+  nodes_repair || rc=1
+  node_panel_sync all || warn "Синхронизацию с «Узлами» 3X-UI можно повторить позже"
+  nodes_metrics_collect >/dev/null 2>&1 || true
+  return "$rc"
+}
+
 node_add() {
   require_root
   command -v ssh >/dev/null 2>&1 || apt-get install -y -qq openssh-client >/dev/null 2>&1
@@ -5585,9 +5783,16 @@ node_add() {
   # 22/root и попытку коннекта к ноде)
   read -r -p "Имя ноды (латиница, например de1): " nname || { echo; return 1; }
   [[ "$nname" =~ ^[a-zA-Z0-9_-]{1,20}$ ]] || { err "Имя: латиница/цифры/-/_ до 20 символов"; return 1; }
-  jq -e --arg n "$nname" 'any(.[]; .name==$n)' <(nodes_load) >/dev/null 2>&1 \
-    && { err "Нода '$nname' уже есть"; return 1; }
+  if jq -e --arg n "$nname" 'any(.[]; .name==$n)' <(nodes_load) >/dev/null 2>&1; then
+    confirm "Нода '$nname' уже есть. Переподключить без переустановки? [Y/n] " y && node_reconnect_existing "$nname"
+    return $?
+  fi
   nhost="$(read_host "IP/домен ноды -> ")"
+  local existing_name; existing_name="$(nodes_load | jq -r --arg h "$nhost" '[.[]|select(.host==$h)][0].name // empty')"
+  if [ -n "$existing_name" ]; then
+    confirm "Этот адрес уже записан как '$existing_name'. Переподключить без нового туннеля? [Y/n] " y && node_reconnect_existing "$existing_name"
+    return $?
+  fi
   read -r -p "SSH порт [22]: " nport || { echo; return 1; }
   nport="${nport:-22}"; is_port "$nport" || { err "Порт"; return 1; }
   read -r -p "SSH пользователь [root]: " nuser || { echo; return 1; }
@@ -5872,10 +6077,28 @@ EOS
   fi
 
   log "Генерирую ключи Reality для ноды..."
-  local priv pub tuuid tsid
-  read -r priv pub <<<"$(api_get_new_x25519)"
-  [ -n "$priv" ] && [ -n "$pub" ] || { err "Не удалось получить ключи x25519"; rm -f "$ck"; return 1; }
-  tuuid="$(new_uuid)"; tsid="$(rand_hex 4)"
+  local priv="" pub tuuid tsid existing_resp existing_ib existing_tunnel=0
+  existing_resp="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck")" \
+    || { err "Не удалось прочитать инбаунды ноды — новый туннель не создаю"; rm -f "$ck"; return 1; }
+  jq -e '.success == true and (.obj|type=="array")' <<<"$existing_resp" >/dev/null 2>&1 \
+    || { err "Панель ноды не вернула список инбаундов — новый туннель не создаю"; rm -f "$ck"; return 1; }
+  existing_ib="$(jq -c --arg remark "xkit-tunnel-${nname}" '[.obj[]|select(.remark==$remark and .protocol=="vless")][0] // empty' <<<"$existing_resp")"
+  if [ -n "$existing_ib" ]; then
+    existing_tunnel=1; tport="$(jq -r '.port' <<<"$existing_ib")"
+    tuuid="$(jq -r '.settings|if type=="string" then (fromjson? // {}) else . end|.clients[0].id // ""' <<<"$existing_ib")"
+    pub="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else . end|.realitySettings.settings.publicKey // ""' <<<"$existing_ib")"
+    tsid="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else . end|.realitySettings.shortIds[0] // ""' <<<"$existing_ib")"
+    ndest="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else . end|.realitySettings.dest // ""' <<<"$existing_ib")"
+    nsni="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else . end|.realitySettings.serverNames[0] // ""' <<<"$existing_ib")"
+    if ! is_port "$tport" || [ -z "$tuuid" ] || [ -z "$pub" ] || [ -z "$tsid" ] || [ -z "$ndest" ] || [ -z "$nsni" ]; then
+      err "Существующий XKIT-туннель повреждён или неполон — дубль не создаю"; rm -f "$ck"; return 1
+    fi
+    ok "Найден существующий XKIT-туннель :${tport} — использую его, новый inbound не создаю"
+  else
+    read -r priv pub <<<"$(api_get_new_x25519)"
+    [ -n "$priv" ] && [ -n "$pub" ] || { err "Не удалось получить ключи x25519"; rm -f "$ck"; return 1; }
+    tuuid="$(new_uuid)"; tsid="$(rand_hex 4)"
+  fi
 
   local nsettings nstream nib
   nsettings="$(jq -nc --arg id "$tuuid" --arg sn "$nname" --arg sub "$(rand_str 16)" '
@@ -5893,14 +6116,16 @@ EOS
      sniffing:"{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"]}",
      allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",
      tag:$tag}')"
-  log "Создаю туннельный inbound на ноде (VLESS+Reality, порт ${tport})..."
-  local out
-  out="$(node_api "$rec" "panel/api/inbounds/add" POST "$nib" "$ck")"
-  if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
-    err "Нода: создание inbound не прошло: $(api_err_msg "$out" | head -c 200)"
-    rm -f "$ck"; return 1
+  if [ "$existing_tunnel" = 0 ]; then
+    log "Создаю туннельный inbound на ноде (VLESS+Reality, порт ${tport})..."
+    local out
+    out="$(node_api "$rec" "panel/api/inbounds/add" POST "$nib" "$ck")"
+    if ! jq -e '.success == true' <<<"$out" >/dev/null 2>&1; then
+      err "Нода: создание inbound не прошло: $(api_err_msg "$out" | head -c 200)"
+      rm -f "$ck"; return 1
+    fi
+    ok "Туннельный inbound на ноде создан"
   fi
-  ok "Туннельный inbound на ноде создан"
 
   local myip
   myip="$(pubip)"   # только валидный IP; иначе ufw настрою без правила для панели
@@ -6027,6 +6252,8 @@ EOS
       node_camo_deploy_one "$nname" "" || warn "Camo не развернулся — вернитесь: НОДЫ -> 10 (или xkit nodes camo ${nname})"
     fi
   fi
+  node_panel_sync "$nname" || warn "${nname}: нода XKIT сохранена; повторите: xkit nodes panel-sync ${nname}"
+  nodes_metrics_collect "$nname" >/dev/null 2>&1 || warn "${nname}: метрики пока недоступны"
   return 0
 }
 
@@ -6169,6 +6396,8 @@ node_relogin() { # $1 имя|all, [$2 = none]
       warn "${n}: токен не получен/не принят панелью — API будет по логину+CSRF"
     fi
     rm -f "$tck"
+    [ -n "$(jq -r '.panel.token // empty' < <(nodes_load | jq -c --arg n "$n" '.[]|select(.name==$n)'))" ] \
+      && { node_panel_sync "$n" || warn "${n}: повторите xkit nodes panel-sync ${n}"; }
   done < <(jq -c '.[]' <<<"$arr")
   [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes relogin <имя|all> [none])"; return 1; }
   return 0
@@ -6291,6 +6520,14 @@ nodes_del() {
     fi
     rm -f "$ck"
   fi
+  local panel_id; panel_id="$(jq -r '.panel_node_id // empty' <<<"$rec")"
+  if [ -n "$panel_id" ] && confirm "Удалить запись из раздела «Узлы» мастер-панели? [y/N] " n; then
+    if kit_session >/dev/null 2>&1 && api "panel/api/nodes/del/${panel_id}" POST "" | jq -e '.success == true' >/dev/null 2>&1; then
+      ok "Запись удалена из «Узлов» 3X-UI"
+    else
+      warn "Запись в «Узлах» не удалена (возможны привязанные инбаунды) — проверьте панель"
+    fi
+  fi
   if confirm "Остановить x-ui на ноде? [y/N] " n; then
     node_ssh "$rec" "systemctl stop x-ui; systemctl disable x-ui" >/dev/null 2>&1 \
       && ok "x-ui на ноде остановлен" || warn "Не удалось остановить (проверьте доступ)"
@@ -6371,6 +6608,10 @@ nodes_menu() {
     echo "10) Camo-сьют ноды: свой сайт + фейк-логин + vhost api./dev./login. (v7.3)"
     echo "11) Проверка нод: TCP/SSH/API/x-ui; deep: CPU/RAM/диск/серт (v7.3)"
     echo "12) Freeze-check: заморозка ТСПУ на леге мастер->нода (v7.3, до ~2 мин/нода)"
+    echo "13) Drift plan / canary / apply"
+    echo "14) Scoped API token: задать / проверить срок"
+    echo "15) Переполучить API token и обновить «Узлы» 3X-UI"
+    echo "16) Добавить/обновить ноду в «Узлах» 3X-UI (без импорта)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -6387,6 +6628,10 @@ nodes_menu() {
       10) node_camo_menu; pause_enter ;;
       11) local _ck; read -r -p "Имя ноды (Enter — все): " _ck; nodes_check "${_ck:-all}"; pause_enter ;;
       12) local _fz; read -r -p "Имя ноды (Enter — все): " _fz; nodes_freeze "${_fz:-all}"; pause_enter ;;
+      13) nodes_plan; local _ca; read -r -p "Canary нода (Enter — отмена): " _ca; [ -z "$_ca" ] || { nodes_apply_canary "$_ca" && confirm "Применить остальным? [y/N]" && nodes_apply_remaining; }; pause_enter ;;
+      14) local _tn; read -r -p "Нода: " _tn; node_token_set "$_tn"; node_token_expiry_check; pause_enter ;;
+      15) local _rl; read -r -p "Нода: " _rl; node_relogin "$_rl"; pause_enter ;;
+      16) local _ps; read -r -p "Нода (Enter — все): " _ps; node_panel_sync "${_ps:-all}"; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac
@@ -7959,6 +8204,44 @@ xkit_summary_save() { # тихо: только файл (вызывается п
 }
 
 #=========================== ОБНОВЛЕНИЕ =======================================
+# Фоновая проверка для TUI: только версия из удалённого ядра, никакой установки.
+xkit_update_check() { # [--force] [--quiet]
+  require_root
+  load_xkit_env 2>/dev/null || true
+  local force=0 quiet=0 base tmp nv cache now mtime latest=""
+  [ "${1:-}" = "--force" ] && { force=1; shift; }
+  [ "${1:-}" = "--quiet" ] && quiet=1
+  base="${XKIT_REPO_URL:-}"; case "$base" in */xkit.sh) base="${base%/*}" ;; esac
+  [ -n "$base" ] || { [ "$quiet" = 1 ] || err "Не задан XKIT_REPO_URL"; return 1; }
+  case "$base" in
+    http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;;
+    http://*) [ "$quiet" = 1 ] || err "Проверка по http:// запрещена"; return 1 ;;
+  esac
+  cache="${XKIT_DIR}/update-check.json"; now="$(date +%s)"
+  if [ "$force" = 0 ] && [ -r "$cache" ]; then
+    mtime="$(stat -c %Y "$cache" 2>/dev/null || echo 0)"
+    if [ $((now-mtime)) -lt 21600 ]; then latest="$(jq -r '.latest // empty' "$cache" 2>/dev/null)"; fi
+  fi
+  if [ -z "$latest" ]; then
+    tmp="$(mktemp /tmp/.xkit-version.XXXXXX)" || return 1
+    curl -fsSL --connect-timeout 4 --max-time 10 "${base}/xkit.sh" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    nv="$(grep -m1 '^XKIT_VERSION=' "$tmp" | cut -d'"' -f2)"; rm -f "$tmp"
+    [[ "$nv" =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1
+    latest="$nv"
+    jq -nc --arg latest "$latest" --argjson checked "$now" '{latest:$latest,checked_at:$checked}' \
+      | _xkit_atomic_write "$cache" || return 1
+    chmod 600 "$cache" 2>/dev/null || true
+  fi
+  if [ "$latest" != "$XKIT_VERSION" ] && [ "$(printf '%s\n%s\n' "$XKIT_VERSION" "$latest" | sort -V | tail -1)" = "$latest" ]; then
+    [ "$quiet" = 1 ] || ok "Доступно обновление XKIT: v${XKIT_VERSION} -> v${latest}"
+  else
+    latest=""
+    [ "$quiet" = 1 ] || ok "Установлена актуальная версия XKIT v${XKIT_VERSION}"
+  fi
+  [ -n "$latest" ] && printf '%s\n' "$latest"
+  return 0
+}
+
 # v5.0.0: обновляются ОБА файла — xkit.sh (ядро) и xkit_menu.sh (модуль меню).
 # Пломба xkit.sh.sha256 — формат sha256sum, 2 строки; строка 1 = xkit.sh,
 # строка 2 = xkit_menu.sh (старые версии читают строку 1 — совместимость)
@@ -8055,6 +8338,7 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
   rm -f "$tmp" "$sumf"; [ -n "$tmpm" ] && rm -f "$tmpm"
   # v5.2: после ядра/меню атомарно обновляем модуль протоколов и TUI.
   xkit_extras_install || warn "Дополнительные компоненты обновятся при следующем запуске"
+  rm -f "${XKIT_DIR}/update-check.json"
   ok "Обновлено: v${XKIT_VERSION} -> v${nv} ($XKIT_BIN); резервная копия: ${XKIT_BIN}.bak"
   ok "Конфиг nginx, состояние и подписки не тронуты"
   return 0
@@ -8371,6 +8655,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes apply --canary <имя> | --remaining — поэтапное применение
   xkit nodes token set|remove <имя> — scoped API token (0600, не argv)
   xkit nodes relogin <имя|all> [none] — обновить API-токен ноды из install-result.env (Bearer вместо пароля)
+  xkit nodes panel-sync <имя|all> — добавить/обновить «Узлы» 3X-UI без импорта инбаундов
   xkit nodes cert <имя|all> [self|ip|domain|wildcard] [домен] — сертификат панели ноды (wildcard выпускает мастер по dns-01)
   xkit nodes cert show — таблица сертификатов/камо нод
   xkit nodes cert-renew [имя|--cron] — продление wildcard-линейджей мастера + пере-раздача нодам
@@ -8415,6 +8700,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit camo status|files — состояние и файлы, которые можно заменить вручную
   xkit camo regenerate [seed] — новый случайный сайт; seed = воспроизводимый вариант
   xkit update [URL]    — обновить xkit из репозитория (SHA-256 + бэкап; URL = .../main)
+  xkit update --check [--force] — проверить новую версию (кэш 6 часов)
   xkit help            — эта справка
 
 Неинтерактивный режим (CI/cloud-init): XKIT_YES=1 (согласие на вопросы) и
@@ -8475,6 +8761,7 @@ xkit_main_impl() {
                token) shift
                       case "${1:-}" in set) node_token_set "${2:-}" ;; remove) node_token_revoke_local "${2:-}" ;; *) err "nodes token set|remove <имя>"; exit 1 ;; esac ;;
                relogin) shift; node_relogin "${1:-all}" "${2:-}" ;;
+               panel-sync) shift; node_panel_sync "${1:-}" ;;
                cert) shift; node_cert_dispatch "$@" ;;
                cert-renew) shift; node_cert_dispatch renew "$@" ;;
                camo) shift; node_camo_dispatch "$@" ;;
@@ -8572,7 +8859,7 @@ xkit_main_impl() {
             case "${1:-show}" in collect) traffic_ledger_collect && ok "Ledger обновлён" ;; show) traffic_ledger_show ;; quota-check) traffic_ledger_quota_check "${2:-}" ;; *) err "ledger collect|show|quota-check <bytes>"; exit 1 ;; esac ;;
     geodata) shift; require_root
              case "${1:-}" in update) shift; geodata_update "$@" ;; *) err "geodata update <tag> <geoip-sha256> <geosite-sha256>"; exit 1 ;; esac ;;
-    update)  shift; xkit_self_update "${1:-}" ;;
+    update)  shift; if [ "${1:-}" = "--check" ]; then shift; xkit_update_check "$@"; else xkit_self_update "${1:-}"; fi ;;
     info)    require_root; xkit_info ;;
     help|-h|--help) usage ;;
     *) err "Неизвестная команда: $1 (xkit help)"; exit 1 ;;
@@ -10415,6 +10702,7 @@ node_token_set() {
   local rc=$?; rm -f "$rec_file"; [ "$rc" -eq 0 ] || return 1
   audit_event nodes.token.set "$want" ok
   ok "Scoped token проверен и сохранён с mode 0600; старый пароль оставлен как fallback"
+  [ -z "$(jq -r '.panel_node_id // empty' <<<"$rec")" ] || node_panel_sync "$want" || warn "Токен в «Узлах» 3X-UI не обновлён: xkit nodes panel-sync ${want}"
 }
 
 node_token_revoke_local() {
@@ -10604,6 +10892,7 @@ node_readdress() { # name new-ip [--dry-run]
   fi
   audit_event nodes.readdress "$want" ok
   ok "Адрес ноды изменён без переустановки. Snapshot: $backup"
+  [ -z "$(jq -r '.panel_node_id // empty' <<<"$testrec")" ] || node_panel_sync "$want" || warn "Адрес в «Узлах» 3X-UI не обновлён: xkit nodes panel-sync ${want}"
   warn "REALITY не требует перевыпуска собственного сертификата; TLS/Hysteria сертификат обновляется только если старый IP входил в SAN"
 }
 
