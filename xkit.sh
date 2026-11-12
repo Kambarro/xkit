@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.10 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.12 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.10"
+XKIT_VERSION="7.4.12"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -1987,6 +1987,8 @@ api_post_form() { # $1 путь; далее key=value
 # (старые v2-пути inbounds/addClient, inbounds/:id/delClient/:cid в v3 УДАЛЕНЫ)
 api_add_client() { # $1 id инбаунда, $2 JSON ОДНОГО клиента, $3 текущая строка settings (для v2)
   local id="$1" cj="$2" settings="$3" resp
+  cj="$(jq -c 'if .tgId? == "" then del(.tgId) elif (.tgId?|type)=="string" then .tgId = (.tgId | if test("^-?[0-9]+$") then tonumber else error("tgId must be an integer") end) else . end' <<<"$cj")" \
+    || { err "addClient: tgId должен быть целым числом или отсутствовать"; return 1; }
   if [ "$API_V3" = "1" ]; then
     local body
     body="$(jq -nc --argjson c "$cj" --argjson i "$id" '{client:$c, inboundIds:[$i]}')"
@@ -3085,7 +3087,8 @@ client_add_all() {
   done < <(jq -c '.[]' <<<"$INBOUNDS")
 
   echo ""
-  ok "Итог: добавлен в ${added} инбаунд(ов), пропущено/ошибок: ${failed}"
+  if [ "$failed" -gt 0 ]; then warn "Итог: добавлен в ${added} инбаунд(ов), пропущено/ошибок: ${failed}"
+  else ok "Итог: добавлен во все ${added} инбаунд(ов)"; fi
   [ "$added" -gt 0 ] || { err "Ни один инбаунд не принял пользователя"; return 1; }
   sub_regen_quiet || true
   local sp; sp="$(sub_path)"
@@ -3093,7 +3096,7 @@ client_add_all() {
   ok "ЕДИНАЯ подписка пользователя (${email}):"
   printf '  base64:       https://%s%s%s\n' "$XKIT_HOST" "$sp" "$subid"
   printf '  Clash/Mihomo: https://%s%s%s.yaml\n' "$XKIT_HOST" "$sp" "$subid"
-  return 0
+  [ "$failed" -eq 0 ]
 }
 
 #=========================== РУЧНОЙ РЕЛЕЙ-МАРШРУТ =============================
@@ -6216,12 +6219,12 @@ EOS
       [ -n "$plink" ] && { echo ""; ok "Ссылка ПОЛА (трафик балансируется по нодам):"; printf '  %s\n' "$plink"; }
     fi
   fi
-  read -r -p "Срок аренды ноды '${nname}' (YYYY-MM-DD, Enter — пропустить): " dex
+  read -r -p "Срок аренды ноды '${nname}' (DD.MM.YYYY или YYYY-MM-DD, Enter — пропустить): " dex
   if [ -n "$dex" ]; then
     if expiry_set node "$nname" "$dex" ""; then
       ok "Срок аренды сохранён: ${dex} (виден в веб-дашборде и xkit expiry list)"
     else
-      warn "Дата не распознана — задайте позже: xkit expiry set ${nname} YYYY-MM-DD"
+      warn "Дата не распознана — задайте позже: xkit expiry set ${nname} DD.MM.YYYY"
     fi
   fi
   echo ""
@@ -6803,7 +6806,10 @@ expiry_note() { # $1 scope, $2 id -> заметка
 
 expiry_set() { # $1 scope, $2 id, $3 date, $4 note
   local scope="$1" id="$2" d="$3" note="${4:-}"
-  [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { err "Дата в формате YYYY-MM-DD (например 2027-01-15)"; return 1; }
+  if [[ "$d" =~ ^([0-9]{2})\.([0-9]{2})\.([0-9]{4})$ ]]; then
+    d="${BASH_REMATCH[3]}-${BASH_REMATCH[2]}-${BASH_REMATCH[1]}"
+  fi
+  [[ "$d" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { err "Дата в формате DD.MM.YYYY или YYYY-MM-DD (например 15.01.2027)"; return 1; }
   date -d "$d" +%s >/dev/null 2>&1 || { err "Некорректная дата: $d"; return 1; }
   # заметка не должна ломать tab-separated формат (4-е поле съедает остаток)
   note="${note//$'\t'/ }"; note="${note//$'\r'/ }"; note="${note//$'\n'/ }"
@@ -6890,7 +6896,7 @@ expiry_menu_set() {
     scope="master"; id="-"
   fi
   local d note
-  read -r -p "Дата окончания аренды (YYYY-MM-DD): " d
+  read -r -p "Дата окончания аренды (DD.MM.YYYY или YYYY-MM-DD): " d
   read -r -p "Заметка (провайдер/тариф, Enter — нет): " note
   expiry_set "$scope" "$id" "$d" "$note" || return 1
   xkit_summary_save >/dev/null 2>&1 || true
@@ -7667,7 +7673,7 @@ dash_install() {
   local mexp mexd
   mexp="$(expiry_get master -)"
   if [ -z "$mexp" ]; then
-    read -r -p "Срок аренды ЭТОГО сервера (YYYY-MM-DD, Enter — пропустить): " mexd
+    read -r -p "Срок аренды ЭТОГО сервера (DD.MM.YYYY или YYYY-MM-DD, Enter — пропустить): " mexd
     [ -n "$mexd" ] && expiry_set master "-" "$mexd" ""
   fi
 
@@ -8657,6 +8663,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit --classic       — классическое Bash-меню (6 групп с подменю)
   xkit protocols       — REALITY/XHTTP/AmneziaWG/Hysteria 2
   xkit protocols list [--json] — санитизированная сводка профилей
+  xkit protocols remove — удалить выбранный inbound и обновить nginx/подписки
   xkit snapshot        — JSON состояния для TUI (без секретов)
   xkit install         — установка одним шагом (при уже установленном — меню:
                          обновить / переустановить чисто / починить поверх)
@@ -8773,7 +8780,7 @@ xkit_main_impl() {
              else [ "${1:-}" = "-q" ] && export SUB_QUIET=1; require_root; sub_regen; fi ;;
     client)  shift; require_root
              case "${1:-list}" in
-               add) client_add ;; del) client_del ;; list) client_list ;; reset) client_reset ;;
+               add) client_add_all ;; del) client_del ;; list) client_list ;; reset) client_reset ;;
                all) client_add_all ;;
                *) err "xkit client add|all|del|list|reset"; exit 1 ;;
              esac ;;
@@ -9794,6 +9801,25 @@ proto_panel_uninstall() {
   return 0
 }
 
+protocol_remove() {
+  load_xkit_env || die "Сначала установка XKIT"; kit_session || return 1
+  routes_load; list_inbounds_menu || return 1
+  local ib="$PICK_IB" id proto port remark clients
+  id="$(jq -r '.id' <<<"$ib")"; proto="$(jq -r '.protocol' <<<"$ib")"
+  port="$(jq -r '.port' <<<"$ib")"; remark="$(jq -r '.remark // ""' <<<"$ib")"
+  clients="$(jq -r '[.settings|if type=="string" then fromjson else . end|.clients[]?]|length' <<<"$ib")"
+  confirm "Удалить inbound #$id ($proto, порт $port) и его пользователей ($clients)? Остальные протоколы не изменятся. [y/N] " n || { warn "Отменено"; return 0; }
+  api_del_inbound "$id" || return 1
+  routes_del "$id"
+  case "$proto:$remark" in
+    hysteria:hysteria2-[0-9]*) xkit_fw_remove hysteria2 "$port" udp || warn "Проверьте UDP-правило $port" ;;
+    amneziawg:amneziawg-[0-9]*) xkit_fw_remove awg "$port" udp || warn "Проверьте UDP-правило $port" ;;
+  esac
+  regen_conf_and_apply || { err "Inbound удалён, но nginx не обновлён — выполните xkit route --yes"; return 1; }
+  sub_regen_quiet || { warn "Inbound удалён; подписки обновите командой xkit sub"; return 1; }
+  ok "Протокол #$id удалён; остальные inbound, пользователи и маршруты не затронуты"
+}
+
 proto_panel_status() {
   load_xkit_env 2>/dev/null || true
   proto_state_load 2>/dev/null || true
@@ -10726,7 +10752,7 @@ node_token_set() {
   [ -n "$rec" ] || { err "Нода не найдена"; return 1; }
   read -r -s -p "Scoped API token для $want: " token || { echo; return 1; }; echo
   [[ "$token" =~ ^[A-Za-z0-9._~-]{20,512}$ ]] || { err "Токен пуст или имеет неподдерживаемый формат"; return 1; }
-  read -r -p "Истекает YYYY-MM-DD (Enter — не задан): " expires || return 1
+  read -r -p "Истекает DD.MM.YYYY или YYYY-MM-DD (Enter — не задан): " expires || return 1
   if [ -n "$expires" ] && ! [[ "$expires" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then err "Формат даты"; return 1; fi
   ck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)" || return 1
   out="$(XKIT_NODE_API_TOKEN="$token" node_api "$rec" panel/api/inbounds/list GET "" "$ck" 2>/dev/null)"; rm -f "$ck"
@@ -11095,7 +11121,7 @@ print(json.dumps(c,separators=(",",":")))
 
 master_xray_template_get() {
   local resp
-  if [ "$API_V3" = 1 ]; then resp="$(api_post_json panel/api/xray/ '{}')"; jq -c '.obj.xraySetting//{}|if type=="string" then fromjson else . end' <<<"$resp"
+  if [ "$API_V3" = 1 ]; then resp="$(api_post_json panel/api/xray/ '{}')"; jq -c '.obj|if type=="string" then fromjson else . end|.xraySetting//{}|if type=="string" then fromjson else . end' <<<"$resp"
   else resp="$(panel_settings_get)"; jq -c '.obj.xrayTemplateConfig//{}|if type=="string" then fromjson else . end' <<<"$resp"; fi
 }
 master_xray_template_set() {

@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v7.4.10 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v7.4.12 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -710,15 +710,16 @@ protocols_menu() {
     echo '4) Hysteria 2 (в панели — рекомендуется; можно отдельной службой)'
     echo '5) Панельный режим: AWG + Hy2 как инбаунды панели (вкл/выкл)'
     echo '6) Профили UDP-портов и совместимость'
+    echo '7) Удалить протокол (конкретный inbound, с подтверждением)'
     echo '0) Назад'
     read -r -p 'Протоколы: ' c || return
-    case "$c" in 1) reality_wizard ;; 2) proto_xhttp_create ;; 3) proto_awg_menu ;; 4) proto_hy2_menu ;; 5) proto_panel_menu ;; 6) proto_ports_list ;; 0) return ;; *) warn 'Нет такого пункта' ;; esac
+    case "$c" in 1) reality_wizard ;; 2) proto_xhttp_create ;; 3) proto_awg_menu ;; 4) proto_hy2_menu ;; 5) proto_panel_menu ;; 6) proto_ports_list ;; 7) protocol_remove ;; 0) return ;; *) warn 'Нет такого пункта' ;; esac
   done
 }
 
 protocols_main() {
   case "${1:-menu}" in
-    menu) protocols_menu ;; list) protocols_list "${2:-}" ;; status) protocols_list ;;
+    menu) protocols_menu ;; list) protocols_list "${2:-}" ;; status) protocols_list ;; remove) protocol_remove ;;
     reality) reality_wizard ;; xhttp) proto_xhttp_create ;;
     awg) case "${2:-menu}" in menu) proto_awg_menu ;; install) proto_awg_install ;; add) proto_awg_add ;; list) proto_awg_list ;; show) proto_awg_show ;; upgrade31) proto_awg_upgrade31 ;; status) systemctl status awg-quick@awg0 --no-pager ;; uninstall) proto_awg_uninstall ;; *) return 1 ;; esac ;;
     hysteria2|hy2) case "${2:-menu}" in menu) proto_hy2_menu ;; install) proto_hy2_install ;; link) proto_hy2_link ;; camo-check) proto_hy2_camo_check "${3:-}" ;; status) systemctl status xkit-hysteria2 --no-pager ;; uninstall) proto_hy2_uninstall ;; *) return 1 ;; esac ;;
