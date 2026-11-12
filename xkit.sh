@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.7 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.9 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.7"
+XKIT_VERSION="7.4.9"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -1599,7 +1599,7 @@ save_xkit_env() {
       printf 'XKIT_PANEL_SUB_PORT=%q\n' "${XKIT_PANEL_SUB_PORT:-}"
       printf 'XKIT_PANEL_SUB_PATH=%q\n' "${XKIT_PANEL_SUB_PATH:-}"
       printf 'XKIT_REALITY_INTERNAL=%q\n' "${XKIT_REALITY_INTERNAL:-0}"
-      printf 'XKIT_BAL_STRATEGY=%q\n' "${XKIT_BAL_STRATEGY:-roundRobin}"
+      printf 'XKIT_BAL_STRATEGY=%q\n' "${XKIT_BAL_STRATEGY:-leastLoad}"
       printf 'XKIT_POOL_INBOUND=%q\n' "${XKIT_POOL_INBOUND:-}"
       printf 'XKIT_POOL_TAG=%q\n' "${XKIT_POOL_TAG:-}"
       printf 'XKIT_REPO_URL=%q\n' "${XKIT_REPO_URL:-}"
@@ -1632,7 +1632,7 @@ load_xkit_env() {
   local _script_ver="${XKIT_VERSION:-}"
   XKIT_HOST=""; XKIT_CRT=""; XKIT_KEY=""; XKIT_CERT_MODE=""; XKIT_SUB_TOKEN=""; XKIT_UFW="0"
   XKIT_PANEL_SUB_PORT=""; XKIT_PANEL_SUB_PATH=""; XKIT_REALITY_INTERNAL="0"
-  XKIT_BAL_STRATEGY="roundRobin"; XKIT_POOL_INBOUND=""; XKIT_POOL_TAG=""
+  XKIT_BAL_STRATEGY="leastLoad"; XKIT_POOL_INBOUND=""; XKIT_POOL_TAG=""
   XKIT_DASH="0"; XKIT_DASH_TOKEN=""; XKIT_DASH_ALLOW=""
   XKIT_DASH_AUTH="1"; XKIT_DASH_USER=""; XKIT_DASH_PASS=""
   XKIT_TG_TOKEN=""; XKIT_TG_CHAT=""; XKIT_TG_PROXY=""; XKIT_TG_ADMINS=""
@@ -3946,7 +3946,7 @@ show_status() {
   # v4.5: явный режим — «мастер» это состояние (nodes.json не пуст), а не отдельная установка
   local ncnt; ncnt="$(nodes_load 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
   if [ "$ncnt" -gt 0 ]; then
-    echo "  Режим:   мастер (${ncnt} нод; балансировка ${XKIT_BAL_STRATEGY:-roundRobin})"
+    echo "  Режим:   мастер (${ncnt} нод; балансировка ${XKIT_BAL_STRATEGY:-leastLoad})"
   else
     echo "  Режим:   одиночный сервер (ноды не подключены)"
   fi
@@ -5526,7 +5526,7 @@ if os.path.isfile(src):
 else:
     nodes = json.loads(src)
 pool_tag = sys.argv[3]
-strategy = sys.argv[4] if sys.argv[4] in ("roundRobin", "random", "leastPing", "leastLoad") else "roundRobin"
+strategy = sys.argv[4] if sys.argv[4] in ("roundRobin", "random", "leastPing", "leastLoad") else "leastLoad"
 
 outb = tpl.get("outbounds") or []
 outb = [o for o in outb if not str(o.get("tag", "")).startswith("node-")]
@@ -5575,7 +5575,8 @@ r["rules"] = rules
 bal = r.get("balancers") or []
 bal = [b for b in bal if b.get("tag") != "XKIT_POOL"]
 if nodes:
-    bal.append({"tag": "XKIT_POOL", "selector": ["node-"], "strategy": {"type": strategy}})
+    bal.append({"tag": "XKIT_POOL", "selector": ["node-"], "strategy": {"type": strategy,
+                **({"expected": 1} if strategy == "leastLoad" else {})}})
 r["balancers"] = bal
 
 tpl.pop("observatory", None)
@@ -5588,7 +5589,7 @@ if nodes and strategy == "leastLoad":
     tpl["burstObservatory"] = {"subjectSelector": ["node-"],
                                "pingConfig": {"destination": "https://www.google.com/generate_204",
                                               "connectivity": "http://www.google.com/generate_204",
-                                              "interval": "1m", "timeout": "5s", "sampling": 2}}
+                                              "interval": "15s", "timeout": "5s", "sampling": 20}}
 print(json.dumps(tpl, ensure_ascii=False, separators=(",", ":")))
 PY
 }
@@ -5604,7 +5605,7 @@ nodes_apply_template() {
   chmod 600 "$nodes_file" 2>/dev/null || true
   printf '%s' "$nodes_json" > "$nodes_file"
   local mrc=0
-  merged="$(nodes_merge_template "$cur" "$nodes_file" "${XKIT_POOL_TAG:-}" "${XKIT_BAL_STRATEGY:-roundRobin}")" || mrc=$?
+  merged="$(nodes_merge_template "$cur" "$nodes_file" "${XKIT_POOL_TAG:-}" "${XKIT_BAL_STRATEGY:-leastLoad}")" || mrc=$?
   rm -f "$nodes_file"
   [ "$mrc" -eq 0 ] || { err "Не удалось собрать шаблон xray"; return 1; }
   master_xray_template_set "$merged"
@@ -5740,7 +5741,7 @@ node_panel_sync() { # $1 имя ноды
       apiToken:$token,enable:true,allowPrivateAddress:true,
       tlsVerifyMode:(if $scheme=="https" then "pin" else "verify" end),pinnedCertSha256:$pin,
       inboundSyncMode:"selected",inboundTags:[],outboundTag:""}')"
-  resp="$(api "$path" POST "$body")" || { err "${n}: мастер-панель не приняла ноду"; return 1; }
+  resp="$(api_post_json "$path" "$body")" || { err "${n}: мастер-панель не приняла ноду"; return 1; }
   jq -e '.success == true' <<<"$resp" >/dev/null 2>&1 || {
     err "${n}: $(jq -r '.msg // "ошибка регистрации в разделе Узлы"' <<<"$resp")"; return 1;
   }
@@ -6240,7 +6241,7 @@ EOS
   else
     warn "Панель ноды: ${psch}://${nhost}:${np_port}${nbase} (UFW не управляется XKIT)"
   fi
-  ok "Стратегия: ${XKIT_BAL_STRATEGY:-roundRobin} (сменить: Ноды -> стратегия)"
+  ok "Стратегия: ${XKIT_BAL_STRATEGY:-leastLoad} (сменить: Ноды -> стратегия)"
   # (7.4.0): реквизиты панели ноды показываем в конце установки — пользователь
   # должен видеть логин/пароль один раз глазами, не выковыривая их из реестра
   echo ""
@@ -6449,7 +6450,7 @@ nodes_list() {
   while IFS=$'\t' read -r n h sp tp sni pp; do
     printf '%-10s %-22s %-6s %-9s %-24s %-8s\n' "$n" "$h" "$sp" "$tp" "$sni" "$pp"
   done < <(jq -r '.[] | [.name, .host, (.ssh_port|tostring), (.tunnel.port|tostring), .tunnel.sni, (.panel.port|tostring)] | @tsv' <<<"$arr")
-  ok "Стратегия: ${XKIT_BAL_STRATEGY:-roundRobin}"
+  ok "Стратегия: ${XKIT_BAL_STRATEGY:-leastLoad}"
   return 0
 }
 
@@ -6507,11 +6508,12 @@ nodes_strategy() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   echo ""
   echo "Стратегия балансировки (xray balancer):"
-  echo "1) roundRobin — по кругу (по умолчанию)"
+  echo "1) roundRobin — по кругу"
   echo "2) random     — случайно"
   echo "3) leastPing  — УМНАЯ: observatory пингует ноды, трафик идёт на самую быструю"
-  echo "4) leastLoad  — УМНАЯ: burst-замеры, выбор наименее загруженной/быстрой"
-  read -r -p "Выбор [1-4]: " s
+  echo "4) leastLoad  — стабильная нода, burst-замеры 5 минут (по умолчанию)"
+  read -r -p "Выбор [1-4, Enter = 4]: " s
+  s="${s:-4}"
   case "$s" in
     1) XKIT_BAL_STRATEGY="roundRobin" ;;
     2) XKIT_BAL_STRATEGY="random" ;;
@@ -6556,7 +6558,7 @@ nodes_del() {
   fi
   local panel_id; panel_id="$(jq -r '.panel_node_id // empty' <<<"$rec")"
   if [ -n "$panel_id" ] && confirm "Удалить запись из раздела «Узлы» мастер-панели? [y/N] " n; then
-    if kit_session >/dev/null 2>&1 && api "panel/api/nodes/del/${panel_id}" POST "" | jq -e '.success == true' >/dev/null 2>&1; then
+    if kit_session >/dev/null 2>&1 && api_post_json "panel/api/nodes/del/${panel_id}" "" | jq -e '.success == true' >/dev/null 2>&1; then
       ok "Запись удалена из «Узлов» 3X-UI"
     else
       warn "Запись в «Узлах» не удалена (возможны привязанные инбаунды) — проверьте панель"
@@ -7451,7 +7453,7 @@ dash_gen_locked() {
   local data
   data="$(jq -n \
       --arg v "$XKIT_VERSION" --arg host "$XKIT_HOST" \
-      --arg panel "$panel_st" --arg strat "${XKIT_BAL_STRATEGY:-roundRobin}" \
+      --arg panel "$panel_st" --arg strat "${XKIT_BAL_STRATEGY:-leastLoad}" \
       --arg mode "$mode" \
       --arg gen_str "$(date '+%Y-%m-%d %H:%M:%S %Z')" \
       --argjson gen "$(date +%s)" \
@@ -8145,7 +8147,7 @@ xkit_summary_text() { # stdout: plain-текст без цветов
     # v4.5: явный режим сервера
     local nc; nc="$(jq 'length' <<<"$(nodes_load 2>/dev/null || printf '[]')" 2>/dev/null || echo 0)"
     if [ "$nc" -gt 0 ]; then
-      L+=("Режим:             мастер (${nc} нод; балансировка ${XKIT_BAL_STRATEGY:-roundRobin})")
+      L+=("Режим:             мастер (${nc} нод; балансировка ${XKIT_BAL_STRATEGY:-leastLoad})")
     else
       L+=("Режим:             одиночный сервер (ноды не подключены)")
     fi
@@ -11093,7 +11095,7 @@ print(json.dumps(c,separators=(",",":")))
 
 master_xray_template_get() {
   local resp
-  if [ "$API_V3" = 1 ]; then resp="$(api_post_json panel/api/xray/ '{}')"; jq -c '.obj.xraySetting//{}' <<<"$resp"
+  if [ "$API_V3" = 1 ]; then resp="$(api_post_json panel/api/xray/ '{}')"; jq -c '.obj.xraySetting//{}|if type=="string" then fromjson else . end' <<<"$resp"
   else resp="$(panel_settings_get)"; jq -c '.obj.xrayTemplateConfig//{}|if type=="string" then fromjson else . end' <<<"$resp"; fi
 }
 master_xray_template_set() {

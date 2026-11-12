@@ -4,7 +4,7 @@
 
 **TUI и мастер-меню для nginx + 3X-UI: VPN-панель, подписки, REALITY, ноды, балансировка и мониторинг — в одном инструменте.**
 
-![Version](https://img.shields.io/badge/version-7.4.7-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-7.4.9-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -358,7 +358,7 @@ sudo xkit protocols panel install   # панельный режим: AWG+Hy2 к�
 - пароль передаётся через `sshpass -e`, без раскрытия в аргументах процесса;
 - HTTPS и пин публичного ключа для API панели ноды;
 - API-токен панели ноды (3X-UI v3.11+): авто-сбор из install-result.env по SSH при добавлении, Bearer вместо логина+CSRF (не зависит от пароля и 2FA); обновление — `xkit nodes relogin`;
-- стратегии `roundRobin`, `random`, `leastPing` и `leastLoad`;
+- стратегии `roundRobin`, `random`, `leastPing` и `leastLoad`; по умолчанию `leastLoad` выбирает одну стабильную ноду по burst-замерам за окно около 5 минут (20 выборок, `interval: 15s`);
 - health-check туннеля и панели, `repair`, `repin` и удаление ноды;
 - автоматическая регистрация в родном разделе **«Узлы» 3X-UI v3.11+**: доступность, версии панели/Xray и штатные метрики. Всегда передаются `inboundSyncMode:"selected"`, `inboundTags:[]` и пустой `outboundTag`: инбаунды не импортируются, туннели и балансировка XKIT не меняются. Повтор — `xkit nodes panel-sync ИМЯ|all`; ошибка панели не откатывает ноду.
 
