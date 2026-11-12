@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.1 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.2 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.1"
+XKIT_VERSION="7.4.2"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -1872,6 +1872,24 @@ api_post() { # $1 путь, $2 JSON-тело (пусто = без тела)
   _api_post_guard_run _api_post_once "$url" "${2:-}"
 }
 
+# v7.4.2: нормализация wire-формата инбаундов. 3X-UI v3 отдаёт поля
+# settings/streamSettings/sniffing/allocate ВЛОЖЕННЫМИ ОБЪЕКТАМИ, а не
+# JSON-строками (живой лог 7.4.1: инбаунды создаются, но «Подписки: ссылок 0» —
+# весь код xkit читает их как '.settings|fromjson' и получал null). Приводим к
+# v2-wire (компактные JSON-строки) на входе — вся существующая логика (подписки,
+# клиенты, классификация, экспирация) работает одинаково на v2 и v3.
+# На запись панели v3 строки по-прежнему принимают (официальные API-docs:
+# «legacy callers that send them back as JSON-encoded strings are still
+# accepted on write»), поэтому add/update round-trip не меняется.
+_ib_wire_v2_norm() { # stdin: один инбаунд ИЛИ массив -> stdout: поля как строки
+  jq -c 'def n:
+    (if ((.settings // null) | type) == "object"      then .settings      |= tojson else . end)
+    | (if ((.streamSettings // null) | type) == "object" then .streamSettings |= tojson else . end)
+    | (if ((.sniffing // null) | type) == "object"      then .sniffing      |= tojson else . end)
+    | (if ((.allocate // null) | type) == "object"      then .allocate      |= tojson else . end);
+    if type == "array" then map(n) else n end'
+}
+
 api_list() {
   local out
   out="$(api_get list)" || { err "Панель не отвечает на запрос списка инбаундов"; return 1; }
@@ -1879,7 +1897,7 @@ api_list() {
     err "API list: $(api_err_msg "$out" | head -c 200)"
     return 1
   fi
-  jq '.obj // []' <<<"$out"
+  jq '(.obj // [])' <<<"$out" | _ib_wire_v2_norm
 }
 
 # полный JSON одного инбаунда по id
@@ -1887,7 +1905,7 @@ api_get_inbound() {
   local out
   out="$(api_get "get/$1")" || return 1
   jq -e '.success == true' <<<"$out" >/dev/null 2>&1 || return 1
-  jq '.obj' <<<"$out"
+  jq '(.obj // null)' <<<"$out" | _ib_wire_v2_norm
 }
 
 # обновить инбаунд целиком (панель применит listen/streamSettings)
@@ -2484,8 +2502,72 @@ _link_proto() { # proto email host port net sec path svc sni pbk sid fp flow cli
       fi
       link="hysteria2://$(enc_uri "$pass")@${host}:${port}?${hq}&alpn=h3#${e}" ;;
 
-    amneziawg|wireguard)
-      # vpn:// (конфиг AmneziaVPN) рендерит сама панель — попадает в подписку
+    amneziawg)
+      # v7.4.2: vpn:// (base64 клиентского .conf AmneziaVPN) собираем САМИ —
+      # раньше полагались на panel_sub_links, но нативный sub-сервер панели
+      # может быть не настроен/изменён, и AmneziaWG-клиент выпадал из подписки.
+      # Формат 1:1 с фронтендом 3x-ui (frontend/src/pages/clients/amneziaWGConfig.ts):
+      # [Interface] ключи клиента + обфускация СЕРВЕРА, [Peer] PublicKey сервера,
+      # Endpoint = наш домен:порт. AllowedIPs туннеля — весь трафик (0.0.0.0/0).
+      local st sv cpriv cpsk cip cka conf
+      st="$(jq -r '.settings|if type=="string" then (fromjson? // {}) else . end' <<<"$ib")"
+      sv="$(jq -c '.server // {}' <<<"$st")"
+      cpriv="$(jq -r '.privateKey // .password // ""' <<<"$cl")"
+      [ -n "$cpriv" ] || return 0
+      cip="$(jq -r '(.allowedIPs // [])[0] // ""' <<<"$cl")"
+      [ -n "$cip" ] || cip="10.8.1.2/32"
+      cpsk="$(jq -r '.preSharedKey // ""' <<<"$cl")"
+      cka="$(jq -r '.keepAlive // 0' <<<"$cl")"
+      [[ "$cka" =~ ^[0-9]+$ ]] || cka=0
+      conf="$(jq -rn --arg priv "$cpriv" --arg addr "$cip" --arg psk "$cpsk" \
+                --argjson ka "$cka" --argjson sv "$sv" --arg rem "${tag:-inbound} - ${email}" \
+                --arg host "$host" --arg port "$port" '
+        def h($k; $v; $d): "\($k) = \(if ($v // "" | tostring | length) > 0 then ($v|tostring) else $d end)";
+        [ "[Interface]",
+          "PrivateKey = \($priv)",
+          "Address = \($addr)",
+          (if ([($sv.primaryDns // ""), ($sv.secondaryDns // "")] | map(select(. != "")) | length) > 0
+           then "DNS = \([($sv.primaryDns // ""), ($sv.secondaryDns // "")] | map(select(. != "")) | join(", "))"
+           else empty end),
+          "MTU = \($sv.mtu // 1280)",
+          "Jc = \($sv.jc // 5)",
+          "Jmin = \($sv.jmin // 10)",
+          "Jmax = \($sv.jmax // 50)",
+          "S1 = \($sv.s1 // 30)",
+          "S2 = \($sv.s2 // 45)",
+          (if ($sv.s3 // 0) != 0 then "S3 = \($sv.s3)" else empty end),
+          (if ($sv.s4 // 0) != 0 then "S4 = \($sv.s4)" else empty end),
+          h("H1"; $sv.h1; "1"),
+          h("H2"; $sv.h2; "2"),
+          h("H3"; $sv.h3; "3"),
+          h("H4"; $sv.h4; "4"),
+          ([$sv.i1, $sv.i2, $sv.i3, $sv.i4, $sv.i5] | to_entries[]
+             | select((.value // "") != "") | "I\(.key+1) = \(.value)"),
+          ([{k:"HeaderProtectionKey",v:$sv.headerProtectionKey},
+             {k:"ContentPaddingAddition",v:$sv.contentPaddingAddition},
+             {k:"RekeyAfterTime",v:$sv.rekeyAfterTime},
+             {k:"RekeyTimeout",v:$sv.rekeyTimeout},
+             {k:"RejectAfterTime",v:$sv.rejectAfterTime},
+             {k:"KeepaliveTimeout",v:$sv.keepaliveTimeout},
+             {k:"MaxHandshakeAttempts",v:$sv.maxHandshakeAttempts}][]
+             | select((.v // "") != "") | "\(.k) = \(.v)"),
+          (if ($sv.randomTrailers // false) then "RandomTrailers = on" else empty end),
+          (if ($sv.disableCookies // false) then "DisableCookies = on" else empty end),
+          "",
+          "# \($rem)",
+          "[Peer]",
+          "PublicKey = \($sv.publicKey // "")",
+          (if ($psk != "") then "PresharedKey = \($psk)" else empty end),
+          "AllowedIPs = 0.0.0.0/0, ::/0",
+          "Endpoint = \($host):\($port)",
+          (if $ka > 0 then "PersistentKeepalive = \($ka)" else empty end)
+        ] | join("\n")')"
+      # пустой PublicKey сервера = битый конфиг — ссылку не отдаём
+      [ -n "$(jq -r '.publicKey // ""' <<<"$sv")" ] || return 0
+      link="vpn://$(printf '%s' "$conf" | base64 -w0)" ;;
+
+    wireguard)
+      # wireguard:// URI рендерит сама панель — попадает в подписку
       # через panel_sub_links; свою реализацию формата не дублируем
       return 0 ;;
 
@@ -2496,15 +2578,39 @@ _link_proto() { # proto email host port net sec path svc sni pbk sid fp flow cli
 
 #=========================== ПОДПИСКИ =========================================
 sub_regen_quiet() { SUB_QUIET=1 sub_regen; }
-# v6.0.0: ссылки, которые рендерит САМА панель (vpn:// AmneziaWG и другие
-# протоколы ядра 26.x). Берем из нативной подписки панели (127.0.0.1:subPort),
-# вырезаем только валидные схемы ссылок (панель может отдать HTML-страницу
-# браузерному UA — мусор в подписки не попадает). Не настроено/недоступно — пусто.
+# v6.0.0: ссылки, которые рендерит САМА панель. Берем из нативной подписки панели
+# (127.0.0.1:subPort), вырезаем только валидные схемы ссылок (панель может отдать
+# HTML-страницу браузерному UA — мусор в подписки не попадает). Не настроено/
+# недоступно — пусто.
+# v7.4.2: vpn:// ИСКЛЮЧЁН — AmneziaWG-конфиги xkit теперь собирает сам
+# (link_for_client), а дубль «наш vpn:// + панельный vpn://» с разным remark
+# показывался бы в клиенте двумя одинаковыми серверами.
 panel_sub_links() { # $1 subId -> строки ссылок на stdout
   [ -n "${XKIT_PANEL_SUB_PORT:-}" ] && [ -n "${XKIT_PANEL_SUB_PATH:-}" ] || return 0
   curl -fsS --max-time 8 "http://127.0.0.1:${XKIT_PANEL_SUB_PORT}${XKIT_PANEL_SUB_PATH}${1}" 2>/dev/null \
     | base64 -d 2>/dev/null | tr '\r' '\n' \
-    | grep -E '^(vless|vmess|trojan|ss|hysteria2|hy2|tuic|vpn|tg)://' || return 0
+    | grep -E '^(vless|vmess|trojan|ss|hysteria2|hy2|tuic|tg|wireguard)://' || return 0
+}
+
+# v7.4.2: hy2://-ссылка Hysteria 2 отдельной службы (xkit-hysteria2). Пароль у
+# службы один на всех — ссылка общая, добавляется в КАЖДУЮ подписку (в Clash-YAML
+# так делает clash_standalone_hy2 с v6.0.0; теперь parity у base64 и sing-box).
+sub_standalone_hy2_link() { # -> hy2://... (пусто = службы нет)
+  [ -r "${XKIT_PROTOCOLS_ENV:-/etc/xkit/protocols.env}" ] || return 0
+  # shellcheck disable=SC1090
+  . "${XKIT_PROTOCOLS_ENV:-/etc/xkit/protocols.env}"
+  [ -n "${HY2_PORT:-}" ] && [ -n "${HY2_AUTH:-}" ] || return 0
+  [ -n "${XKIT_HOST:-}" ] || return 0
+  # пути службы — через env с дефолтами (xkit_protocols.sh при `xkit sub` не
+  # загружен; те же значения, что XKIT_HY2_BIN/XKIT_HY2_CONF компонента)
+  [ -x "${XKIT_HY2_BIN:-/usr/local/bin/xkit-hysteria2}" ] || [ -f "${XKIT_HY2_CONF:-/etc/xkit/hysteria2/config.yaml}" ] || return 0
+  local q="obfs=salamander&obfs-password=$(enc_uri "${HY2_OBFS:-}")"
+  if [ "${XKIT_CERT_MODE:-}" = "4" ]; then
+    q="insecure=1"
+  else
+    q+="&sni=$(enc_uri "$XKIT_HOST")"
+  fi
+  printf 'hy2://%s@%s:%s?%s&alpn=h3#%s' "$(enc_uri "$HY2_AUTH")" "$XKIT_HOST" "$HY2_PORT" "$q" "$(enc_uri 'XKIT-Hysteria2')"
 }
 # flock-обёртка (аудит №5): cron «13 * * * * xkit sub -q» и ручной запуск не должны
 # пересекаться — иначе rm -f ${SUBS_DIR}/* + пересборка дают окно 404/битого base64.
@@ -2571,12 +2677,17 @@ sub_regen_impl() {
   done < <(jq -c '.[]' <<<"$INBOUNDS")
 
   # баз64-файлы по subId (+ v6.0.0: ссылки панели, + Clash-YAML рядом)
-  local acc f subid n_yaml=0
+  local acc f subid n_yaml=0 hy2l
+  # v7.4.2: Hysteria 2 отдельной службой — общая ссылка в каждую подписку
+  hy2l="$(sub_standalone_hy2_link 2>/dev/null || true)"
+  [ -n "$hy2l" ] && n_links=$((n_links+1))
   for acc in "${SUBS_DIR}"/.acc.*; do
     [ -e "$acc" ] || break
     subid="${acc##*.acc.}"
-    # ссылки, отрендеренные панелью (vpn:// для AmneziaWG и т.п.) — без дублей
+    # ссылки, отрендеренные панелью (wireguard:// и др.) — без дублей
     panel_sub_links "$subid" | grep -Fxvf "$acc" >> "$acc" 2>/dev/null || true
+    # v7.4.2: hy2 отдельной службы — в raw-подписку (и, следом, в sing-box JSON)
+    [ -n "$hy2l" ] && printf '%s\n' "$hy2l" >> "$acc"
     f="${SUBS_DIR}/${subid}"
     sort -u "$acc" | tr '\n' '\n' | base64 -w0 > "$f"
     rm -f "$acc"
@@ -5691,7 +5802,8 @@ EOS
   if [ -n "${XKIT_POOL_INBOUND:-}" ]; then
     local pool_ib pool_cl plink
     pool_ib="$(api_get_inbound "$XKIT_POOL_INBOUND")" || true
-    pool_cl="$(jq -c '.settings|fromjson?|.clients[0] // empty' <<<"${pool_ib:-}")"
+    # v7.4.2: толерантный разбор settings (защита от v3-wire без нормализации)
+    pool_cl="$(jq -c '.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[0] // empty' <<<"${pool_ib:-}")"
     if [ -n "$pool_cl" ]; then
       plink="$(link_for_client "${pool_ib:-}" "$pool_cl")"
       [ -n "$plink" ] && { echo ""; ok "Ссылка ПОЛА (трафик балансируется по нодам):"; printf '  %s\n' "$plink"; }
@@ -7622,6 +7734,9 @@ xkit_summary_text() { # stdout: plain-текст без цветов
       fi
     fi
     [ -n "${XKIT_SUB_TOKEN:-}" ] && L+=("Подписки xkit:     https://${XKIT_HOST}$(sub_path)")
+    # v7.4.2: живой вопрос пользователя «где теперь логин/пароль панели» —
+    # показываем хранилище-источник явно (сводка с паролем: cat ${XKIT_INFO_FILE})
+    [ -n "${PANEL_USER:-}" ] && L+=("Источник пароля:   /etc/x-ui/install-result.env (обновляет установщик 3X-UI)")
     if [ "${XKIT_DASH:-0}" = "1" ] && [ -n "${XKIT_DASH_TOKEN:-}" ]; then
       L+=("Веб-дашборд:       https://${XKIT_HOST}$(dash_path)")
       [ -n "${XKIT_DASH_USER:-}" ] && L+=("Логин дашборда:    ${XKIT_DASH_USER}")
@@ -8742,7 +8857,11 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
       settings="$(jq -nc --arg pk "$priv" --arg pub "$pub" \
         '{server:{privateKey:$pk,publicKey:$pub,subnetIp:"10.8.9.0",subnetCidr:24,primaryDns:"1.1.1.1",secondaryDns:"8.8.8.8"},clients:[]}')"
       stream='{}' ;;
-    amneziawg31) # v7.2.7: полный набор 3.1 — проба «поняло ли ядро поля 3.x»
+    amneziawg31) # v7.4.2: ПОЛНОЕ ИМЯ ПРОТОКОЛА — «amneziawg» (набор 3.1 отличается
+      # только ПОЛЯМИ настроек, отдельного протокола amneziawg31 в 3x-ui нет:
+      # живой лог 7.4.1 — «панель отклонила протокол — request body failed
+      # validation» при живой поддержке AWG в ядре 26.10.21). Проба «поняло ли
+      # ядро поля 3.x» — по сохранённому headerProtectionKey судит установщик.
       local priv pub
       read -r priv pub <<<"$(xray_wg_pair)" || return 1
       awg31_gen_params
@@ -8763,9 +8882,13 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
       stream='{}' ;;
     *) return 1 ;;
   esac
+  # v7.4.2: имя протокола в API всегда базовое (amneziawg/hysteria);
+  # суффикс «31» — только наш внутренний маркер профиля настроек
+  local pname="$proto"
+  case "$proto" in amneziawg31) pname="amneziawg" ;; esac
   ib="$(jq -nc --argjson port "$port" --arg s "$settings" --arg st "$stream" '
     {up:0,down:0,total:0,remark:"xkit-probe",enable:true,expiryTime:0,listen:"127.0.0.1",
-     port:$port,protocol:"'"$proto"'",settings:$s,streamSettings:$st,
+     port:$port,protocol:"'"$pname"'",settings:$s,streamSettings:$st,
      sniffing:"{\"enabled\":false}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:"xkit-probe"}')"
   # v7.4.1: отказ ПРИМЕНЕНИЯ пробы (пустой/не-JSON ответ = 401 bearer / 403 CSRF)
   # ≠ «ядро не умеет протокол». api_post уже повторил запрос с восстановленной
@@ -10324,7 +10447,8 @@ node_profile_inbound_vless() { # rec profile port private-key -> JSON
 
 node_profile_tunnel_vless() { # rec profile port private-key path-from-inbound
   local rec="$1" profile="$2" port="$3" priv="$4" ib="$5" net=tcp flow=xtls-rprx-vision path=""
-  if [ "$profile" = vless-xhttp-reality ]; then net=xhttp; flow=""; path="$(jq -r '.streamSettings|fromjson|.xhttpSettings.path' <<<"$ib")"; fi
+  # v7.4.2: панели нод v3 отдают streamSettings объектом — толерантный разбор
+  if [ "$profile" = vless-xhttp-reality ]; then net=xhttp; flow=""; path="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else (. // {}) end|.xhttpSettings.path // ""' <<<"$ib")"; fi
   jq -c --argjson port "$port" --arg net "$net" --arg flow "$flow" --arg path "$path" --arg priv "$priv" --arg profile "$profile" \
     '.tunnel={port:$port,proto:"vless",profile:$profile,net:$net,sec:"reality",uuid:.tunnel.uuid,pbk:.tunnel.pbk,sid:.tunnel.sid,sni:.tunnel.sni,dest:.tunnel.dest,flow:$flow,path:$path,reality_private:$priv}' <<<"$rec"
 }
@@ -10377,7 +10501,7 @@ node_profile_switch() {
   case "$profile" in
     vless-*)
       priv="$(jq -r '.tunnel.reality_private//""' <<<"$rec")"
-      [ -n "$priv" ] || priv="$(jq -r '.streamSettings|fromjson?|.realitySettings.privateKey//""' <<<"$oldib")"
+      [ -n "$priv" ] || priv="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else (. // {}) end|.realitySettings.privateKey//""' <<<"$oldib")"
       [ -n "$priv" ] || { rm -f "$ck"; err "REALITY private key не найден"; return 1; }
       ib="$(node_profile_inbound_vless "$rec" "$profile" "$port" "$priv")" ;;
     hysteria2)

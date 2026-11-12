@@ -1,9 +1,11 @@
 #!/bin/bash
-# XKIT v7.4.1 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v7.4.2 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
 # (awg31_gen_params) живёт в xkit.sh и доступен здесь после загрузки ядра.
+# v7.4.2: Hy2 — тоже панель-первым (проба ядра + предложение инбаунда);
+# ссылка отдельной службы добавляется в общие подписки (sub_standalone_hy2_link).
 # Подключается только из xkit.sh. Секреты не выводятся в status/list --json.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
   echo "Это модуль XKIT — запускайте: xkit protocols" >&2
@@ -213,21 +215,9 @@ proto_hy2_download() { # $1 destination
   base="$(jq -r --arg n "$asset" '.assets[]|select(.name==$n)|.browser_download_url' "$meta" | head -n1)"
   [ -n "$tag" ] && [ -n "$base" ] || { rm -f "$meta"; err "Не найден официальный бинарник $asset"; return 1; }
   sums="$(mktemp /tmp/.xkit-hy2-sums.XXXXXX)" || { rm -f "$meta"; return 1; }
-  # v7.4.1: в hashes.txt пути с префиксом «build/» (build/hysteria-linux-amd64) —
-  # сверяем по базовому имени; раньше точное совпадение $2==asset не находило
-  # строку и установка всегда падала («В hashes.txt нет hysteria-linux-amd64»).
-  # Если hashes.txt недоступен/без нужного файла — .digest из GitHub API
-  # (sha256:<hex>, есть у всех ассетов релиза).
-  want=""
-  if curl -fsSL --max-time 30 "${base%/*}/hashes.txt" -o "$sums"; then
-    want="$(awk -v n="$asset" '$2==n || $2=="*"n || $2 ~ ("/" n "$") {print $1;exit}' "$sums")"
-  else
-    warn "hashes.txt релиза недоступен — SHA-256 сверю по метаданным GitHub API"
-  fi
-  if [ -z "$want" ]; then
-    want="$(jq -r --arg n "$asset" '.assets[]?|select(.name==$n)|(.digest // "")|sub("^sha256:";"")' "$meta" 2>/dev/null | head -n1)"
-  fi
-  [ -n "$want" ] || { rm -f "$meta" "$sums"; err "Не удалось получить SHA-256 для $asset — установка отменена"; return 1; }
+  curl -fsSL "${base%/*}/hashes.txt" -o "$sums" || { rm -f "$meta" "$sums"; return 1; }
+  want="$(awk -v n="$asset" '$2==n || $2=="*"n {print $1;exit}' "$sums")"
+  [ -n "$want" ] || { rm -f "$meta" "$sums"; err "В hashes.txt нет $asset — установка отменена"; return 1; }
   curl -fsSL "$base" -o "$1" || { rm -f "$meta" "$sums"; return 1; }
   got="$(sha256sum "$1" | awk '{print $1}')"
   rm -f "$meta" "$sums"
@@ -239,6 +229,29 @@ proto_hy2_install() {
   require_root; load_xkit_env || die "Сначала установка XKIT"
   [ -n "${XKIT_HOST:-}" ] && [ -r "${XKIT_CRT:-}" ] && [ -r "${XKIT_KEY:-}" ] || { err "Нужны XKIT_HOST и сертификат"; return 1; }
   if [ -f "$XKIT_HY2_CONF" ]; then warn "Hysteria 2 уже настроен"; return 0; fi
+  # (v7.4.2) ПАНЕЛЬ-ПЕРВЫМ — паритет с AmneziaWG: если ядро панели умеет hysteria2,
+  # панельный инбаунд рекомендован (единые пользователи/подписки/учёт трафика),
+  # отдельная служба — осознательный выбор. Раньше меню сразу ставило службу —
+  # вводило в заблуждение («в панели рекомендуется», а ставится отдельно).
+  if kit_session >/dev/null 2>&1; then
+    local p_hy=0
+    p_hy="$(jq -r '[.[]|select(.protocol=="hysteria")]|length' <<<"${INBOUNDS:-}" 2>/dev/null || echo 0)"
+    if [ "${p_hy:-0}" -eq 0 ]; then
+      if proto_core_supports hysteria; then
+        echo ""
+        log "Ядро панели умеет Hysteria 2."
+        if confirm "Включить ПАНЕЛЬНЫЙ режим Hysteria 2 (рекомендуется: единые пользователи, подписки, учёт трафика)? [Y/n]" y; then
+          if proto_panel_install hy2; then return 0; fi
+          warn "Панельный режим не удался — продолжаю отдельной службой"
+        else
+          log "Панельный режим отклонён — ставлю отдельной службой"
+        fi
+      fi
+    else
+      log "Панельный Hysteria 2 уже включён — отдельная служба не нужна (xkit protocols panel status)"
+      return 0
+    fi
+  fi
   local p; p="$(proto_default_udp_port 8443)" || return 1
   read -r -p "UDP-порт Hysteria 2 [${p}]: " pin; p="${pin:-$p}"; is_port "$p" || return 1
   proto_udp_free "$p" || { err "UDP-порт $p уже занят"; return 1; }
