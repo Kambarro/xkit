@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v7.4.2 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v7.4.3 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -161,18 +161,21 @@ proto_xhttp_create() {
   read -r priv pub <<<"$(api_get_new_x25519)"
   [ -n "$priv" ] && [ -n "$pub" ] || { err "Нет ключей x25519"; return 1; }
   uuid="$(new_uuid)"; subid="$(rand_str 16)"; email="xhttp-$(rand_hex 2)"; sid="$(rand_hex 4)"
-  local settings stream ib
+  local settings stream ib so
+  so='{}'; sockopt_enabled && so="$(sockopt_obj)"   # v7.4.3: TFO+TCP_NODELAY
   settings="$(jq -nc --arg id "$uuid" --arg email "$email" --arg sub "$subid" '{clients:[{id:$id,email:$email,limitIp:0,totalGB:0,expiryTime:0,enable:true,tgId:"",subId:$sub,reset:0}],decryption:"none",fallbacks:[]}')"
-  stream="$(jq -nc --arg dest "$PROTO_DEST" --arg sni "$PROTO_SNI" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" --arg path "$path" '
+  stream="$(jq -nc --arg dest "$PROTO_DEST" --arg sni "$PROTO_SNI" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" --arg path "$path" --argjson so "$so" '
     {network:"xhttp",security:"reality",
      xhttpSettings:{path:$path,host:"",mode:"auto"},
      realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$priv,
        minClient:"",maxClient:"",maxTimeDiff:0,shortIds:[$sid],
-       settings:{publicKey:$pub,fingerprint:"chrome",serverName:""}}}')"
+       settings:{publicKey:$pub,fingerprint:"chrome",serverName:""}}}
+    + (if (($so|length) > 0) then {sockopt:$so} else {} end)')"
   ib="$(jq -nc --arg port "$p" --arg tag "inbound-${p}" --arg remark "xhttp-reality-${PROTO_SNI}" --arg s "$settings" --arg st "$stream" '
     {up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,listen:"",port:($port|tonumber),protocol:"vless",settings:$s,streamSettings:$st,
      sniffing:"{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"]}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:$tag}')"
   api_add_inbound "$ib" || return 1
+  if [ "$so" != "{}" ]; then sockopt_tfo_sysctl_apply || true; fi   # v7.4.3: серверный бит TFO
   local ibid fresh cl link
   ibid="$(jq -r --arg t "inbound-${p}" '[.[]|select(.tag==$t)][0].id // empty' <<<"$(api_list 2>/dev/null)")"
   [ -n "$ibid" ] || { err "Inbound создан, но не найден для проверки"; return 1; }

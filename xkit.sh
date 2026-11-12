@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.2"
+XKIT_VERSION="7.4.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -1624,6 +1624,10 @@ save_xkit_env() {
 }
 
 load_xkit_env() {
+  # v7.4.3: XKIT_VERSION из xkit.env НЕ должен переопределять версию скрипта —
+  # старый env (сохранился от прошлой установки) показывал в сводке «XKIT v7.4.0»
+  # под бинарём 7.4.x (живой лог 7.4.2: сводка после «починки поверх»).
+  local _script_ver="${XKIT_VERSION:-}"
   XKIT_HOST=""; XKIT_CRT=""; XKIT_KEY=""; XKIT_CERT_MODE=""; XKIT_SUB_TOKEN=""; XKIT_UFW="0"
   XKIT_PANEL_SUB_PORT=""; XKIT_PANEL_SUB_PATH=""; XKIT_REALITY_INTERNAL="0"
   XKIT_BAL_STRATEGY="roundRobin"; XKIT_POOL_INBOUND=""; XKIT_POOL_TAG=""
@@ -1640,6 +1644,7 @@ load_xkit_env() {
   # shellcheck disable=SC1090
   . "$XKIT_ENV"
   [ -n "${XKIT_REPO_URL:-}" ] || XKIT_REPO_URL="$_repo"
+  [ -n "$_script_ver" ] && XKIT_VERSION="$_script_ver"
   return 0
 }
 
@@ -1723,11 +1728,17 @@ api_auth_args() {
 # ошибка печаталась как «add inbound: » без единой подсказки. Теперь видно,
 # что именно случилось (см. живой лог 7.4.0: «[ERR ] add inbound: »).
 api_err_msg() { # $1 тело ответа панели (может быть пустым или не-JSON)
-  local r="${1:-}"
+  local r="${1:-}" msg issues
   if [ -z "$r" ]; then
     printf 'пустой ответ панели — POST отклонён middleware (401: неверный API-токен, 403: CSRF-сессия); запрос повторён с обновлённой аутентификацией'
   elif jq -e 'type=="object"' <<<"$r" >/dev/null 2>&1; then
-    jq -r 'if .success == true then "ok" elif (.msg // "") == "" then "отклонено панелью без пояснения (msg пуст)" else .msg end' <<<"$r" 2>/dev/null | head -c 300
+    msg="$(jq -r 'if .success == true then "ok" elif (.msg // "") == "" then "отклонено панелью без пояснения (msg пуст)" else .msg end' <<<"$r" 2>/dev/null | head -c 300)"
+    # v7.4.3: валидатор панели (middleware.BindAndValidate) возвращает obj.issues[]
+    # с конкретным полем и правилом — без них «request body failed validation»
+    # нечувствителен к диагностике. Показываем до 4 первых нарушений.
+    issues="$(jq -r '(.obj.issues // [])[:4][] | "\(.field): \(.rule)\(if (.param // "") == "" then "" else "(\(.param))" end)"' <<<"$r" 2>/dev/null \
+      | paste -sd'; ' - | head -c 300)"
+    [ -n "$issues" ] && printf '%s [%s]' "$msg" "$issues" || printf '%s' "$msg"
   else
     printf 'не-JSON ответ панели: %s' "$(printf '%s' "$r" | tr '\n' ' ' | tr -s ' ' | head -c 150)"
   fi
@@ -2576,6 +2587,111 @@ _link_proto() { # proto email host port net sec path svc sni pbk sid fp flow cli
   printf '%s\n' "$link"
 }
 
+
+#=========================== v7.4.3: SOCKOPT (TCP Fast Open + TCP_NODELAY) ====
+# Рекомендуемые «быстрые» настройки TCP-инбаундов (транспорты tcp/ws/grpc/
+# xhttp/httpupgrade; UDP-протоколы Hysteria2/AmneziaWG не затрагиваются).
+#   * tcpNoDelay: true    — отключает алгоритм Нейгла (latency);
+#   * tcpFastOpen: true   — серверная сторона TFO; требует net.ipv4.tcp_fastopen
+#                           с серверным битом (0x2) — xkit ставит sysctl = 3.
+# Управление: xkit sockopt on|off|status; XKIT_SOCKOPT=0 — не добавлять при
+# создании Reality/XHTTP инбаундов. ВАЖНО: если менять sockopt ВРУЧНУЮ в панели,
+# xkit больше не трогает эти инбаунды сам — но форма 3x-ui при правке
+# streamSettings требует заново выбрать dest/SNI Reality (особенность UI панели,
+# не xkit), поэтому предпочтителен путь `xkit sockopt`.
+sockopt_enabled() { [ "${XKIT_SOCKOPT:-1}" = "1" ]; }
+
+sockopt_obj() { # -> JSON sockopt для streamSettings
+  jq -nc '{tcpFastOpen:true,tcpNoDelay:true}'
+}
+
+sockopt_net_ok() { # $1 network — sockopt осмыслен только для TCP-транспортов
+  case "$1" in tcp|raw|ws|grpc|xhttp|splithttp|httpupgrade) return 0 ;; *) return 1 ;; esac
+}
+
+sockopt_tfo_sysctl_apply() { # включить серверный бит TFO (net.ipv4.tcp_fastopen=3)
+  local cur
+  cur="$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0)"
+  if [ "$((cur & 2))" -ne 2 ]; then
+    printf 'net.ipv4.tcp_fastopen = 3\n' > /etc/sysctl.d/99-xkit-tfo.conf
+    chmod 644 /etc/sysctl.d/99-xkit-tfo.conf
+    sysctl -w net.ipv4.tcp_fastopen=3 >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+    cur="$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0)"
+    if [ "$((cur & 2))" -ne 2 ]; then
+      warn "ядро не применило net.ipv4.tcp_fastopen=3 — серверная сторона TFO не заработает"
+      return 1
+    fi
+    ok "sysctl: net.ipv4.tcp_fastopen=3 (TFO клиент+сервер), файл /etc/sysctl.d/99-xkit-tfo.conf"
+  else
+    ok "sysctl: net.ipv4.tcp_fastopen=$cur — серверный бит TFO уже включён"
+  fi
+  return 0
+}
+
+sockopt_patch_stream() { # stdin: streamSettings JSON, $1 on|off -> stdout
+  # пустой вывод = изменений не требуется
+  local mode="$1" st net
+  st="$(cat)"
+  net="$(jq -r '.network // ""' <<<"$st" 2>/dev/null)"
+  sockopt_net_ok "$net" || return 0
+  if [ "$mode" = "on" ]; then
+    jq -e '.sockopt.tcpFastOpen == true and .sockopt.tcpNoDelay == true' <<<"$st" >/dev/null 2>&1 && return 0
+    jq -c --argjson so "$(sockopt_obj)" '.sockopt = ((.sockopt // {}) + $so)' <<<"$st"
+  else
+    # off: снимаем ТОЛЬКО наш sockopt (ровно tcpFastOpen+tcpNoDelay, без других
+    # ключей) — ручные настройки администратора не трогаем
+    jq -e '.sockopt.tcpFastOpen == true and .sockopt.tcpNoDelay == true
+           and ([.sockopt | keys_unsorted[]] | length == 2)' <<<"$st" >/dev/null 2>&1 || return 0
+    jq -c 'del(.sockopt)' <<<"$st"
+  fi
+}
+
+sockopt_cmd() { # xkit sockopt [on|off|status]
+  local mode="${1:-status}"
+  require_root; load_xkit_env || die "Сначала установка (пункт 1)"
+  case "$mode" in on|off|status) ;; *) err "xkit sockopt on|off|status"; return 1 ;; esac
+  local tfo
+  tfo="$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || echo 0)"
+  if [ "$mode" = "status" ]; then
+    echo "sysctl net.ipv4.tcp_fastopen = ${tfo} $([ "$((tfo & 2))" -eq 2 ] && echo '(серверный TFO включён)' || echo '(серверный TFO ВЫКЛЮЧЕН — xkit sockopt on)')"
+    echo ""
+    printf '%-4s %-22s %-8s %-6s %s\n' 'ID' 'TAG' 'NET' 'PORT' 'SOCKOPT'
+    kit_session >/dev/null 2>&1 || { err "Нет сессии панели"; return 1; }
+    local ib id tag port net st so
+    while IFS= read -r ib; do
+      [ -z "$ib" ] && continue
+      id="$(jq -r '.id' <<<"$ib")"; tag="$(jq -r '.tag' <<<"$ib")"; port="$(jq -r '.port' <<<"$ib")"
+      net="$(jq -r '.streamSettings|fromjson?|.network // "-"' <<<"$ib" 2>/dev/null)"
+      st="$(jq -r '.streamSettings|fromjson?|.sockopt // {}|c' <<<"$ib" 2>/dev/null)"
+      case "$st" in {}|null) so="-" ;; *) so="$st" ;; esac
+      printf '%-4s %-22s %-8s %-6s %s\n' "$id" "$tag" "$net" "$port" "$so"
+    done < <(jq -c '.[]' <<<"$(api_list 2>/dev/null)" 2>/dev/null)
+    return 0
+  fi
+  kit_session || return 1
+  [ "$mode" = "on" ] && sockopt_tfo_sysctl_apply || true
+  local ib id tag port patched new n=0 s=0 proto
+  log "Применяю sockopt ${mode} к TCP-инбаундам панели..."
+  while IFS= read -r ib; do
+    [ -z "$ib" ] && continue
+    id="$(jq -r '.id' <<<"$ib")"; tag="$(jq -r '.tag' <<<"$ib")"; port="$(jq -r '.port' <<<"$ib")"
+    proto="$(jq -r '.protocol' <<<"$ib")"
+    case "$proto" in vless|vmess|trojan) ;; *) s=$((s+1)); continue ;; esac
+    new="$(jq -r '.streamSettings|fromjson?' <<<"$ib" 2>/dev/null | sockopt_patch_stream "$mode")"
+    if [ -z "$new" ]; then s=$((s+1)); continue; fi
+    patched="$(jq -c --arg st "$new" '.streamSettings = $st' <<<"$ib")"
+    if api_update_inbound "$id" "$patched" >/dev/null 2>&1; then
+      ok "#$id ${tag} (${port}/tcp): sockopt ${mode} — применено"
+      n=$((n+1))
+    else
+      err "#$id ${tag}: sockopt ${mode} не применился"
+    fi
+  done < <(jq -c '.[]' <<<"$(api_list 2>/dev/null)" 2>/dev/null)
+  echo ""
+  ok "Итого: изменено ${n}, пропущено (UDP-протоколы/уже настроено/чужие правила) ${s}"
+  [ "$mode" = "off" ] && warn "sysctl не откатывается автоматически: net.ipv4.tcp_fastopen=${tfo} (xkit sockopt статус sysctl — вручную при желании)"
+  return 0
+}
 #=========================== ПОДПИСКИ =========================================
 sub_regen_quiet() { SUB_QUIET=1 sub_regen; }
 # v6.0.0: ссылки, которые рендерит САМА панель. Берем из нативной подписки панели
@@ -4403,10 +4519,38 @@ panel_settings_get() {
   printf '%s' "$out"
 }
 
-panel_settings_set() { # пары key=value (form-urlencoded, панель обновит только их)
+panel_settings_set() { # пары key=value
   local resp p
-  if [ "$API_V3" = "1" ]; then p="panel/api/setting/update"; else p="panel/setting/update"; fi
-  resp="$(api_post_form "$p" "$@")"
+  if [ "$API_V3" = "1" ]; then
+    p="panel/api/setting/update"
+    # v7.4.3: v3-эндпоинт биндит ВСЮ структуру updateSettingForm (entity.AllSetting)
+    # и валидирует её целиком: частичная form-форма не проходит — отсутствующие
+    # int-поля биндятся нулями и валят validate:"gte=1" (webPort/sessionMaxAge/
+    # smtpPort/outboundDownThreshold/nodeDownThreshold) — живой лог 7.4.2:
+    # «panel/api/setting/update: request body failed validation» в шаге 4/7.
+    # Шлём ПОЛНЫЙ объект из setting/all: секреты в browser-safe view пустые,
+    # а «пусто = не менять» (preserveRedactedSecrets панели сохранит прежние).
+    # Наши переопределения накладываем сверху с приведением типа ПО ТЕКУЩЕМУ
+    # типу поля (bool/number/string), чтобы биндинг не упал на типе.
+    local all base pair k v json
+    all="$(panel_settings_get)" || { err "${p}: не удалось прочитать settings/all для полной формы"; return 1; }
+    base="$(jq -c '.obj // empty' <<<"$all" 2>/dev/null)"
+    [ -n "$base" ] || { err "${p}: settings/all вернул пустой obj — update отменён"; return 1; }
+    json="$base"
+    for pair in "$@"; do
+      k="${pair%%=*}"; v="${pair#*=}"
+      [ "$k" != "$pair" ] || { err "${p}: аргумент без '=': ${pair:0:40}"; return 1; }
+      json="$(jq -c --arg k "$k" --arg v "$v" '
+        .[$k] = (if (.[$k]? | type)=="boolean" then ($v=="true" or $v=="1")
+                 elif (.[$k]? | type)=="number" then ($v | tonumber)
+                 else $v end)' <<<"$json")" \
+        || { err "${p}: не удалось применить ключ ${k} к полной форме"; return 1; }
+    done
+    resp="$(api_post_json "$p" "$json")"
+  else
+    p="panel/setting/update"
+    resp="$(api_post_form "$p" "$@")"
+  fi
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
     err "${p}: $(api_err_msg "$resp" 2>/dev/null | head -c 200)"
     return 1
@@ -4780,16 +4924,18 @@ reality_create_inbound() {
   local uuid subid email sid
   uuid="$(new_uuid)"; subid="$(rand_str 16)"; email="reality-$(rand_hex 2)"; sid="$(rand_hex 4)"
 
-  local settings stream ib
+  local settings stream ib so
+  so='{}'; sockopt_enabled && so="$(sockopt_obj)"   # v7.4.3: TFO+TCP_NODELAY (xkit sockopt off — отключить)
   settings="$(jq -nc --arg id "$uuid" --arg email "$email" --arg sub "$subid" '
     {clients:[{id:$id, flow:"xtls-rprx-vision", email:$email, limitIp:0, totalGB:0,
                expiryTime:0, enable:true, tgId:"", subId:$sub, reset:0}],
      decryption:"none", fallbacks:[]}')"
-  stream="$(jq -nc --arg dest "$dest" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" '
+  stream="$(jq -nc --arg dest "$dest" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" --argjson so "$so" '
     {network:"tcp", security:"reality",
      realitySettings:{show:false, xver:0, dest:$dest, serverNames:[$sni],
                       privateKey:$priv, minClient:"", maxClient:"", maxTimeDiff:0,
-                      shortIds:[$sid], settings:{publicKey:$pub, fingerprint:"chrome", serverName:""}}}')"
+                      shortIds:[$sid], settings:{publicKey:$pub, fingerprint:"chrome", serverName:""}}}
+    + (if (($so|length) > 0) then {sockopt:$so} else {} end)')"
   ib="$(jq -nc --arg port "$p" --arg tag "inbound-${p}" --arg remark "reality-${sni}" \
         --arg s "$settings" --arg st "$stream" '
     {up:0, down:0, total:0, remark:$remark, enable:true, expiryTime:0,
@@ -4801,6 +4947,7 @@ reality_create_inbound() {
 
   log "Создаю Reality inbound: порт ${p}, dest ${dest}, SNI ${sni}..."
   api_add_inbound "$ib" || return 1
+  if [ "$so" != "{}" ]; then sockopt_tfo_sysctl_apply || true; fi   # v7.4.3: серверный бит TFO
 
   # id созданного + externalProxy (чтобы панель показывала ДОМЕН:порт)
   local newlist ibid fresh cl link
@@ -8208,6 +8355,9 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit client add|del|list|reset — управление пользователями
   xkit client all      — пользователь во ВСЕ протоколы сразу (одна подписка)
   xkit reality          — Reality: создать inbound (wizard)
+  xkit sockopt [on|off|status] — TCP Fast Open + TCP_NODELAY на TCP-инбаундах
+                         (on — sysctl net.ipv4.tcp_fastopen=3 + sockopt всем
+                         vless/vmess/trojan; off — снять наш sockopt)
   xkit nodes            — меню нод (добавить/список/health/стратегия/удалить)
   xkit nodes repair     — переприменить конфигурацию нод (после сбоя apply)
   xkit nodes repin [имя|all] — перепинить сертификат панели ноды (MITM-защита)
@@ -8307,6 +8457,7 @@ xkit_main_impl() {
              esac ;;
     reality) shift; require_root; load_xkit_env || true
              if [ "${1:-}" = scan-csv ]; then reality_scan_csv "${2:-${XKIT_DIR}/reality-scan.tsv}" "${3:-${XKIT_DIR}/reality-scan.csv}"; else reality_wizard; fi ;;
+    sockopt) shift; sockopt_cmd "${1:-status}" ;;
     nodes)   shift; require_root
              case "${1:-menu}" in
                repair) nodes_repair ;;
@@ -8835,13 +8986,15 @@ proto_udp_free() { # $1 порт -> 0 = свободен
 # удаляем. Только реальный запуск ядра — источник истины, не версия.
 proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить file-masquerade
   local proto="$1" port resp ib listening camo_mode="${2:-}"
-  [ "${PANEL_PORT:-}" ] || return 1
+  if [ -z "${PANEL_PORT:-}" ]; then
+    warn "проба '$proto': порт панели не определён (PANEL_PORT пуст) — проба невозможна"; return 1
+  fi
   # Никогда не удаляем чужой/старый inbound с таким же tag.
   jq -e '[.[]|select(.tag=="xkit-probe")]|length==0' <<<"$(api_list 2>/dev/null)" >/dev/null 2>&1 || {
     warn "Найден существующий inbound xkit-probe — проба отменена"; return 1;
   }
-  port="$(rand_free_port 23000 59000)" || return 1
-  proto_udp_free "$port" || return 1
+  port="$(rand_free_port 23000 59000)" || { warn "проба '$proto': нет свободного TCP-порта для пробы"; return 1; }
+  proto_udp_free "$port" || { warn "проба '$proto': UDP ${port} занят — проба отменена"; return 1; }
   local settings stream
   case "$proto" in
     hysteria)
@@ -8854,8 +9007,15 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
     amneziawg)
       local priv pub
       read -r priv pub <<<"$(xray_wg_pair)" || return 1
+      # v7.4.3: У ПРОБЫ ДОЛЖЕН БЫТЬ PEER. Сайдкар AWG (internal/amneziawgnet)
+      # стартует только когда у инбаунда есть хотя бы один включённый клиент
+      # с publicKey и allowedIPs (amneziawg.InstanceFromInbound: «no enabled
+      # peer to serve — skips the sidecar entirely»). Проба с clients:[]
+      # никогда не поднимала UDP-слушатель — вердикт «ядро НЕ умеет» был
+      # ложным при живой поддержке AWG (живой лог 7.4.2).
       settings="$(jq -nc --arg pk "$priv" --arg pub "$pub" \
-        '{server:{privateKey:$pk,publicKey:$pub,subnetIp:"10.8.9.0",subnetCidr:24,primaryDns:"1.1.1.1",secondaryDns:"8.8.8.8"},clients:[]}')"
+        '{server:{privateKey:$pk,publicKey:$pub,subnetIp:"10.8.9.0",subnetCidr:24,primaryDns:"1.1.1.1",secondaryDns:"8.8.8.8"},
+          clients:[{email:"xkit-probe",enable:true,publicKey:$pub,allowedIPs:["10.8.9.2/32"]}]}')"
       stream='{}' ;;
     amneziawg31) # v7.4.2: ПОЛНОЕ ИМЯ ПРОТОКОЛА — «amneziawg» (набор 3.1 отличается
       # только ПОЛЯМИ настроек, отдельного протокола amneziawg31 в 3x-ui нет:
@@ -8878,7 +9038,8 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
           headerProtectionKey:$hpk,contentPaddingAddition:$cpa,
           rekeyAfterTime:$rkat,rekeyTimeout:$rt,rejectAfterTime:$rjt,
           keepaliveTimeout:$kat,maxHandshakeAttempts:$mha,
-          randomTrailers:false,disableCookies:false},clients:[]}')"
+          randomTrailers:false,disableCookies:false},
+          clients:[{email:"xkit-probe",enable:true,publicKey:$pub,allowedIPs:["10.8.9.2/32"]}]}')"
       stream='{}' ;;
     *) return 1 ;;
   esac
@@ -8907,10 +9068,24 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
     warn "проба '$proto': панель отклонила протокол — $(api_err_msg "$resp" | head -c 140)"
     _proto_probe_cleanup; return 1
   fi
-  sleep 2
-  listening="$(ss -lunpH "sport = :$port" 2>/dev/null | grep -c . || true)"
+  # v7.4.3: опрос слушателя вместо одного sleep 2. У AmneziaWG слушатель
+  # поднимает САЙДКАР панели, а он реконсиличится job-ом с тактом 10 секунд
+  # (3x-ui internal/web/job/amneziawg_job.go) — двух секунд всегда не хватало.
+  local wait_max=6 step=3 tries=0
+  case "$proto" in amneziawg|amneziawg31) wait_max=27 ;; esac
+  listening=0
+  while [ "$tries" -lt "$wait_max" ]; do
+    sleep "$step"; tries=$((tries + step))
+    listening="$(ss -lunpH "sport = :$port" 2>/dev/null | grep -c . || true)"
+    [ "${listening:-0}" -gt 0 ] && break
+  done
   _proto_probe_cleanup
-  [ "${listening:-0}" -gt 0 ]
+  if [ "${listening:-0}" -eq 0 ]; then
+    warn "проба '$proto': inbound принят панелью, но UDP-слушатель на ${port} не появился за ${wait_max}с —"
+    warn "  сайдкар/ядро не поднял протокол (лог панели: journalctl -u x-ui | grep -iE 'amnez|awg|hysteria')"
+    return 1
+  fi
+  return 0
 }
 
 _proto_probe_cleanup() { # удалить пробный инбаунд (по tag xkit-probe), молча

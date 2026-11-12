@@ -4,7 +4,7 @@
 
 **TUI и мастер-меню для nginx + 3X-UI: VPN-панель, подписки, REALITY, ноды, балансировка и мониторинг — в одном инструменте.**
 
-![Version](https://img.shields.io/badge/version-7.4.2-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-7.4.3-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -414,6 +414,7 @@ xkit route [--yes]                # автопроброс инбаундов
 xkit sub [-q]                     # перегенерация подписок
 xkit client add|del|list|reset    # пользователи
 xkit reality                      # мастер REALITY
+xkit sockopt on|off|status        # TCP Fast Open + TCP_NODELAY (7.4.3)
 xkit nodes [repair|repin]         # обслуживание нод
 xkit nodes metrics                # обновить трафик, ping и CPU/RAM нод
 xkit nodes plan [--json]          # read-only drift/preflight план
@@ -479,6 +480,10 @@ xkit nodes tune node-1 balanced
 ---
 
 ## 🛠️ Эксплуатация XKIT 7
+
+### TCP Fast Open и TCP_NODELAY (7.4.3)
+
+`xkit sockopt on` включает серверный бит `net.ipv4.tcp_fastopen=3` и добавляет `tcpFastOpen` + `tcpNoDelay` TCP-инбаундам VLESS/VMess/Trojan. `off` снимает только sockopt, установленный xkit; чужие настройки не изменяются. `status` показывает состояние sysctl и инбаундов. Для отключения sockopt при создании REALITY/XHTTP задайте `XKIT_SOCKOPT=0`.
 
 ### Ноды: plan → canary → остальные
 
@@ -618,7 +623,7 @@ sha256sum -c xkit.sh.sha256
 
 ## ✅ Тесты
 
-В пакете находятся **26 регрессионных наборов (1169 проверок)**, включая:
+В пакете находятся **27 регрессионных наборов (1217 проверок)**, включая:
 
 - unit-тесты TUI и самопроверку бинарников;
 - классический fallback и навигацию;
