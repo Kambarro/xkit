@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.5 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.6 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.5"
+XKIT_VERSION="7.4.6"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5844,7 +5844,15 @@ node_add() {
 
   log "Проверяю SSH-доступ..."
   if [ "$rec_auth" = "password" ]; then
-    node_ssh "$rec" "echo ok" 2>/dev/null | grep -q ok || { err "SSH по паролю не прошёл — проверьте пароль и реквизиты ${nuser}@${nhost}:${nport}"; return 1; }
+    local ssh_check ssh_rc
+    ssh_check="$(node_ssh "$rec" "echo ok" 2>&1)"; ssh_rc=$?
+    if [ "$ssh_rc" -ne 0 ] || ! grep -q ok <<<"$ssh_check"; then
+      err "SSH по паролю не прошёл — проверьте реквизиты ${nuser}@${nhost}:${nport}"
+      [ -z "$ssh_check" ] || { echo "Ответ SSH:"; tail -n 8 <<<"$ssh_check"; } >&2
+      grep -qi 'Permission denied' <<<"$ssh_check" \
+        && warn "Сервер отклонил вход: пароль не принят или вход root по паролю запрещён (PermitRootLogin/PasswordAuthentication)"
+      return 1
+    fi
     local pub; pub="$(cat "${nkey}.pub")"
     node_ssh "$rec" "mkdir -p ~/.ssh && chmod 700 ~/.ssh; grep -qF '$pub' ~/.ssh/authorized_keys 2>/dev/null || echo '$pub' >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys" \
       || { err "Не удалось установить ключ на ноде"; return 1; }
