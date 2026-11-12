@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.6 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.7 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.6"
+XKIT_VERSION="7.4.7"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5277,6 +5277,27 @@ node_ssh_host_key() { # $1 host, $2 port, $3 known_hosts -> 0 = можно по�
   return 0
 }
 
+# Изменённый ключ не принимаем автоматически: это может быть MITM.
+node_ssh_host_key_refresh() { # $1 host, $2 port, $3 known_hosts
+  local host="$1" port="$2" kh="$3" old old_fp scan new_fp
+  old="$( { ssh-keygen -F "[${host}]:${port}" -f "$kh"; ssh-keygen -F "$host" -f "$kh"; } 2>/dev/null)"
+  old_fp="$(printf '%s\n' "$old" | ssh-keygen -lf - 2>/dev/null)"
+  warn "Ключ хоста ${host}:${port} изменился: возможна переустановка сервера или атака MITM."
+  [ -z "$old_fp" ] || { echo "Старые отпечатки:"; echo "$old_fp"; } >&2
+  scan="$(timeout 15 ssh-keyscan -T 8 -p "$port" "$host" 2>/dev/null)" || scan=""
+  [ -n "$scan" ] || { err "Не удалось получить новый ключ ${host}:${port}; старый сохранён"; return 1; }
+  new_fp="$(printf '%s\n' "$scan" | ssh-keygen -lf - 2>/dev/null)"
+  [ -n "$new_fp" ] || { err "Не удалось проверить новый ключ ${host}:${port}; старый сохранён"; return 1; }
+  { echo "Новые отпечатки:"; echo "$new_fp"; } >&2
+  if [ "${XKIT_YES:-0}" = "1" ] || [ ! -t 0 ]; then
+    err "Смена ключа требует ручного подтверждения; старый сохранён"; return 1
+  fi
+  confirm "Сверили новый ключ с консолью провайдера и заменяем старый? [y/N] " n || return 1
+  ssh-keygen -f "$kh" -R "[${host}]:${port}" >/dev/null 2>&1 || return 1
+  ssh-keygen -f "$kh" -R "$host" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$scan" >> "$kh"
+}
+
 # отпечаток публичного ключа сертификата (пин, как SSH TOFU): защита panel-API
 # ноды от MITM. Снимается при добавлении ноды и проверяется curl при каждом вызове
 cert_pin() { # $1 host, $2 port -> base64 sha256 публичного ключа (или пусто)
@@ -5846,6 +5867,11 @@ node_add() {
   if [ "$rec_auth" = "password" ]; then
     local ssh_check ssh_rc
     ssh_check="$(node_ssh "$rec" "echo ok" 2>&1)"; ssh_rc=$?
+    if { [ "$ssh_rc" -ne 0 ] || ! grep -q ok <<<"$ssh_check"; } \
+      && grep -q 'Host key verification failed' <<<"$ssh_check"; then
+      node_ssh_host_key_refresh "$nhost" "$nport" "${XKIT_DIR}/known_hosts" || return 1
+      ssh_check="$(node_ssh "$rec" "echo ok" 2>&1)"; ssh_rc=$?
+    fi
     if [ "$ssh_rc" -ne 0 ] || ! grep -q ok <<<"$ssh_check"; then
       err "SSH по паролю не прошёл — проверьте реквизиты ${nuser}@${nhost}:${nport}"
       [ -z "$ssh_check" ] || { echo "Ответ SSH:"; tail -n 8 <<<"$ssh_check"; } >&2
