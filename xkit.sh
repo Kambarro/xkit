@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.12 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.4.15 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.12"
+XKIT_VERSION="7.4.15"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5571,8 +5571,13 @@ tpl["outbounds"] = outb
 r = tpl.setdefault("routing", {})
 rules = r.get("rules") or []
 rules = [x for x in rules if x.get("balancerTag") != "XKIT_POOL"]
+if pool_tag:
+    rules = [x for x in rules if not (x.get("outboundTag") == "direct" and x.get("inboundTag") == [pool_tag]
+             and ("geosite:category-ru" in x.get("domain", []) or "geoip:ru" in x.get("ip", [])))]
 if pool_tag and nodes:
-    rules.insert(0, {"inboundTag": [pool_tag], "balancerTag": "XKIT_POOL"})
+    rules.insert(0, {"inboundTag": [pool_tag], "domain": ["geosite:category-ru"],
+                     "ip": ["geoip:ru"], "outboundTag": "direct"})
+    rules.insert(1, {"inboundTag": [pool_tag], "balancerTag": "XKIT_POOL"})
 r["rules"] = rules
 
 bal = r.get("balancers") or []
@@ -9204,7 +9209,7 @@ clash_yaml_gen() { # $1 subId, $2 файл-аккумулятор «id<TAB>clien
     printf '\nproxy-groups:\n'
     printf '  - name: "Авто"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    proxies:\n%s' "$group_auto"
     printf '  - name: "Прокси"\n    type: select\n    proxies:\n      - "Авто"\n%s' "$group_all"
-    printf '\nrules:\n  - MATCH,Прокси\n'
+    printf '\nrules:\n  - GEOSITE,category-ru,DIRECT\n  - GEOIP,RU,DIRECT,no-resolve\n  - MATCH,Прокси\n'
   } > "$out"
   chmod 644 "$out"
   rm -f "$acc"
@@ -10603,7 +10608,12 @@ for line in text.splitlines():
         out.append(o)
     except Exception:
         skipped.append(name if 'name' in locals() else line[:16])
-conf={'log':{'level':'warn','timestamp':True},'outbounds':[],'route':{'final':'auto'}}
+conf={'log':{'level':'warn','timestamp':True},'outbounds':[],'route':{
+    'rule_set':[
+        {'type':'remote','tag':'geosite-category-ru','format':'binary','url':'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ru.srs','update_interval':'24h'},
+        {'type':'remote','tag':'geoip-ru','format':'binary','url':'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ru.srs','update_interval':'24h'}],
+    'rules':[{'rule_set':['geosite-category-ru','geoip-ru'],'outbound':'direct'}],
+    'final':'auto'}}
 if out:
     conf['outbounds']=[{'type':'selector','tag':'auto','outbounds':[o['tag'] for o in out]+['direct'],'default':out[0]['tag']}]+out+[{'type':'direct','tag':'direct'}]
 else: conf['outbounds']=[{'type':'direct','tag':'direct'}]
@@ -12447,7 +12457,7 @@ CLEAN
 # self-test с самой ноды. stdout: OK<TAB>port<TAB>tok<TAB>dir<TAB>unit<TAB>clean<TAB>ufw
 _freeze_node_setup() { # $1 rec
   local rec="$1" out rc
-  out="$(timeout 120 node_ssh "$rec" 'bash -s' 2>/dev/null <<'EOS'
+  out="$(node_ssh "$rec" 'bash -s' <<'EOS'
 command -v python3 >/dev/null 2>&1 || { echo "ERR nopys"; exit 3; }
 command -v systemd-run >/dev/null 2>&1 || { echo "ERR nosystemd"; exit 3; }
 PORT=""

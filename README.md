@@ -341,6 +341,7 @@ sudo xkit protocols panel install   # панельный режим: AWG+Hy2 к�
 - **два формата каждой подписки (v6.0.0)**: классический base64 для v2ray-приложений и
   `Clash/Mihomo`-YAML (`<subId>.yaml`, `application/yaml`) для Clash Verge/FlClash — с
   группами «Авто»/«Прокси» (без WireGuard в автoselect) и DNS fake-ip + DoH;
+  RU GeoSite/GeoIP идут `DIRECT` с устройства клиента, остальной трафик — через выбранный прокси;
 - **ссылки от рендера самой панели (v6.0.0)**: `vpn://` AmneziaWG и `hysteria2://`
   панельного инбаунда попадают в те же base64-файлы подписок;
 - `xkit client all` — пользователь во ВСЕ протоколы сразу, одна подписка на всё; Vision назначается только VLESS + RAW/TCP + REALITY, для XHTTP остаётся пустым;
