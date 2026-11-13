@@ -473,6 +473,7 @@ xkit help
 
 ```bash
 xkit nodes profile list
+xkit nodes profile survey node-1
 xkit nodes profile switch node-1 vless-xhttp-reality
 xkit nodes profile switch node-1 hysteria2
 xkit nodes profile benchmark node-1
@@ -481,7 +482,7 @@ xkit nodes readdress node-1 203.0.113.20
 xkit nodes tune node-1 balanced
 ```
 
-Переключение создаёт один временный candidate на свободном порту, меняет master outbound и скачивает 8 MiB через весь активный каскад. После успеха старый inbound удаляется; при ошибке восстанавливаются registry, master template и owned firewall-правила. RTT/throughput не являются client/DPI test. Клиентские подписки мастера не меняются. AWG 3.1 остаётся external/host-level вариантом: автоматический switch отклоняется, поскольку Xray не имеет AWG outbound.
+Survey последовательно проверяет VLESS TCP, XHTTP и Hysteria2, показывает RTT/скорость и предлагает выбрать только работающий профиль. Каждый candidate после probe откатывается; без выбора реестр и активный канал не меняются. В неинтерактивном запуске сохраняется только JSON-отчёт. Переключение создаёт один временный candidate на свободном порту, меняет master outbound и скачивает 8 MiB через весь активный каскад. После успеха старый inbound удаляется; при ошибке восстанавливаются registry, master template и owned firewall-правила. RTT/throughput не являются client/DPI test. Клиентские подписки мастера не меняются. AWG 3.1 остаётся external/host-level вариантом: автоматический switch отклоняется, поскольку Xray не имеет AWG outbound.
 
 Смена IP требует тот же SSH host key, успешные SSH/API preflight и новый pin панельного TLS. Переустановка 3X-UI/Xray и автоматический перевыпуск REALITY не выполняются. Сертификат Hysteria/TLS меняется только при необходимости SAN.
 

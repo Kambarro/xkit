@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v7.4.15 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v7.5.0 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -336,7 +336,7 @@ proto_hy2_uninstall() {
 
 proto_hy2_menu() {
   while :; do
-    echo "1) Установить  2) Ссылка  3) Статус  4) Журнал  5) Проверить camo  6) Удалить  0) Назад"
+    echo "1) Установить  2) Ссылка  3) Статус  4) Журнал  5) Проверить сайт-прикрытие  6) Удалить  0) Назад"
     read -r -p 'Hysteria 2: ' c || return
     case "$c" in
       1) proto_hy2_install ;; 2) proto_hy2_link ;;

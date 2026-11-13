@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v7.4.15
+#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v7.5.0
 #
 #  Меню вынесено из xkit.sh в отдельный файл: ядро (API, установка, nginx,
 #  подписки, ноды, дашборд) не раздувается, а правки меню не трогают xkit.sh.
@@ -32,15 +32,15 @@ show_menu() {
   echo ""
   echo -e "${GREEN}============================================================${NC}"
   echo -e "${GREEN}   XKIT v${XKIT_VERSION} — nginx + 3X-UI${XKIT_HOST:+   |   ${XKIT_HOST}}${NC}"
-  echo -e "${GREEN}   Режим: $([ "$_nc" -gt 0 ] && echo "мастер (${_nc} нод)" || echo "одиночный сервер")${NC}"
+  echo -e "${GREEN}   Режим: $([ "$_nc" -gt 0 ] && echo "главный (дополнительных серверов: ${_nc})" || echo "одиночный сервер")${NC}"
   echo -e "${GREEN}============================================================${NC}"
-  echo -e "${YELLOW} 1)${NC} Установка и настройка (3X-UI, автопроброс, relay)"
+  echo -e "${YELLOW} 1)${NC} Установка и настройка (3X-UI, nginx, подключения)"
   echo -e "${YELLOW} 2)${NC} ПОЛЬЗОВАТЕЛИ: создать / удалить / список / трафик / подписки"
   echo -e "${YELLOW} 3)${NC} Протоколы: REALITY / XHTTP / AmneziaWG / Hysteria 2"
-  echo -e "${YELLOW} 4)${NC} НОДЫ: пул серверов, туннели, балансировка"
-  echo -e "${YELLOW} 5)${NC} Обслуживание: сертификат, health, статус, бэкап, обновление"
-  echo -e "${YELLOW} 6)${NC} Мониторинг: дашборд, Telegram, аренда, SSH-хук, реквизиты"
-  echo -e "${YELLOW} 7)${NC} Магистральные каналы: профиль, benchmark, смена IP, tuning"
+  echo -e "${YELLOW} 4)${NC} СЕРВЕРЫ: подключение и распределение нагрузки"
+  echo -e "${YELLOW} 5)${NC} Обслуживание: сертификат, проверки, копии, обновление"
+  echo -e "${YELLOW} 6)${NC} Состояние: страница, Telegram, аренда, доступ"
+  echo -e "${YELLOW} 7)${NC} Соединения между серверами: проверка, скорость, смена IP"
   echo -e "${YELLOW} 0)${NC} Выход"
   echo ""
 }
@@ -69,10 +69,10 @@ menu_install() {
     echo ""
     echo -e "${YELLOW}=== УСТАНОВКА И НАСТРОЙКА: nginx(TLS 443) + 3X-UI ===${NC}"
     echo " 1) Установка одним шагом (3X-UI + nginx + SSL + панель за nginx)"
-    echo " 2) АВТОПРОБРОС: все инбаунды → 127.0.0.1 за nginx + подписки"
+    echo " 2) Настроить все inbound для работы через nginx + подписки"
     echo " 3) Спрятать УЖЕ установленную панель 3X-UI за nginx"
-    echo " 4) Ручной relay-маршрут (проброс пути на другой сервер)"
-    echo " 5) Панель: корректные ссылки и подписки (externalProxy)"
+    echo " 4) Добавить перенаправление на другой сервер"
+    echo " 5) Исправить ссылки и подписки панели"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -97,9 +97,9 @@ menu_users() {
     echo " 2) Удалить пользователя"
     echo " 3) Сбросить трафик пользователю"
     echo " 4) Список пользователей + ссылки"
-    echo " 5) Подписки: перегенерировать и показать URL"
-    echo " 6) Пользователь во ВСЕ протоколы (одна подписка, v6)"
-    echo " 7) QR подписки (локально, SVG/PNG)"
+    echo " 5) Обновить подписки и показать адреса"
+    echo " 6) Добавить пользователя во все протоколы (одна подписка)"
+    echo " 7) QR-код подписки (сохранить SVG/PNG на сервере)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -124,12 +124,12 @@ menu_reality() {
     echo -e "${YELLOW}=== ПРОТОКОЛЫ И ПОДКЛЮЧЕНИЯ ===${NC}"
     echo " 1) VLESS + REALITY + Vision: создать inbound"
     echo " 2) VLESS + XHTTP + REALITY: создать inbound"
-    echo " 3) REALITY: скан подсети"
+    echo " 3) REALITY: найти подходящие сайты рядом"
     echo " 4) REALITY: показать ключи и ссылки"
     echo " 5) AmneziaWG: панель (рекомендуется) или служба — обе с AWG 3.1"
     echo " 6) Hysteria 2: служба и ссылка"
-    echo " 7) Сводка всех профилей"
-    echo " 8) Панельный режим: AWG + Hy2 как инбаунды панели (v6)"
+    echo " 7) Показать состояние всех протоколов"
+    echo " 8) Добавить AWG и Hysteria 2 как inbound панели"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -163,24 +163,24 @@ menu_service() {
   while true; do
     echo ""
     echo -e "${YELLOW}=== ОБСЛУЖИВАНИЕ: серты, диагностика, бэкапы, обновление ===${NC}"
-    echo " 1) Сертификат: перевыпустить (домен / IP / self-signed)"
-    echo " 2) Проверка жизнеспособности (и «что светится наружу»)"
-    echo " 3) Глубокая проверка: реальный клиент по нашим ссылкам (v6)"
-    echo " 4) Статус: сервисы, порты, маршруты"
-    echo " 5) Бэкап: сделать сейчас"
-    echo " 6) Бэкап: восстановить из последнего"
-    echo " 7) Обновить xkit из репозитория (SHA-256, бэкап)"
-    echo " 8) Версии 3X-UI/Xray: список, проверка, установка, rollback"
-    echo " 9) Сайт-заглушка: статус или ручная регенерация по seed"
-    echo "10) Doctor: sanitized support bundle"
-    echo "11) Бэкап: verify / restore dry-run / age export"
-    echo "12) Maintenance: logrotate + systemd timer"
-    echo "13) Отложенные restart: статус / применить"
-    echo "14) Traffic ledger: собрать / показать / quota dry-run"
-    echo "15) Audit journal: последние 50 действий"
-    echo "16) Бэкапы: расписание и хранение (интервал 24/48/168/свой)"
+    echo " 1) Сертификат: выпустить заново (домен / IP / самоподписанный)"
+    echo " 2) Проверка сервера (и «что доступно снаружи»)"
+    echo " 3) Проверить подключение по нашим ссылкам как обычный клиент"
+    echo " 4) Показать службы, порты и маршруты"
+    echo " 5) Создать резервную копию"
+    echo " 6) Восстановить последнюю резервную копию"
+    echo " 7) Обновить XKIT (проверка файла и резервная копия)"
+    echo " 8) Версии 3X-UI/Xray: список, проверка, установка, откат"
+    echo " 9) Сайт-заглушка: состояние или создать заново"
+    echo "10) Подготовить архив для диагностики без секретов"
+    echo "11) Резервные копии: проверить / пробное восстановление / экспорт"
+    echo "12) Автоматическое обслуживание и очистка журналов"
+    echo "13) Отложенные перезапуски: состояние / выполнить"
+    echo "14) Учёт трафика: собрать / показать / проверить ограничения"
+    echo "15) Журнал действий: последние 50 записей"
+    echo "16) Резервные копии: расписание и хранение"
     echo "17) BBR: статус / включить (рекомендация для пропускной способности)"
-    echo "18) Socket options: TFO / TCP_NODELAY"
+    echo "18) Настройки TCP: TFO / TCP_NODELAY"
     echo "19) Проверить обновление XKIT"
     echo " 0) Назад"
     local c
@@ -215,9 +215,9 @@ menu_versions() {
   while true; do
     echo ""; echo "=== ВЕРСИИ 3X-UI/XRAY ==="
     versions_status
-    echo " 1) Показать манифест связок"
-    echo " 2) Установить связку (SHA-256 + backup + probes + rollback)"
-    echo " 3) Откатить последнюю смену связки"
+    echo " 1) Показать проверенные сочетания версий"
+    echo " 2) Установить сочетание версий (проверка, копия, откат при ошибке)"
+    echo " 3) Вернуть предыдущие версии"
     echo " 0) Назад"
     local c u x; read -r -p "Выбор: " c || return 0
     case "$c" in
@@ -243,21 +243,23 @@ menu_camo() {
 menu_channels_v71() {
   while true; do
     echo ""
-    echo " 1) Профили нод: список"
-    echo " 2) Переключить профиль (candidate + benchmark + rollback)"
-    echo " 3) Benchmark: RTT и скорость полного канала"
-    echo " 4) Сменить IP ноды без переустановки (dry-run)"
-    echo " 5) Сменить IP ноды без переустановки (apply)"
-    echo " 6) Conservative tuning: show / safe / balanced"
+    echo " 1) Способы соединения с серверами: список"
+    echo " 2) Сменить способ соединения (при ошибке оставить прежний)"
+    echo " 3) Замерить задержку и скорость текущего соединения"
+    echo " 4) Проверить все способы соединения и выбрать работающий"
+    echo " 5) Проверить смену IP сервера без внесения изменений"
+    echo " 6) Изменить IP сервера без переустановки"
+    echo " 7) Настройки скорости TCP: показать / сбросить / применить"
     echo " 0) Назад"
     local c n p ip m; read -r -p "Выбор: " c || return 0
     case "$c" in
       1) node_profile_list all; pause_enter ;;
       2) read -r -p 'Нода: ' n; read -r -p 'Профиль: ' p; node_profile_switch "$n" "$p"; pause_enter ;;
       3) read -r -p 'Нода: ' n; node_profile_benchmark "$n"; pause_enter ;;
-      4) read -r -p 'Нода: ' n; read -r -p 'Новый IP: ' ip; node_readdress "$n" "$ip" --dry-run; pause_enter ;;
-      5) read -r -p 'Нода: ' n; read -r -p 'Новый IP: ' ip; node_readdress "$n" "$ip"; pause_enter ;;
-      6) read -r -p 'Нода: ' n; read -r -p 'show/safe/balanced: ' m; node_tune "$n" "$m"; pause_enter ;;
+      4) read -r -p 'Нода: ' n; node_profile_survey "$n"; pause_enter ;;
+      5) read -r -p 'Нода: ' n; read -r -p 'Новый IP: ' ip; node_readdress "$n" "$ip" --dry-run; pause_enter ;;
+      6) read -r -p 'Нода: ' n; read -r -p 'Новый IP: ' ip; node_readdress "$n" "$ip"; pause_enter ;;
+      7) read -r -p 'Нода: ' n; read -r -p 'show/safe/balanced: ' m; node_tune "$n" "$m"; pause_enter ;;
       0) return 0 ;; *) warn "Нет такого пункта" ;;
     esac
   done
@@ -267,12 +269,12 @@ menu_extra() {
   while true; do
     echo ""
     echo -e "${YELLOW}=== МОНИТОРИНГ И РЕКВИЗИТЫ ===${NC}"
-    echo " 1) ВЕБ-ДАШБОРД: статусы нод, каналы, трафик (секретный URL)"
-    echo " 2) Telegram: алерты (ноды/аренда/сертификат/дашборд)"
-    echo " 3) СРОКИ АРЕНДЫ серверов: мастер + ноды (expiry)"
-    echo " 4) SSH: авто-меню при входе вкл/выкл (+ обновить команду xkit)"
-    echo " 5) Реквизиты: сводка в терминал (пароли — только в /root/xkit-info.txt)"
-    echo " 6) Telegram Proxy: MTProto FakeTLS / Web Proxy (без SOCKS5)"
+    echo " 1) СТРАНИЦА СОСТОЯНИЯ: серверы, соединения, трафик"
+    echo " 2) Telegram: уведомления о серверах, аренде и сертификатах"
+    echo " 3) СРОКИ АРЕНДЫ главного и дополнительных серверов"
+    echo " 4) Открывать меню XKIT автоматически при входе по SSH"
+    echo " 5) Данные для доступа (пароли — только в /root/xkit-info.txt)"
+    echo " 6) Прокси для Telegram: MTProto / веб-прокси"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -290,7 +292,7 @@ menu_extra() {
 }
 
 menu_backup_v7() {
-  echo "1) verify  2) restore dry-run  3) age export  0) отмена"
+  echo "1) проверить  2) пробное восстановление  3) экспорт  0) отмена"
   local c; read -r -p "Выбор: " c || return 0
   case "$c" in 1) backup_verify ;; 2) backup_restore_dry_run ;; 3) backup_export ;; 0) : ;; *) warn "Нет такого пункта" ;; esac
 }
@@ -300,7 +302,7 @@ menu_bbr() {
   echo ""; echo "=== BBR (TCP congestion control) ==="
   echo "Рекомендуется для прокси-нагрузки: выше пропускная способность, стабильнее latency."
   bbr_status
-  echo " 1) Включить BBR (sysctl drop-in, переживёт ребут)"
+  echo " 1) Включить BBR (настройка сохранится после перезагрузки)"
   echo " 2) Выключить BBR"
   echo " 0) Назад"
   local c; read -r -p "Выбор: " c || return 0

@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.4.15 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.0 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.4.15"
+XKIT_VERSION="7.5.0"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -3664,13 +3664,13 @@ backup_settings_menu() {
     echo ""
     echo -e "${YELLOW}=== НАСТРОЙКИ БЭКАПОВ ===${NC}"
     backup_settings_show
-    echo " 1) Включить / отключить авто-бэкапы"
+    echo " 1) Включить / отключить автоматические резервные копии"
     echo " 2) Интервал: раз в сутки (24 ч)"
     echo " 3) Интервал: раз в 2 суток (48 ч)"
     echo " 4) Интервал: раз в неделю (168 ч)"
     echo " 5) Свой интервал (в часах)"
     echo " 6) Хранение: дней и минимум копий"
-    echo " 7) Сделать бэкап сейчас"
+    echo " 7) Создать резервную копию сейчас"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -3765,8 +3765,8 @@ install_backup_offer() {
   echo "  1) Только сертификаты"
   echo "  2) Пользователи и панель"
   echo "  3) Подписки (вместе с пользователями и панелью)"
-  echo "  4) Ноды и сроки аренды"
-  echo "  5) Полный перенос мастера (всё перечисленное)"
+  echo "  4) Дополнительные серверы и сроки аренды"
+  echo "  5) Полный перенос главного сервера (всё перечисленное)"
   echo "  0) Не восстанавливать"
   read -r -p "Выбор [5]: " choice || { echo; return 1; }
   case "${choice:-5}" in
@@ -4032,7 +4032,7 @@ preflight_installed_menu() { # 0 = продолжать установку по�
   local a
   echo ""
   warn "xkit уже установлен: ${XKIT_ENV}"
-  echo "  1) Обновить скрипт (xkit update) — состояние/ноды/подписки НЕ трогаются"
+  echo "  1) Обновить XKIT — настройки, серверы и подписки не меняются"
   echo "  2) Чистая переустановка: бэкап -> полное удаление -> установка с нуля"
   echo "  3) Починить поверх: пакеты/панель/конфиг заново, состояние сохраняется"
   echo "  0) Выход"
@@ -4509,7 +4509,7 @@ xkit_install_body() {
   echo ""
   log "Что дальше?"
   echo "  1) Одиночный сервер — автопроброс инбаундов за nginx (по умолчанию)"
-  echo "  2) Мастер с нодами — автопроброс, затем добавить зарубежные ноды"
+  echo "  2) Главный и дополнительные серверы — настройка nginx, затем подключение серверов"
   echo "  3) Ничего — сделаю позже сам (xkit route / xkit nodes)"
   if [ "${XKIT_YES:-0}" = "1" ]; then
     a="3"
@@ -4776,7 +4776,7 @@ ensure_panel_sub_settings() {
     "subPath=${XKIT_PANEL_SUB_PATH}" \
     "subListen=127.0.0.1" \
     "subDomain=${XKIT_HOST}" \
-    "subURI=https://${XKIT_HOST}" || return 1
+    "subURI=https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}" || return 1
   ok "Настройки подписок панели применены"
   panel_restart || true
   save_xkit_env
@@ -5113,8 +5113,8 @@ reality_wizard() {
   echo "Какой dest (сайт-прикрытие) используем для Reality?"
   echo "1) Свой сайт на этом сервере (${XKIT_HOST:-домен} + наш сертификат) — лучший камуфляж"
   echo "2) Скан подсети — найти подходящие сайты рядом"
-  echo "3) Готовый список проверенных dest"
-  echo "4) Вручную: dest + SNI"
+  echo "3) Готовый список проверенных сайтов"
+  echo "4) Ввести адрес сайта и SNI вручную"
   read -r -p "Выбор [1-4]: " c
   local dest="" sni=""
   case "$c" in
@@ -5603,6 +5603,8 @@ PY
 }
 
 nodes_apply_template() {
+  load_xkit_env || return 1
+  [ -n "${PANEL_PORT:-}" ] || kit_session || return 1
   local nodes_json; nodes_json="$(nodes_load)"
   local cur merged
   cur="$(master_xray_template_get)" || return 1
@@ -5910,8 +5912,8 @@ node_add() {
     none) _need_install=1 ;;
     panel)
       warn "На ноде ${nhost} уже установлена рабочая панель 3X-UI."
-      echo "  1) Подключить ноду к существующей панели (xkit задаст новые случайные реквизиты, инбаунды остаются)"
-      echo "  2) Снести и поставить заново (чистая установка; старая БД уедет в бэкап на ноде)"
+      echo "  1) Подключить сервер к существующей панели (новые доступы, inbound сохранятся)"
+      echo "  2) Переустановить панель (прежние настройки сохранятся в резервной копии)"
       read -r -p "Что делать? [1]: " _ra || { echo; return 1; }
       _ra="${_ra:-1}"
       if [ "$_ra" = "2" ]; then
@@ -5923,7 +5925,7 @@ node_add() {
     leftovers)
       warn "На ноде ${nhost} найдены куски прежней установки 3X-UI (рабочей панели нет)."
       echo "  1) Очистить и поставить заново (рекомендуется)"
-      echo "  2) Отменить добавление ноды"
+      echo "  2) Отменить добавление сервера"
       read -r -p "Что делать? [1]: " _ra || { echo; return 1; }
       _ra="${_ra:-1}"
       [ "$_ra" = "1" ] || { warn "Добавление ноды отменено — куски прежней установки не тронуты"; return 1; }
@@ -6084,7 +6086,7 @@ EOS
   local ndest="" nsni="" RDEST="" RSNI="" dc=""
   if [ "${XKIT_NODE_DEST_MENU:-0}" = "1" ]; then
     echo "Dest (прикрытие) для Reality на ноде:"
-    echo "  1) 1.1.1.1 (быстро и надёжно)   2) известный список   3) СКАН С САМОЙ НОДЫ"
+    echo "  1) 1.1.1.1 (быстро и надёжно)   2) известный список   3) ПОИСК С ДОПОЛНИТЕЛЬНОГО СЕРВЕРА"
     if [ -n "$mdest" ] && [ -n "$msni" ]; then
       echo "  4) как на мастере (${mdest}, SNI ${msni})"
     else
@@ -6278,7 +6280,7 @@ EOS
       echo "Сертификат панели ноды (${nhost}):"
       echo "  1) Let's Encrypt на домен — поддомен с A-записью на ${nhost} (автопродление на ноде) [Enter]"
       echo "  2) свой сертификат — пути к fullchain/privkey на этом сервере"
-      echo "  3) subdomain+wildcard — база + *.база, dns-01 через Cloudflare (открывает vhost api./dev./login. camo)"
+      echo "  3) Домен и все поддомены через Cloudflare (для сайта-прикрытия)"
       echo "  4) самоподписанный (уже стоит — пропустить)"
       read -r -p "Выбор [1]: " _cm || _cm=""
       case "${_cm:-1}" in
@@ -6516,10 +6518,10 @@ nodes_strategy() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   echo ""
   echo "Стратегия балансировки (xray balancer):"
-  echo "1) roundRobin — по кругу"
-  echo "2) random     — случайно"
-  echo "3) leastPing  — УМНАЯ: observatory пингует ноды, трафик идёт на самую быструю"
-  echo "4) leastLoad  — стабильная нода, burst-замеры 5 минут (по умолчанию)"
+  echo "1) По очереди (roundRobin)"
+  echo "2) Случайно (random)"
+  echo "3) По наименьшей задержке (leastPing): выбирается самый быстрый ответ"
+  echo "4) По наименьшей загрузке (leastLoad): проверка каждые 5 минут (по умолчанию)"
   read -r -p "Выбор [1-4, Enter = 4]: " s
   s="${s:-4}"
   case "$s" in
@@ -6639,23 +6641,23 @@ pool_remove() { # интерактивно (пункт меню НОДЫ -> 8)
 nodes_menu() {
   while true; do
     echo ""
-    echo -e "${YELLOW}=== НОДЫ: главный сервер -> туннель до нод, балансировка ===${NC}"
-    echo " 1) Добавить ноду по SSH (3X-UI + Reality-туннель + балансировка)"
-    echo " 2) Список нод"
-    echo " 3) Health-check нод"
-    echo " 4) Стратегия балансировки (roundRobin/random/leastPing/leastLoad)"
-    echo " 5) Удалить ноду"
-    echo " 6) Repair: переприменить конфигурацию нод (после сбоя apply)"
-    echo " 7) Перепинить сертификат панели ноды (MITM-защита API)"
-    echo " 8) Убрать pool — вернуть сервер в одиночный режим (v4.5)"
-    echo " 9) Сертификат панели ноды: LE ip/domain/wildcard (мастер dns-01)/self-signed (v7.3)"
-    echo "10) Camo-сьют ноды: свой сайт + фейк-логин + vhost api./dev./login. (v7.3)"
-    echo "11) Проверка нод: TCP/SSH/API/x-ui; deep: CPU/RAM/диск/серт (v7.3)"
-    echo "12) Freeze-check: заморозка ТСПУ на леге мастер->нода (v7.3, до ~2 мин/нода)"
-    echo "13) Drift plan / canary / apply"
-    echo "14) Scoped API token: задать / проверить срок"
-    echo "15) Переполучить API token и обновить «Узлы» 3X-UI"
-    echo "16) Добавить/обновить ноду в «Узлах» 3X-UI (без импорта)"
+    echo -e "${YELLOW}=== ДОПОЛНИТЕЛЬНЫЕ СЕРВЕРЫ И РАСПРЕДЕЛЕНИЕ НАГРУЗКИ ===${NC}"
+    echo " 1) Добавить сервер по SSH (3X-UI + защищённое соединение)"
+    echo " 2) Список дополнительных серверов"
+    echo " 3) Проверить состояние серверов"
+    echo " 4) Выбрать распределение нагрузки (по очереди/случайно/по задержке/по загрузке)"
+    echo " 5) Удалить дополнительный сервер"
+    echo " 6) Восстановить настройки серверов после ошибки"
+    echo " 7) Проверить и заново доверять сертификат панели сервера"
+    echo " 8) Отключить дополнительные серверы и работать только на главном"
+    echo " 9) Сертификат панели сервера: домен / IP / самоподписанный"
+    echo "10) Сайт-прикрытие сервера: сайт и страница входа"
+    echo "11) Проверка серверов: соединение, SSH, панель, память и диск"
+    echo "12) Проверка зависания передачи между главным и дополнительным сервером"
+    echo "13) Показать отличия настроек / проверить на одном / применить ко всем"
+    echo "14) Ограниченный ключ доступа к панели: задать / проверить срок"
+    echo "15) Получить новый ключ доступа и обновить список в 3X-UI"
+    echo "16) Добавить/обновить сервер в «Узлах» 3X-UI (без импорта)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -6705,7 +6707,7 @@ node_cert_menu() {
 node_camo_menu() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   node_camo_status
-  echo " 1) Развернуть/обновить camo на ноде   2) Снять camo (имя|all)   0) Назад"
+  echo " 1) Установить/обновить сайт-прикрытие   2) Удалить сайт-прикрытие (имя|all)   0) Назад"
   local c n
   read -r -p "Выбор: " c || return 0
   case "$c" in
@@ -6888,7 +6890,7 @@ expiry_check() {
 }
 
 expiry_menu_set() {
-  echo "Кому задать срок:  1) этот сервер (мастер)   2) нода"
+  echo "Кому задать срок:  1) главный сервер   2) дополнительный сервер"
   read -r -p "Выбор [1]: " w; w="${w:-1}"
   local scope id
   if [ "$w" = "2" ]; then
@@ -7793,18 +7795,18 @@ dash_menu() {
   load_xkit_env 2>/dev/null || true
   while true; do
     echo ""
-    echo -e "${YELLOW}=== ВЕБ-ДАШБОРД (статусы нод / каналы / трафик / сроки аренды) ===${NC}"
+    echo -e "${YELLOW}=== СТРАНИЦА СОСТОЯНИЯ (серверы / соединения / трафик / аренда) ===${NC}"
     if [ "${XKIT_DASH:-0}" = "1" ] && [ -n "${XKIT_DASH_TOKEN:-}" ]; then
       ok "Установлен: https://${XKIT_HOST:-?}$(dash_path)"
       [ -n "${XKIT_DASH_ALLOW:-}" ] && log "Доступ ограничен IP: ${XKIT_DASH_ALLOW}"
     else
       warn "Не установлен"
     fi
-    echo " 1) Установить / переустановить (nginx-локейшн + cron + первое построение)"
-    echo " 2) Построить данные сейчас (xkit dash gen)"
-    echo " 3) Показать URL"
-    echo " 4) Ротация: новый токен URL + логин/пароль (xkit dash rotate)"
-    echo " 5) Выключить (убрать из nginx и cron; данные и сроки аренды остаются)"
+    echo " 1) Установить / переустановить (адрес, автообновление и первые данные)"
+    echo " 2) Обновить данные сейчас"
+    echo " 3) Показать адрес страницы"
+    echo " 4) Сменить адрес страницы и логин/пароль"
+    echo " 5) Выключить страницу (данные и сроки аренды сохранятся)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -8113,16 +8115,16 @@ telegram_menu() {
   load_xkit_env 2>/dev/null || true
   while true; do
     echo ""
-    echo -e "${YELLOW}=== TELEGRAM-АЛЕРТЫ (ноды/аренда/сертификат/дашборд) ===${NC}"
+    echo -e "${YELLOW}=== УВЕДОМЛЕНИЯ В TELEGRAM (серверы/аренда/сертификаты) ===${NC}"
     if [ -n "${XKIT_TG_TOKEN:-}" ] && [ -n "${XKIT_TG_CHAT:-}" ]; then
       ok "Настроено: чат ${XKIT_TG_CHAT}${XKIT_TG_PROXY:+, прокси ${XKIT_TG_PROXY}}"
     else
       warn "Не настроено (xkit telegram setup)"
     fi
-    echo " 1) Настроить / заменить (токен + chat_id + тестовое сообщение)"
-    echo " 2) Проверить сейчас (то же, что cron каждые 10 минут)"
+    echo " 1) Настроить / заменить (ключ бота + чат + тестовое сообщение)"
+    echo " 2) Проверить сейчас (те же проверки, что автоматически каждые 10 минут)"
     echo " 3) Отправить тестовое сообщение"
-    echo " 4) Выключить (токен удаляется, cron убирается)"
+    echo " 4) Выключить (ключ удаляется, автоматические проверки отключаются)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -8710,7 +8712,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes camo <имя|all> [домен] — camo-сьют ноды: свой сайт + фейк-логин /login + vhost api./dev./login.
   xkit nodes camo-off <имя|all> — снять camo с ноды
   xkit nodes readdress <имя> <новый-IP> [--dry-run] — смена IP без переустановки
-  xkit nodes profile list|switch|benchmark <имя> [профиль] — канал мастер→нода
+  xkit nodes profile list|survey|switch|benchmark <имя> [профиль] — канал мастер→нода
   xkit nodes tune <имя> show|safe|balanced — откатываемая сетевая настройка
   xkit telegram-proxy ... — только MTProto FakeTLS и Telegram Web Proxy
   xkit reality scan-csv [tsv] [csv] — TLS/ALPN/issuer отчёт
@@ -8816,7 +8818,7 @@ xkit_main_impl() {
                camo-off) shift; node_camo_dispatch off "$@" ;;
                readdress) shift; node_readdress "$@" ;;
                profile) shift
-                      case "${1:-list}" in list) node_profile_list "${2:-all}" ;; switch) node_profile_switch "${2:-}" "${3:-}" ;; benchmark) node_profile_benchmark "${2:-}" ;; *) err "nodes profile list|switch <имя> <профиль>|benchmark <имя>"; exit 1 ;; esac ;;
+                      case "${1:-list}" in list) node_profile_list "${2:-all}" ;; survey) node_profile_survey "${2:-}" ;; switch) node_profile_switch "${2:-}" "${3:-}" ;; benchmark) node_profile_benchmark "${2:-}" ;; *) err "nodes profile list|survey <имя>|switch <имя> <профиль>|benchmark <имя>"; exit 1 ;; esac ;;
                tune) shift; node_tune "$@" ;;
                *) nodes_menu ;;
              esac ;;
@@ -10016,9 +10018,9 @@ versions_installer_select() {
   [ -t 0 ] || return 0
   local a u x rel
   echo "Версии 3X-UI/Xray:"
-  echo "  1) свежий релиз официального репозитория (3x-ui latest + его Xray) [Enter]"
-  echo "  2) выбрать релиз из официального репозитория (последние GitHub releases)"
-  echo "  3) проверенная связка из манифеста xkit (3X-UI + Xray)"
+  echo "  1) Последняя официальная версия 3X-UI и входящий в неё Xray [Enter]"
+  echo "  2) Выбрать версию из официального списка GitHub"
+  echo "  3) Выбрать проверенное сочетание версий 3X-UI + Xray"
   read -r -p "Ваш выбор: " a || return 0
   a="${a:-1}"
   case "$a" in
@@ -10972,8 +10974,8 @@ node_profile_inbound_vless() { # rec profile port private-key -> JSON
   local rec="$1" profile="$2" port="$3" priv="$4" net=tcp flow="" path="" settings stream
   [ "$profile" = vless-xhttp-reality ] && { net=xhttp; path="/xkn-$(rand_hex 6)"; }
   [ "$profile" = vless-reality-vision ] && flow=xtls-rprx-vision
-  settings="$(jq -nc --arg id "$(jq -r '.tunnel.uuid' <<<"$rec")" --arg n "$(jq -r '.name' <<<"$rec")" --arg f "$flow" \
-    '{clients:[{id:$id,flow:$f,email:("tunnel-"+$n),enable:true,limitIp:0,totalGB:0,expiryTime:0,reset:0}],decryption:"none",fallbacks:[]}')"
+  settings="$(jq -nc --arg id "$(jq -r '.tunnel.uuid' <<<"$rec")" --arg n "$(jq -r '.name' <<<"$rec")" --arg f "$flow" --arg s "$(rand_hex 3)" \
+    '{clients:[{id:$id,flow:$f,email:("tunnel-"+$n+"-"+$s),enable:true,limitIp:0,totalGB:0,expiryTime:0,reset:0}],decryption:"none",fallbacks:[]}')"
   stream="$(jq -nc --arg net "$net" --arg dest "$(jq -r '.tunnel.dest' <<<"$rec")" --arg sni "$(jq -r '.tunnel.sni' <<<"$rec")" \
     --arg priv "$priv" --arg sid "$(jq -r '.tunnel.sid' <<<"$rec")" --arg pub "$(jq -r '.tunnel.pbk' <<<"$rec")" --arg path "$path" \
     '{network:$net,security:"reality",realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$priv,shortIds:[$sid],settings:{publicKey:$pub,fingerprint:"chrome",serverName:""}}} + (if $net=="xhttp" then {xhttpSettings:{path:$path,mode:"auto"}} else {} end)')"
@@ -10991,7 +10993,7 @@ node_profile_tunnel_vless() { # rec profile port private-key path-from-inbound
 
 node_profile_hysteria_ib() { # rec port auth cert key -> inbound
   local rec="$1" port="$2" auth="$3" crt="$4" key="$5" settings stream
-  settings="$(jq -nc --arg a "$auth" --arg n "$(jq -r '.name' <<<"$rec")" '{version:2,clients:[{email:("tunnel-"+$n),auth:$a,enable:true,limitIp:0,totalGB:0,expiryTime:0,reset:0}]}')"
+  settings="$(jq -nc --arg a "$auth" --arg n "$(jq -r '.name' <<<"$rec")" --arg s "$(rand_hex 3)" '{version:2,clients:[{email:("tunnel-"+$n+"-"+$s),auth:$a,enable:true,limitIp:0,totalGB:0,expiryTime:0,reset:0}]}')"
   stream="$(jq -nc --arg c "$crt" --arg k "$key" '{network:"hysteria",security:"tls",tlsSettings:{alpn:["h3"],certificates:[{certificateFile:$c,keyFile:$k}]},hysteriaSettings:{version:2}}')"
   jq -nc --argjson port "$port" --arg remark "xkit-tunnel-$(jq -r '.name' <<<"$rec")" --arg s "$settings" --arg st "$stream" \
     '{up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,listen:"",port:$port,protocol:"hysteria",settings:$s,streamSettings:$st,sniffing:"{\"enabled\":false}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:("inbound-"+($port|tostring))}'
@@ -11004,11 +11006,16 @@ node_profile_list() {
   printf '%s\n' 'amneziawg-external: только host-level туннель + явно проверенный outbound; Xray AWG outbound не существует'
 }
 
-node_profile_remote_port() { # rec tcp|udp -> свободный loopback/all-interface порт
-  node_ssh "$1" python3 - _ "$2" <<'PY'
+node_profile_remote_port() { # rec tcp|udp [preferred] -> свободный preferred или случайный порт
+  node_ssh "$1" python3 - _ "$2" "${3:-}" <<'PY'
 import socket,sys
 s=socket.socket(socket.AF_INET,socket.SOCK_STREAM if sys.argv[2]=="tcp" else socket.SOCK_DGRAM)
-s.bind(("",0)); print(s.getsockname()[1]); s.close()
+preferred=int(sys.argv[3]) if len(sys.argv)>3 and sys.argv[3] else 0
+try: s.bind(("",preferred))
+except OSError:
+    if not preferred: raise
+    s.bind(("",0))
+print(s.getsockname()[1]); s.close()
 PY
 }
 
@@ -11022,8 +11029,9 @@ node_profile_fw() { # rec add|del port tcp|udp; только owned XKIT rule, UF
 }
 
 node_profile_switch() {
-  local want="${1:-}" profile="${2:-}" arr rec oldrec ck list oldib oldport priv port ib out newrec rf oldid newid rc=0 proto=tcp certpin="" certmade=0
+  local want="${1:-}" profile="${2:-}" probe="${3:-}" arr rec oldrec ck list oldib oldport priv port ib out newrec rf oldid newid rc=0 proto=tcp certpin="" certmade=0
   node_profile_valid "$profile" || { err "Неизвестный профиль"; return 1; }
+  [ -z "$probe" ] || [ "$probe" = --probe ] || { err "Неизвестный режим profile switch"; return 1; }
   [ "$profile" != amneziawg-external ] || { err "AWG не является Xray outbound. Сначала нужен host-level туннель; автоматическое переключение отклонено, чтобы не создать нерабочий канал"; return 2; }
   arr="$(nodes_load)"; rec="$(jq -c --arg n "$want" '[.[]|select(.name==$n)][0]//empty' <<<"$arr")"; [ -n "$rec" ] || return 1
   [ "$(node_profile_name "$rec")" != "$profile" ] || { ok "Профиль уже активен"; return 0; }
@@ -11032,7 +11040,7 @@ node_profile_switch() {
   list="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck")"; oldport="$(jq -r '.tunnel.port' <<<"$rec")"
   oldib="$(jq -c --argjson p "$oldport" '[.obj[]|select(.port==$p)][0]//empty' <<<"$list")"; [ -n "$oldib" ] || { rm -f "$ck"; err "Старый inbound не найден — switch отменён"; return 1; }
   [ "$profile" = hysteria2 ] && proto=udp
-  port="$(node_profile_remote_port "$rec" "$proto")" || { rm -f "$ck"; return 1; }
+  port="$(node_profile_remote_port "$rec" "$proto" 443)" || { rm -f "$ck"; return 1; }
   is_port "$port" || { rm -f "$ck"; err "Не удалось выделить candidate port"; return 1; }
   case "$profile" in
     vless-*)
@@ -11043,7 +11051,8 @@ node_profile_switch() {
     hysteria2)
       local auth crt key
       auth="$(rand_str 32)"; crt="/etc/xkit/node-hysteria-${want}.crt"; key="/etc/xkit/node-hysteria-${want}.key"
-      node_ssh "$rec" "mkdir -p /etc/xkit && chmod 700 /etc/xkit && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj /CN=xkit-node -addext subjectAltName=IP:$(jq -r '.host' <<<"$rec") -keyout '$key' -out '$crt' >/dev/null 2>&1 && chmod 600 '$key'" || { rm -f "$ck"; return 1; }
+      local san; san="$(jq -r '.host' <<<"$rec")"; is_ip "$san" && san="IP:$san" || san="DNS:$san"
+      node_ssh "$rec" "mkdir -p /etc/xkit && chmod 700 /etc/xkit && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj /CN=xkit-node -addext subjectAltName=$san -keyout '$key' -out '$crt' >/dev/null 2>&1 && chmod 600 '$key'" || { rm -f "$ck"; err "Не удалось создать сертификат Hysteria2 на ноде ($san)"; return 1; }
       certmade=1; certpin="$(node_ssh "$rec" "openssl x509 -in '$crt' -outform DER | openssl dgst -sha256 -binary | base64 -w0")"
       [ -n "$certpin" ] || { rm -f "$ck"; err "Не удалось рассчитать certificate pin Hysteria"; return 1; }
       ib="$(node_profile_hysteria_ib "$rec" "$port" "$auth" "$crt" "$key")"
@@ -11072,6 +11081,14 @@ node_profile_switch() {
     if [ "$certmade" = 1 ]; then node_ssh "$oldrec" "rm -f $(jq -r '.tunnel.cert' <<<"$rec") $(jq -r '.tunnel.key' <<<"$rec")" >/dev/null 2>&1 || true; fi
     rm -f "$ck"; audit_event nodes.profile.switch "$want" error rollback; return 1
   fi
+  if [ "$probe" = --probe ]; then
+    printf '%s' "$arr" | _xkit_atomic_write "$XKIT_NODES" && nodes_apply_template >/dev/null 2>&1 || { rm -f "$ck"; err "Probe завершён, но исходный канал не восстановлен"; return 1; }
+    newid="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck" | jq -r --argjson p "$port" '[.obj[]|select(.port==$p)][0].id//empty')"
+    [ -z "$newid" ] || node_api "$rec" "panel/api/inbounds/del/$newid" POST "" "$ck" >/dev/null 2>&1 || true
+    node_profile_fw "$rec" del "$port" "$proto" >/dev/null 2>&1 || true
+    if [ "$certmade" = 1 ]; then node_ssh "$oldrec" "rm -f $(jq -r '.tunnel.cert' <<<"$rec") $(jq -r '.tunnel.key' <<<"$rec")" >/dev/null 2>&1 || true; fi
+    rm -f "$ck"; audit_event nodes.profile.probe "$want" ok "$profile"; return 0
+  fi
   oldid="$(jq -r '.id' <<<"$oldib")"; node_api "$rec" "panel/api/inbounds/del/$oldid" POST "" "$ck" >/dev/null || warn "Старый inbound #${oldid} не удалён — удалите после проверки"
   node_profile_fw "$oldrec" del "$oldport" "$([ "$(jq -r '.tunnel.proto' <<<"$oldrec")" = hysteria2 ] && printf udp || printf tcp)" >/dev/null 2>&1 || true
   rm -f "$ck"; audit_event nodes.profile.switch "$want" ok "$profile"
@@ -11081,6 +11098,8 @@ node_profile_switch() {
 # Полный active-path benchmark: master loopback -> Xray node outbound -> node loopback HTTP.
 node_profile_benchmark() {
   local want="${1:-}" quiet="${2:-}" rec rp lp metrics elapsed ms rtt bytes speed rc=0 orig="" merged applied=0 result
+  load_xkit_env || return 1
+  [ -n "${PANEL_PORT:-}" ] || kit_session || return 1
   rec="$(node_record "$want")"; [ -n "$rec" ] || return 1
   command -v python3 >/dev/null && command -v curl >/dev/null || return 1
   lp="$(rand_free_port 31000 59000)" || return 1
@@ -11111,6 +11130,37 @@ PY
   result="$(jq -nc --arg n "$want" --arg profile "$(node_profile_name "$rec")" --argjson rtt "$rtt" --argjson ms "$ms" --argjson mbps "$speed" '{node:$n,profile:$profile,rtt_ms:$rtt,total_ms:$ms,download_mbps:$mbps,bytes:8388608,scope:"master->node full active path",dpi_test:false}')"
   printf '%s\n' "$result" | _xkit_atomic_write "${XKIT_DIR}/benchmark-${want}.json" || return 1
   [ "$quiet" = --quiet ] || { ok "Полный каскад: RTT ${rtt} ms, 8 MiB за ${ms} ms, ~${speed} Mbps (не DPI test)"; printf '%s\n' "$result"; }
+}
+
+node_profile_survey() {
+  local want="${1:-}" rec current p row results='[]' report choice rc
+  rec="$(node_record "$want")"; [ -n "$rec" ] || { err "Нода не найдена"; return 1; }
+  current="$(node_profile_name "$rec")"
+  warn "Проверка временно применяет candidate и возвращает исходный канал после каждого замера"
+  for p in vless-reality-vision vless-xhttp-reality hysteria2; do
+    log "Проверка $p"
+    if [ "$p" = "$current" ]; then node_profile_benchmark "$want" --quiet; else node_profile_switch "$want" "$p" --probe; fi
+    rc=$?
+    if [ "$rc" -eq 0 ] && row="$(jq -c '. + {ok:true}' "${XKIT_DIR}/benchmark-${want}.json" 2>/dev/null)"; then
+      results="$(jq -c --argjson r "$row" '. + [$r]' <<<"$results")"
+    else
+      row="$(jq -nc --arg p "$p" '{profile:$p,ok:false}')"; results="$(jq -c --argjson r "$row" '. + [$r]' <<<"$results")"
+    fi
+  done
+  report="$(jq -nc --arg n "$want" --argjson r "$results" '{node:$n,results:$r,scope:"master->node full path; 8 MiB",dpi_test:false}')"
+  printf '%s\n' "$report" | _xkit_atomic_write "${XKIT_DIR}/profile-survey-${want}.json" || return 1
+  printf '\n%-4s %-25s %-10s %-10s %-12s\n' '№' 'ПРОФИЛЬ' 'СТАТУС' 'RTT, ms' 'СКОРОСТЬ'
+  jq -r '.results[]|[.profile,(if .ok then "РАБОТАЕТ" else "НЕ РАБОТАЕТ" end),(.rtt_ms//"-"|tostring),(if .ok then ((.download_mbps|tostring)+" Mbps") else "-" end)]|@tsv' <<<"$report" | \
+    while IFS=$'\t' read -r p st rtt speed; do printf '%-4s %-25s %-10s %-10s %-12s\n' '-' "$p" "$st" "$rtt" "$speed"; done
+  mapfile -t choices < <(jq -r '.results[]|select(.ok)|.profile' <<<"$report")
+  [ "${#choices[@]}" -gt 0 ] || { err "Ни один профиль не прошёл полную передачу данных; исходный канал сохранён"; return 1; }
+  [ -t 0 ] || { ok "Отчёт сохранён; для переключения: xkit nodes profile switch $want <профиль>"; return 0; }
+  echo ""; echo ' 0) Не переключать'
+  local i; for i in "${!choices[@]}"; do printf ' %d) %s\n' "$((i+1))" "${choices[$i]}"; done
+  read -r -p 'Профиль для переключения: ' choice || return 0
+  [ "$choice" != 0 ] || return 0
+  [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -le "${#choices[@]}" ] || { err "Неверный выбор — ничего не изменено"; return 1; }
+  node_profile_switch "$want" "${choices[$((choice-1))]}"
 }
 
 node_profile_bench_cleanup() { node_ssh "$1" "p=\$(cat /run/xkit-node-bench.pid 2>/dev/null || true); case \"\$p\" in ''|*[!0-9]*) ;; *) kill \"\$p\" 2>/dev/null || true ;; esac; rm -rf /run/xkit-node-bench /run/xkit-node-bench.pid" >/dev/null 2>&1 || true; }
@@ -11773,9 +11823,9 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
   echo -e "${YELLOW}=== Сертификат панели ноды $nname ($nhost) ===${NC}"
   echo " Текущий режим: $(jq -r '.panel.cert.mode // "self-signed (по умолчанию)"' <<<"$rec")"
   if [ -z "$mode" ]; then
-    echo "  1) self-signed      — как сейчас, но CN=имя ноды (ключ уникален) [быстро]"
-    echo "  2) ip               — LE shortlived на IP ноды (~6.5 дней, автопродление на ноде)"
-    echo "  3) domain           — отдельный домен, A -> IP ноды (http-01, продление на ноде)"
+    echo "  1) Самоподписанный — быстро, отдельный ключ для сервера"
+    echo "  2) Для IP — короткий сертификат с автопродлением"
+    echo "  3) Для отдельного домена — с автопродлением на сервере"
     echo "  4) subdomain+wildcard — база + *.база, выпускает мастер по dns-01 (Cloudflare),"
     echo "                        раздаётся ноде; открывает vhost api./dev./login. (camo-сьют)"
     echo "  5) own              — свой сертификат: пути к fullchain/privkey на этом сервере"
