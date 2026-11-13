@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.0 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.1 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.0"
+XKIT_VERSION="7.5.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -1985,9 +1985,14 @@ api_post_form() { # $1 путь; далее key=value
 #   del     POST /panel/api/clients/del/:email
 #   reset   POST /panel/api/clients/resetTraffic/:email
 # (старые v2-пути inbounds/addClient, inbounds/:id/delClient/:cid в v3 УДАЛЕНЫ)
+api_normalize_tgid() { # клиент или inbound: пустой tgId отсутствует, числовой — JSON-число
+  jq -c 'def n: if .tgId? == "" then del(.tgId) elif (.tgId?|type)=="string" then .tgId = (.tgId | if test("^-?[0-9]+$") then tonumber else error("tgId must be an integer") end) else . end;
+    if has("settings") then .settings = ((.settings|fromjson) | .clients |= map(n) | tojson) else n end'
+}
+
 api_add_client() { # $1 id инбаунда, $2 JSON ОДНОГО клиента, $3 текущая строка settings (для v2)
   local id="$1" cj="$2" settings="$3" resp
-  cj="$(jq -c 'if .tgId? == "" then del(.tgId) elif (.tgId?|type)=="string" then .tgId = (.tgId | if test("^-?[0-9]+$") then tonumber else error("tgId must be an integer") end) else . end' <<<"$cj")" \
+  cj="$(api_normalize_tgid <<<"$cj")" \
     || { err "addClient: tgId должен быть целым числом или отсутствовать"; return 1; }
   if [ "$API_V3" = "1" ]; then
     local body
@@ -2746,6 +2751,7 @@ sub_regen_impl() {
   [ -n "$XKIT_HOST" ] || die "Не задан XKIT_HOST"
   log "Формирую подписки из данных панели..."
   kit_session || return 1
+  panel_sub_uri_fix || return 1
   routes_load
 
   mkdir -p "$SUBS_DIR"
@@ -2953,36 +2959,32 @@ client_del() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   kit_session || return 1
   routes_load
-  list_inbounds_menu || return 1
-  local ib="$PICK_IB" id
-  id="$(jq -r '.id' <<<"$ib")"
 
-  local -a cls=()
-  mapfile -t cls < <(jq -c '.settings|fromjson?|.clients[]?' <<<"$ib")
-  [ "${#cls[@]}" -gt 0 ] || { warn "В инбаунде нет клиентов"; return 0; }
-  echo ""
-  printf '%-3s %-28s %-10s %s\n' "#" "EMAIL" "ВКЛЮЧЁН" "ИСТЕКАЕТ"
-  local i=0 cl
-  for cl in "${cls[@]}"; do
-    i=$((i+1))
-    printf '%-3s %-28s %-10s %s\n' "$i" "$(jq -r '.email // "-"' <<<"$cl" | cut -c1-28)" \
-      "$(jq -r 'if (.enable // true) then "да" else "нет" end' <<<"$cl")" \
-      "$(human_expiry "$(jq -r '.expiryTime // 0' <<<"$cl")")"
-  done
+  local -a users=()
+  mapfile -t users < <(jq -r '[.[].settings|fromjson?|.clients[]?|.email // empty]|unique[]' <<<"$INBOUNDS")
+  [ "${#users[@]}" -gt 0 ] || { warn "Пользователей нет"; return 0; }
+  printf '%-3s %s
+' "#" "ПОЛЬЗОВАТЕЛЬ"
+  local i=0 email
+  for email in "${users[@]}"; do i=$((i+1)); printf '%-3s %s
+' "$i" "$email"; done
   read -r -p "Номер пользователя для удаления [1-$i] (Enter — отмена): " n
-  [[ "$n" =~ ^[0-9]+$ ]] || { warn "Отменено"; return 0; }
-  [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { warn "Отменено"; return 0; }
-  cl="${cls[$((n-1))]}"
-  local email cid
-  email="$(jq -r '.email // "-"' <<<"$cl")"
-  cid="$(jq -r '.id // .password // empty' <<<"$cl")"
-  [ -n "$cid" ] || { err "Не найден id клиента"; return 1; }
-  confirm "Удалить '$email'? [y/N] " n || { warn "Отменено"; return 0; }
-  if api_del_client "$id" "$email" "$cid"; then
-    ok "Пользователь '$email' удалён"
-    sub_regen_quiet || true
-  fi
-  return 0
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { warn "Отменено"; return 0; }
+  email="${users[$((n-1))]}"
+  confirm "Удалить '$email' из всех протоколов? [y/N] " n || { warn "Отменено"; return 0; }
+
+  local ib id cid deleted=0 failed=0
+  while IFS= read -r ib; do
+    [ -n "$ib" ] || continue
+    id="$(jq -r '.id' <<<"$ib")"
+    cid="$(jq -r --arg email "$email" '.settings|fromjson?|.clients[]?|select(.email==$email)|.id // .password // empty' <<<"$ib" | head -n1)"
+    [ -n "$cid" ] || continue
+    if api_del_client "$id" "$email" "$cid"; then deleted=$((deleted+1))
+    else failed=$((failed+1)); warn "Не удалось удалить '$email' из инбаунда #$id"; fi
+  done < <(jq -c '.[]' <<<"$INBOUNDS")
+  [ "$deleted" -gt 0 ] && sub_regen_quiet || true
+  [ "$failed" -eq 0 ] || { err "Удалено записей: $deleted; ошибок: $failed — проверьте пользователя повторно"; return 1; }
+  ok "Пользователь '$email' удалён из всех протоколов ($deleted)"
 }
 
 human_bytes() { # $1 байты -> читаемый вид (IEC; ЕДИНСТВЕННАЯ версия — не переопределять)
@@ -4573,6 +4575,13 @@ hide_existing_panel() {
   return 0
 }
 
+panel_sub_uri_fix() { # исправляет нативный URL только при расхождении; без лишнего restart
+  local want current
+  want="https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}"
+  current="$(panel_settings_get | jq -r '.obj.subURI // empty' 2>/dev/null)" || return 1
+  [ "$current" = "$want" ] || ensure_panel_sub_settings
+}
+
 #=========================== v4.1: API-РАСШИРЕНИЯ =============================
 # v7.2.5: ${COOKIE_JAR:-} — вызов без предварительного kit_login больше не
 # роняет set -u («COOKIE_JAR: unbound variable», живой баг v7.2.4 в [4/7]).
@@ -4709,8 +4718,9 @@ xray_restart() {
 }
 
 api_add_inbound() { # $1 полный JSON инбаунда
-  local resp
-  resp="$(api_post add "$1")" || return 1
+  local ib resp
+  ib="$(api_normalize_tgid <<<"$1")" || { err "add inbound: tgId должен быть целым числом или отсутствовать"; return 1; }
+  resp="$(api_post add "$ib")" || return 1
   if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
     # v7.4.1: api_err_msg — пустой .msg/пустое тело больше не печатаются молчком
     err "add inbound: $(api_err_msg "$resp" | head -c 300)"
@@ -5042,15 +5052,12 @@ reality_create_inbound() {
   local priv pub
   read -r priv pub <<<"$(api_get_new_x25519)"
   [ -n "$priv" ] && [ -n "$pub" ] || { err "Не удалось получить ключи x25519"; return 1; }
-  local uuid subid email sid
-  uuid="$(new_uuid)"; subid="$(rand_str 16)"; email="reality-$(rand_hex 2)"; sid="$(rand_hex 4)"
+  local sid
+  sid="$(rand_hex 4)"
 
   local settings stream ib so
   so='{}'; sockopt_enabled && so="$(sockopt_obj)"   # v7.4.3: TFO+TCP_NODELAY (xkit sockopt off — отключить)
-  settings="$(jq -nc --arg id "$uuid" --arg email "$email" --arg sub "$subid" '
-    {clients:[{id:$id, flow:"xtls-rprx-vision", email:$email, limitIp:0, totalGB:0,
-               expiryTime:0, enable:true, tgId:"", subId:$sub, reset:0}],
-     decryption:"none", fallbacks:[]}')"
+  settings='{"clients":[],"decryption":"none","fallbacks":[]}' 
   stream="$(jq -nc --arg dest "$dest" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" --argjson so "$so" '
     {network:"tcp", security:"reality",
      realitySettings:{show:false, xver:0, dest:$dest, serverNames:[$sni],
@@ -5071,7 +5078,7 @@ reality_create_inbound() {
   if [ "$so" != "{}" ]; then sockopt_tfo_sysctl_apply || true; fi   # v7.4.3: серверный бит TFO
 
   # id созданного + externalProxy (чтобы панель показывала ДОМЕН:порт)
-  local newlist ibid fresh cl link
+  local newlist ibid fresh
   newlist="$(api_list)" || true
   ibid="$(jq -r --arg t "inbound-${p}" '[.[]|select(.tag==$t)][0].id // empty' <<<"$newlist")"
   if [ -n "$ibid" ]; then
@@ -5095,14 +5102,11 @@ reality_create_inbound() {
     ufw allow "${p}/tcp" >/dev/null 2>&1 && ok "UFW: открыт ${p}/tcp"
   fi
 
-  cl="$(jq -c '.settings|fromjson?|.clients[0]' <<<"${fresh:-$ib}")"
   echo ""
   ok "Reality inbound создан: порт ${p}, dest ${dest}, SNI ${sni}"
   [ -n "$ibid" ] && ok "Внешний адрес в панели: ${XKIT_HOST}:${p}"
-  link="$(link_for_client "${fresh:-$ib}" "$cl")"
-  [ -n "$link" ] && { echo ""; ok "Ссылка клиента:"; printf '  %s\n' "$link"; }
   sub_regen_quiet || true
-  ok "Подписка: https://${XKIT_HOST}$(sub_path)${subid}"
+  ok "Автоматических пользователей нет — добавьте своего через «Пользователи»"
   return 0
 }
 
@@ -9463,7 +9467,7 @@ proto_panel_hysteria_ib() { # $1 порт, $2 auth, $3 clientJSON -> полны�
        hysteriaSettings:{version:2,masquerade:{type:"string",content:$page,statusCode:200,headers:$h}}}')"
   fi
   local settings
-  settings="$(jq -nc --arg a "$auth" --argjson c "$cl" '{version:2, clients:[$c + {auth:$a}]}')"
+  settings="$(jq -nc --arg a "$auth" --argjson c "$cl" '{version:2, clients:(if $c == {} then [] else [$c + {auth:$a}] end)}')"
   jq -nc --argjson port "$port" --arg remark "hysteria2-${port}" --arg s "$settings" --arg st "$stream" '
     {up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,listen:"",
      port:$port,protocol:"hysteria",settings:$s,streamSettings:$st,
@@ -9502,7 +9506,7 @@ proto_panel_awg_ib() { # $1 порт, $2 clientJSON, $3 профиль: 31|class
               rekeyAfterTime:$rkat, rekeyTimeout:$rt, rejectAfterTime:$rjt,
               keepaliveTimeout:$kat, maxHandshakeAttempts:$mha,
               randomTrailers:false, disableCookies:false},
-      clients:[$c]}')"
+      clients:(if $c == {} then [] else [$c] end)}')"
   else
     local jc jmin jmax s1 s2 h1 h2 h3 h4
     jc=$((RANDOM % 4 + 3)); jmin=$((RANDOM % 50 + 40)); jmax=$((jmin + RANDOM % 200 + 50))
@@ -9522,7 +9526,7 @@ proto_panel_awg_ib() { # $1 порт, $2 clientJSON, $3 профиль: 31|class
               jc:$jc, jmin:$jmin, jmax:$jmax, s1:$s1, s2:$s2, s3:0, s4:0,
               h1:($h1|tostring), h2:($h2|tostring), h3:($h3|tostring), h4:($h4|tostring),
               randomTrailers:false, disableCookies:false},
-      clients:[$c]}')"
+      clients:(if $c == {} then [] else [$c] end)}')"
   fi
   jq -nc --argjson port "$port" --arg remark "amneziawg-${port}" --arg s "$settings" '
     {up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,listen:"",
@@ -9711,7 +9715,7 @@ proto_panel_install() { # $1 режим: all (по умолчанию) | awg | h
     is_port "$hp" && proto_udp_free "$hp" || { err "Порт $hp занят/некорректен"; return 1; }
     local auth cl ib
     auth="$(rand_str 24)"
-    cl="$(jq -nc --arg email "hy2-xkit" '{email:$email, limitIp:0, totalGB:0, expiryTime:0, enable:true, tgId:"", subId:"", comment:"", reset:0}')"
+    cl='{}' 
     ib="$(proto_panel_hysteria_ib "$hp" "$auth" "$cl")" || return 1
     api_add_inbound "$ib" || return 1
     xkit_fw_add hysteria2 "$hp" udp || { _proto_panel_rollback_created "$hp" ""; err 'Firewall Hysteria 2 не настроен — inbound откачен'; return 1; }
@@ -9726,9 +9730,7 @@ proto_panel_install() { # $1 режим: all (по умолчанию) | awg | h
     local wpriv wpub cl2 ib2
     read -r wpriv wpub <<<"$(xray_wg_pair)"
     [ -n "$wpriv" ] && [ -n "$wpub" ] || { _proto_panel_rollback_created "$hp" ""; return 1; }
-    cl2="$(jq -nc --arg pk "$wpriv" --arg pub "$wpub" --arg email "awg-xkit" '
-      {email:$email, limitIp:0, totalGB:0, expiryTime:0, enable:true, tgId:"", subId:"", comment:"", reset:0,
-       privateKey:$pk, publicKey:$pub, allowedIPs:["10.8.1.2/32"]}')"
+    cl2='{}' 
     ib2="$(proto_panel_awg_ib "$ap" "$cl2" "$awg_profile")" || { _proto_panel_rollback_created "$hp" ""; return 1; }
     api_add_inbound "$ib2" || { _proto_panel_rollback_created "$hp" ""; return 1; }
     # (v7.2.7) контрольная сверка: панель СОХРАНИЛА параметры 3.1 — старая
