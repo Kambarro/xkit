@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.3 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.4 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.3"
+XKIT_VERSION="7.5.4"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -2859,7 +2859,7 @@ sub_show() {
   local sp; sp="$(sub_path)"
   echo ""
   log "URL подписок (вставить в клиент: v2rayNG / Streisand / Hiddify / v2rayN):"
-  awk -F'\t' '{print $1"\t"$2"\t"$3}' "$idx" | sort -u | while IFS=$'\t' read -r subid email tag; do
+  awk -F'\t' '!seen[$1 FS $2]++ {print $1"\t"$2"\t"$3}' "$idx" | while IFS=$'\t' read -r subid email tag; do
     printf '  %-18s %-18s https://%s%s%s\n' "${subid:0:18}" "${email}" "$XKIT_HOST" "$sp" "$subid"
     printf '  %-18s %-18s https://%s%s%s.yaml  (Clash/Mihomo)\n' "" "" "$XKIT_HOST" "$sp" "$subid"
     printf '  %-18s %-18s https://%s%s%s.json  (sing-box)\n' "" "" "$XKIT_HOST" "$sp" "$subid"
@@ -3058,17 +3058,21 @@ client_add_all() {
   read -r -p "Срок жизни, дней (0 = бессрочно) [0]: " days; days="${days:-0}"
 
   local subid expiry=0 gb=0
-  subid="$(rand_str 16)"
+  subid="$(jq -r --arg email "$email" '[.[].settings|fromjson?|.clients[]?|select(.email==$email)|.subId // empty][0] // empty' <<<"$INBOUNDS")"
+  [ -n "$subid" ] || subid="$(rand_str 16)"
   [ "$days" -gt 0 ] 2>/dev/null && expiry=$(( $(date +%s) * 1000 + days * 86400000 ))
   [ "$total" -gt 0 ] 2>/dev/null && gb=$(( total * 1073741824 ))
 
-  local added=0 failed=0 ib id settings cj link
+  local added=0 existing=0 failed=0 ib id settings cj link
   echo ""
   while IFS= read -r ib; do
     [ -z "$ib" ] && continue
     [ "$(jq -r '.enable // true' <<<"$ib")" = "true" ] || continue
     id="$(jq -r '.id' <<<"$ib")"
     local proto; proto="$(jq -r '.protocol' <<<"$ib")"
+    if jq -e --arg email "$email" '.settings|fromjson?|.clients[]?|select(.email==$email)' <<<"$ib" >/dev/null 2>&1; then
+      existing=$((existing+1)); ok "#$id (${proto}): уже добавлен — сохраняю существующую запись"; continue
+    fi
     # PAYLOAD/EXTRA_* через глобалы: вызов в $(...) — субшелл, EXTRA_* терялись бы
     if ! client_payload_for "$ib" "$email" "$subid" "$gb" "$expiry"; then
       warn "#$id (${proto}): протокол не поддержан — пропущен"; failed=$((failed+1)); continue
@@ -3089,10 +3093,10 @@ client_add_all() {
   done < <(jq -c '.[]' <<<"$INBOUNDS")
 
   echo ""
-  if [ "$failed" -gt 0 ]; then warn "Итог: добавлен в ${added} инбаунд(ов), пропущено/ошибок: ${failed}"
-  else ok "Итог: добавлен во все ${added} инбаунд(ов)"; fi
-  [ "$added" -gt 0 ] || { err "Ни один инбаунд не принял пользователя"; return 1; }
-  sub_regen_quiet || true
+  if [ "$failed" -gt 0 ]; then warn "Итог: добавлен в ${added}, уже был в ${existing}, ошибок: ${failed}"
+  else ok "Итог: добавлен в ${added}, уже был в ${existing}; единая подписка сохранена"; fi
+  [ "$added" -gt 0 ] || [ "$existing" -gt 0 ] || { err "Ни один инбаунд не принял пользователя"; return 1; }
+  [ "$added" -eq 0 ] || sub_regen_quiet || true
   local sp; sp="$(sub_path)"
   echo ""
   ok "ЕДИНАЯ подписка пользователя (${email}):"
