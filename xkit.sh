@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.1 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.3 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.1"
+XKIT_VERSION="7.5.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5537,12 +5537,13 @@ strategy = sys.argv[4] if sys.argv[4] in ("roundRobin", "random", "leastPing", "
 
 outb = tpl.get("outbounds") or []
 outb = [o for o in outb if not str(o.get("tag", "")).startswith("node-")]
+generated = []
 for n in nodes:
     t = n.get("tunnel") or {}
     tag = n.get("outbound_tag") or ("node-" + n.get("name", ""))
     proto = t.get("proto", "vless")
     if proto == "hysteria2":
-        outb.append({
+        generated.append({
             "tag": tag, "protocol": "hysteria",
             "settings": {"version": 2, "servers": [{"address": n.get("host"),
                 "port": int(t.get("port", 443)), "auth": t.get("auth", "")}]},
@@ -5554,7 +5555,7 @@ for n in nodes:
     elif proto == "external" and isinstance(t.get("outbound"), dict):
         # Host-level AWG и другие внешние каналы: только явно сохранённый и
         # проверенный outbound, без выдумывания неподдерживаемого Xray AWG outbound.
-        ob = dict(t["outbound"]); ob["tag"] = tag; outb.append(ob)
+        ob = dict(t["outbound"]); ob["tag"] = tag; generated.append(ob)
     else:
         net = t.get("net", "tcp")
         stream = {"network": net, "security": "reality",
@@ -5563,14 +5564,14 @@ for n in nodes:
                                       "shortId": t.get("sid", ""), "spiderX": ""}}
         if net in ("xhttp", "splithttp"):
             stream["xhttpSettings"] = {"path": t.get("path", "/"), "mode": "auto"}
-        outb.append({
+        generated.append({
             "tag": tag, "protocol": "vless",
             "settings": {"vnext": [{"address": n.get("host"), "port": int(t.get("port", 443)),
                                     "users": [{"id": t.get("uuid"), "encryption": "none",
                                                "flow": t.get("flow", "") if net != "tcp" else t.get("flow", "xtls-rprx-vision"),
                                                "level": 0}]}]},
             "streamSettings": stream, "mux": {"enabled": False, "concurrency": -1}})
-tpl["outbounds"] = outb
+tpl["outbounds"] = generated + outb
 
 r = tpl.setdefault("routing", {})
 rules = r.get("rules") or []
@@ -9326,14 +9327,10 @@ proto_udp_free() { # $1 порт -> 0 = свободен
 # Создаём минимальный инбаунд на 127.0.0.1:случайный-UDP, ждём слушателя,
 # удаляем. Только реальный запуск ядра — источник истины, не версия.
 proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить file-masquerade
-  local proto="$1" port resp ib listening camo_mode="${2:-}"
+  local proto="$1" port resp ib listening camo_mode="${2:-}" probe="xkit-probe-$(rand_hex 4)"
   if [ -z "${PANEL_PORT:-}" ]; then
     warn "проба '$proto': порт панели не определён (PANEL_PORT пуст) — проба невозможна"; return 1
   fi
-  # Никогда не удаляем чужой/старый inbound с таким же tag.
-  jq -e '[.[]|select(.tag=="xkit-probe")]|length==0' <<<"$(api_list 2>/dev/null)" >/dev/null 2>&1 || {
-    warn "Найден существующий inbound xkit-probe — проба отменена"; return 1;
-  }
   port="$(rand_free_port 23000 59000)" || { warn "проба '$proto': нет свободного TCP-порта для пробы"; return 1; }
   proto_udp_free "$port" || { warn "проба '$proto': UDP ${port} занят — проба отменена"; return 1; }
   local settings stream
@@ -9354,9 +9351,9 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
       # peer to serve — skips the sidecar entirely»). Проба с clients:[]
       # никогда не поднимала UDP-слушатель — вердикт «ядро НЕ умеет» был
       # ложным при живой поддержке AWG (живой лог 7.4.2).
-      settings="$(jq -nc --arg pk "$priv" --arg pub "$pub" \
+      settings="$(jq -nc --arg probe "$probe" --arg pk "$priv" --arg pub "$pub" \
         '{server:{privateKey:$pk,publicKey:$pub,subnetIp:"10.8.9.0",subnetCidr:24,primaryDns:"1.1.1.1",secondaryDns:"8.8.8.8"},
-          clients:[{email:"xkit-probe",enable:true,publicKey:$pub,allowedIPs:["10.8.9.2/32"]}]}')"
+          clients:[{email:$probe,enable:true,publicKey:$pub,allowedIPs:["10.8.9.2/32"]}]}')"
       stream='{}' ;;
     amneziawg31) # v7.4.2: ПОЛНОЕ ИМЯ ПРОТОКОЛА — «amneziawg» (набор 3.1 отличается
       # только ПОЛЯМИ настроек, отдельного протокола amneziawg31 в 3x-ui нет:
@@ -9366,7 +9363,7 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
       local priv pub
       read -r priv pub <<<"$(xray_wg_pair)" || return 1
       awg31_gen_params
-      settings="$(jq -nc --arg pk "$priv" --arg pub "$pub" \
+      settings="$(jq -nc --arg probe "$probe" --arg pk "$priv" --arg pub "$pub" \
         --argjson jc "$AWG31_JC" --argjson jmin "$AWG31_JMIN" --argjson jmax "$AWG31_JMAX" \
         --argjson s1 "$AWG31_S1" --argjson s2 "$AWG31_S2" --argjson s3 "$AWG31_S3" --argjson s4 "$AWG31_S4" \
         --arg h1 "$AWG31_H1" --arg h2 "$AWG31_H2" --arg h3 "$AWG31_H3" --arg h4 "$AWG31_H4" \
@@ -9380,7 +9377,7 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
           rekeyAfterTime:$rkat,rekeyTimeout:$rt,rejectAfterTime:$rjt,
           keepaliveTimeout:$kat,maxHandshakeAttempts:$mha,
           randomTrailers:false,disableCookies:false},
-          clients:[{email:"xkit-probe",enable:true,publicKey:$pub,allowedIPs:["10.8.9.2/32"]}]}')"
+          clients:[{email:$probe,enable:true,publicKey:$pub,allowedIPs:["10.8.9.2/32"]}]}')"
       stream='{}' ;;
     *) return 1 ;;
   esac
@@ -9388,10 +9385,10 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
   # суффикс «31» — только наш внутренний маркер профиля настроек
   local pname="$proto"
   case "$proto" in amneziawg31) pname="amneziawg" ;; esac
-  ib="$(jq -nc --argjson port "$port" --arg s "$settings" --arg st "$stream" '
-    {up:0,down:0,total:0,remark:"xkit-probe",enable:true,expiryTime:0,listen:"127.0.0.1",
+  ib="$(jq -nc --arg probe "$probe" --argjson port "$port" --arg s "$settings" --arg st "$stream" '
+    {up:0,down:0,total:0,remark:$probe,enable:true,expiryTime:0,listen:"127.0.0.1",
      port:$port,protocol:"'"$pname"'",settings:$s,streamSettings:$st,
-     sniffing:"{\"enabled\":false}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:"xkit-probe"}')"
+     sniffing:"{\"enabled\":false}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:$probe}')"
   # v7.4.1: отказ ПРИМЕНЕНИЯ пробы (пустой/не-JSON ответ = 401 bearer / 403 CSRF)
   # ≠ «ядро не умеет протокол». api_post уже повторил запрос с восстановленной
   # аутентификацией; если всё равно не JSON — честно говорим, что вердикт о
@@ -9429,9 +9426,9 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
   return 0
 }
 
-_proto_probe_cleanup() { # удалить пробный инбаунд (по tag xkit-probe), молча
+_proto_probe_cleanup() { # удалить только текущую пробу, молча
   local pid
-  pid="$(jq -r --arg t xkit-probe '[.[]|select(.tag==$t)][0].id // empty' <<<"$(api_list 2>/dev/null)" 2>/dev/null)"
+  pid="$(jq -r --arg t "${probe:-xkit-probe}" '[.[]|select(.tag==$t)][0].id // empty' <<<"$(api_list 2>/dev/null)" 2>/dev/null)"
   [ -n "$pid" ] && api_del_inbound "$pid" >/dev/null 2>&1 || true
   return 0
 }
@@ -10631,12 +10628,13 @@ PY
 
 subscription_nginx_headers() { # $1 subId, $2 metadata file; только числовые values
   local sub="$1" meta="$2" up down total expire value
+  local sub_path; sub_path="$(sub_path)"
   [[ "$sub" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
   up="$(jq -r '.up//0|tonumber? // 0|floor' "$meta" 2>/dev/null)"; down="$(jq -r '.down//0|tonumber? // 0|floor' "$meta" 2>/dev/null)"
   total="$(jq -r '.total//0|tonumber? // 0|floor' "$meta" 2>/dev/null)"; expire="$(jq -r '.expire//0|tonumber? // 0|floor' "$meta" 2>/dev/null)"
   value="upload=${up:-0}; download=${down:-0}; total=${total:-0}; expire=${expire:-0}"
   cat <<EOF
-    location = ${XKIT_SUB_PATH}${sub} {
+    location = ${sub_path}${sub} {
         alias ${SUBS_DIR}/${sub};
         default_type text/plain;
         add_header subscription-userinfo "${value}" always;
