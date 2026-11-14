@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.10 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.11 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.10"
+XKIT_VERSION="7.5.11"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -11814,12 +11814,11 @@ printf '%s' '$payload' | base64 -d | tar -xzf - -C "\$d"
 install -m 644 "\$d/$lineage/fullchain.pem" /etc/x-ui/panel-cert.pem
 install -m 600 "\$d/$lineage/privkey.pem" /etc/x-ui/panel-key.pem
 rm -rf "\$d"
-if command -v sqlite3 >/dev/null 2>&1; then
-  for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
-    key="\${kv%%|*}"; val="\${kv#*|}"
-    sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null || true
-  done
-fi
+command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установлен — сертификат панели не применён'; exit 1; }
+for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
+  key="\${kv%%|*}"; val="\${kv#*|}"
+  sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+done
 systemctl restart x-ui
 EOF
   return 0
@@ -11847,12 +11846,11 @@ printf '%s' '$b64k' | base64 -d > "\$d/privkey.pem"
 install -m 644 "\$d/fullchain.pem" /etc/x-ui/panel-cert.pem
 install -m 600 "\$d/privkey.pem" /etc/x-ui/panel-key.pem
 rm -rf "\$d"
-if command -v sqlite3 >/dev/null 2>&1; then
-  for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
-    key="\${kv%%|*}"; val="\${kv#*|}"
-    sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null || true
-  done
-fi
+command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установлен — сертификат панели не применён'; exit 1; }
+for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
+  key="\${kv%%|*}"; val="\${kv#*|}"
+  sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+done
 systemctl restart x-ui
 echo OK-OWN-CERT
 EOF
@@ -11879,9 +11877,10 @@ case "\$MODE" in
     chmod 600 "\$K"; chmod 644 "\$C"
     ;;
   ip|domain)
-    # порт 80 нужен для http-01/standalone и будущего renew
+    # Camo уже занимает :80 — освобождаем его на время standalone-выпуска.
+    systemctl stop nginx >/dev/null 2>&1 || true
     if ss -ltn 2>/dev/null | grep -q ':80 '; then
-      echo 'ERR: порт 80 на ноде занят — standalone-выпуск невозможен'; exit 1
+      echo 'ERR: порт 80 на ноде занят не nginx — standalone-выпуск невозможен'; exit 1
     fi
     if ! command -v certbot >/dev/null 2>&1 || ! certbot --version 2>/dev/null | grep -qE '(3\.[9-9]|[4-9]|[1-9][0-9])'; then
       echo '[INFO] Ставлю certbot (venv) на ноду...'
@@ -11891,7 +11890,6 @@ case "\$MODE" in
       /opt/certbot-venv/bin/pip install -q certbot >/dev/null 2>&1
       ln -sf /opt/certbot-venv/bin/certbot /usr/local/bin/certbot
     fi
-    systemctl stop nginx >/dev/null 2>&1 || true
     if [ "\$MODE" = "ip" ]; then
       certbot certonly --standalone --ip-address "\$NAME" --preferred-profile shortlived \
         --register-unsafely-without-email --non-interactive --agree-tos || { systemctl start nginx >/dev/null 2>&1 || true; exit 1; }
@@ -11913,12 +11911,12 @@ case "\$MODE" in
     systemctl enable --now xkit-node-certbot.timer >/dev/null 2>&1 || true
     ;;
 esac
-if command -v sqlite3 >/dev/null 2>&1 && [ -s "\$C" ] && [ -s "\$K" ]; then
-  for kv in "webCertFile|\$C" "webCertKey|\$K"; do
-    key="\${kv%%|*}"; val="\${kv#*|}"
-    sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null || true
-  done
-fi
+command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установлен — сертификат панели не применён'; exit 1; }
+[ -s "\$C" ] && [ -s "\$K" ] || { echo 'ERR: файлы сертификата панели пусты'; exit 1; }
+for kv in "webCertFile|\$C" "webCertKey|\$K"; do
+  key="\${kv%%|*}"; val="\${kv#*|}"
+  sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+done
 systemctl restart x-ui
 echo OK-CERT-\$MODE
 EOF
@@ -12075,10 +12073,11 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
   esac
   node_cert_reg_set "$nname" --argjson c "$(jq -nc --arg m "$mode" --arg d "$certdomain" --arg l "$lineage" --arg r "$renew" \
       '{mode:$m, domain:$d, lineage:$l, renew:$r}')" \
-      'map(if .name==$n then .panel.cert=$c else . end)' \
-    || warn "Не записал .panel.cert в реестр"
+      'map(if .name==$n then .panel.cert=$c | .panel.tls=true else . end)' \
+    || { err "Не записал HTTPS и сертификат панели в реестр"; return 1; }
   log "Перепин сертификата панели ноды..."
   node_repin "$nname" || warn "Перепин не прошёл — выполните: xkit nodes repin $nname"
+  [ -z "$(jq -r '.panel_node_id // empty' <<<"$rec")" ] || node_panel_sync "$nname" || warn "Схему в «Узлах» 3X-UI обновите: xkit nodes panel-sync $nname"
   ok "Готово: панель ноды $nname на сертификате '$mode' (${certdomain:-CN=$nname})"
 }
 
