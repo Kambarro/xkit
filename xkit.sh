@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.13 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.14 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.13"
+XKIT_VERSION="7.5.14"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -12078,11 +12078,10 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
   done
   [ -n "$tls_probe" ] || { err "Панель $nname не прошла TLS-handshake после перезапуска — реестр оставлен на прежней схеме"; return 1; }
   node_cert_reg_set "$nname" --argjson c "$(jq -nc --arg m "$mode" --arg d "$certdomain" --arg l "$lineage" --arg r "$renew" \
-      '{mode:$m, domain:$d, lineage:$l, renew:$r}')" \
-      'map(if .name==$n then .panel.cert=$c | .panel.tls=true else . end)' \
-    || { err "Не записал HTTPS и сертификат панели в реестр"; return 1; }
-  log "Перепин сертификата панели ноды..."
-  node_repin "$nname" || warn "Перепин не прошёл — выполните: xkit nodes repin $nname"
+      '{mode:$m, domain:$d, lineage:$l, renew:$r}')" --arg p "$tls_probe" \
+      'map(if .name==$n then .panel.cert=$c | .panel.tls=true | .panel.pincert=$p else . end)' \
+    || { err "Не записал HTTPS, сертификат и pin панели в реестр"; return 1; }
+  ok "Пин сертификата панели обновлён после проверенного TLS-handshake"
   [ -z "$(jq -r '.panel_node_id // empty' <<<"$rec")" ] || node_panel_sync "$nname" || warn "Схему в «Узлах» 3X-UI обновите: xkit nodes panel-sync $nname"
   ok "Готово: панель ноды $nname на сертификате '$mode' (${certdomain:-CN=$nname})"
 }
