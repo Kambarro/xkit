@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.14 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.15 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.14"
+XKIT_VERSION="7.5.15"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5803,7 +5803,7 @@ EOS
 # всегда выключен явно: selected + пустой список; outbound XKIT не трогаем.
 node_panel_sync() { # $1 имя ноды
   load_xkit_env || die "Сначала установка (пункт 1)"
-  local n="${1:-}" rec tok scheme pin id path body resp
+  local n="${1:-}" rec tok scheme pin id path body resp certfp
   [ -n "$n" ] || { err "xkit nodes panel-sync <имя|all>"; return 1; }
   if [ "$n" = all ]; then
     local nn rc=0
@@ -5818,6 +5818,12 @@ node_panel_sync() { # $1 имя ноды
   pin="$(jq -r '.panel.pincert // empty' <<<"$rec")"
   if [ "$scheme" = "https" ] && [ -z "$pin" ]; then
     err "${n}: для HTTPS нужен certificate pin (xkit nodes repin ${n})"; return 1
+  fi
+  if [ "$scheme" = "https" ]; then
+    certfp="$(echo | timeout 8 openssl s_client -connect "$(jq -r '.host' <<<"$rec"):$(jq -r '.panel.port' <<<"$rec")" -servername "$(jq -r '.host' <<<"$rec")" 2>/dev/null \
+      | openssl x509 -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"
+    [[ "$certfp" =~ ^[0-9a-f]{64}$ ]] || { err "${n}: не удалось получить SHA-256 leaf-сертификата для карточки ноды"; return 1; }
+    pin="$certfp"
   fi
   kit_session || { err "Нет сессии мастер-панели"; return 1; }
   id="$(jq -r '.panel_node_id // empty' <<<"$rec")"
