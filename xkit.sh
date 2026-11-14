@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.9 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.10 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.9"
+XKIT_VERSION="7.5.10"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5479,6 +5479,42 @@ nodes_load() {
   fi
 }
 
+nodes_access_export_all() {
+  local dir="${XKIT_NODE_ACCESS_DIR:-/root}" rec name tmp expected='' rc=0 old base
+  [ -e "$XKIT_NODES" ] || return 0
+  jq -e 'type=="array"' "$XKIT_NODES" >/dev/null 2>&1 || { err "Реестр нод повреждён — txt-файлы оставлены без изменений"; return 1; }
+  mkdir -p "$dir" && chmod 700 "$dir" || return 1
+  while IFS= read -r rec; do
+    [ -n "$rec" ] || continue
+    name="$(jq -r '.name // empty' <<<"$rec")"
+    [[ "$name" =~ ^[a-zA-Z0-9_-]{1,20}$ ]] || { err "Небезопасное имя ноды в реестре — txt не создан"; rc=1; continue; }
+    expected+="${name}"$'\n'
+    tmp="$(mktemp "${dir}/.xkit-node-${name}.XXXXXX")" || { rc=1; continue; }
+    if ! jq -r '
+      "Нода: \(.name)\nАдрес: \(.host)\nSSH: \(.ssh_user // "root")@\(.host):\(.ssh_port // 22)\nSSH-аутентификация: \(.auth // "key")\nSSH-ключ на мастере: \(.key_path // "-")",
+      "Панель: \(if .panel.tls == true then "https" else "http" end)://\(.host):\(.panel.port)\(.panel.base // "/")",
+      "Логин панели: \(.panel.user // "-")",
+      "Пароль панели: \(.panel.pass // "-")",
+      "API-токен панели: \(.panel.token // "-")",
+      "Туннель: \(.tunnel.proto // "vless")/\(.tunnel.net // "tcp"), порт \(.tunnel.port // "-")",
+      "SNI: \(.tunnel.sni // "-")",
+      "UUID: \(.tunnel.uuid // "-")",
+      "Reality public key: \(.tunnel.pbk // "-")",
+      "Reality short ID: \(.tunnel.sid // "-")",
+      "Hysteria2 auth: \(.tunnel.auth // "-")",
+      "TLS pin: \(.tunnel.tls_pin // "-")"
+    ' <<<"$rec" > "$tmp"; then rm -f "$tmp"; rc=1; continue; fi
+    chmod 600 "$tmp" && mv -f "$tmp" "${dir}/xkit-node-${name}.txt" || { rm -f "$tmp"; rc=1; }
+  done < <(jq -c '.[]' "$XKIT_NODES")
+  for old in "$dir"/xkit-node-*.txt; do
+    [ -e "$old" ] || continue
+    base="$(basename "$old")"; base="${base#xkit-node-}"; base="${base%.txt}"
+    grep -Fxq -- "$base" <<<"$expected" || rm -f "$old" || rc=1
+  done
+  [ "$rc" -eq 0 ] || return "$rc"
+  ok "Реквизиты нод обновлены в ${dir}/xkit-node-ИМЯ.txt (0600)"
+}
+
 nodes_ensure_pool() {
   if [ -n "${XKIT_POOL_INBOUND:-}" ]; then
     if jq -e --argjson id "${XKIT_POOL_INBOUND:-0}" 'any(.[]; .id==$id)' <<<"$INBOUNDS" >/dev/null 2>&1; then
@@ -8764,6 +8800,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes readdress <имя> <новый-IP> [--dry-run] — смена IP без переустановки
   xkit nodes profile list|survey|switch|benchmark <имя> [профиль] — канал мастер→нода
   xkit nodes tune <имя> show|safe|balanced — откатываемая сетевая настройка
+  xkit nodes credentials — обновить /root/xkit-node-ИМЯ.txt (0600)
   xkit telegram-proxy ... — только MTProto FakeTLS и Telegram Web Proxy
   xkit reality scan-csv [tsv] [csv] — TLS/ALPN/issuer отчёт
   xkit extfix           — externalProxy + подписки панели (корректные ссылки в UI)
@@ -8871,8 +8908,12 @@ xkit_main_impl() {
                profile) shift
                       case "${1:-list}" in list) node_profile_list "${2:-all}" ;; survey) node_profile_survey "${2:-}" ;; switch) node_profile_switch "${2:-}" "${3:-}" ;; benchmark) node_profile_benchmark "${2:-}" ;; *) err "nodes profile list|survey <имя>|switch <имя> <профиль>|benchmark <имя>"; exit 1 ;; esac ;;
                tune) shift; node_tune "$@" ;;
+               credentials) nodes_access_export_all; return $? ;;
                *) nodes_menu ;;
-             esac ;;
+             esac
+             local nodes_rc=$?
+             nodes_access_export_all || warn "Не удалось обновить txt-реквизиты нод"
+             return "$nodes_rc" ;;
     extfix)  require_root; external_proxy_fix ;;
     health)  shift
              if [ "${1:-}" = "deep" ]; then require_root; health_deep; else health_check; fi ;;

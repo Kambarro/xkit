@@ -4,7 +4,7 @@
 
 **TUI и мастер-меню для nginx + 3X-UI: VPN-панель, подписки, REALITY, ноды, балансировка и мониторинг — в одном инструменте.**
 
-![Version](https://img.shields.io/badge/version-7.5.9-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-7.5.10-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -363,6 +363,7 @@ sudo xkit protocols panel install   # панельный режим: AWG+Hy2 к�
 - API-токен панели ноды (3X-UI v3.11+): авто-сбор из install-result.env по SSH при добавлении, Bearer вместо логина+CSRF (не зависит от пароля и 2FA); обновление — `xkit nodes relogin`;
 - стратегии `roundRobin`, `random`, `leastPing` и `leastLoad`; по умолчанию `leastLoad` выбирает одну стабильную ноду по burst-замерам за окно около 5 минут (20 выборок, `interval: 15s`);
 - health-check туннеля и панели, `repair`, `repin` и удаление ноды;
+- реквизиты каждой ноды в `/root/xkit-node-ИМЯ.txt` (0600): SSH, панель и туннель; обновление после команд `xkit nodes ...` или вручную через `xkit nodes credentials`. Приватный SSH-ключ не копируется, повреждённый реестр не удаляет прежние TXT;
 - автоматическая регистрация в родном разделе **«Узлы» 3X-UI v3.11+**: доступность, версии панели/Xray и штатные метрики. Всегда передаются `inboundSyncMode:"selected"`, `inboundTags:[]` и пустой `outboundTag`: инбаунды не импортируются, туннели и балансировка XKIT не меняются. Повтор — `xkit nodes panel-sync ИМЯ|all`; ошибка панели не откатывает ноду.
 
 </details>
@@ -433,6 +434,7 @@ xkit reality                      # мастер REALITY
 xkit sockopt on|off|status        # TCP Fast Open + TCP_NODELAY (7.4.3)
 xkit nodes [repair|repin]         # обслуживание нод
 xkit nodes metrics                # обновить трафик, ping и CPU/RAM нод
+xkit nodes credentials            # обновить /root/xkit-node-ИМЯ.txt (0600)
 xkit nodes plan [--json]          # read-only drift/preflight план
 xkit nodes apply --canary ИМЯ     # TCP+SSH+API canary перед apply
 xkit nodes apply --remaining      # остальные ноды, только после canary
