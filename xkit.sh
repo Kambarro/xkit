@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.12 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.13 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.12"
+XKIT_VERSION="7.5.13"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6055,7 +6055,7 @@ if [ ! -s "$C" ] || [ ! -s "$K" ]; then
   chmod 600 "$K" 2>/dev/null; chmod 644 "$C" 2>/dev/null
 fi
 if [ -s "$C" ] && [ -s "$K" ] && command -v sqlite3 >/dev/null 2>&1; then
-  for kv in "webCertFile|$C" "webCertKey|$K"; do
+  for kv in "webCertFile|$C" "webKeyFile|$K"; do
     key="${kv%%|*}"; val="${kv#*|}"
     sqlite3 /etc/x-ui/x-ui.db \
       "UPDATE settings SET value='$val' WHERE key='$key'; INSERT INTO settings(key,value) SELECT '$key','$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='$key');"
@@ -11814,7 +11814,7 @@ install -m 644 "\$d/$lineage/fullchain.pem" /etc/x-ui/panel-cert.pem
 install -m 600 "\$d/$lineage/privkey.pem" /etc/x-ui/panel-key.pem
 rm -rf "\$d"
 command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установлен — сертификат панели не применён'; exit 1; }
-for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
+for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webKeyFile|/etc/x-ui/panel-key.pem"; do
   key="\${kv%%|*}"; val="\${kv#*|}"
   sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
@@ -11826,7 +11826,7 @@ EOF
 # (7.4.0, режим own): доставка СВОЕГО сертификата (купленного/выпущенного
 # вне xkit) с мастера на ноду: base64 каждого файла через stdin node_ssh
 # (V-03) + sha256-сверка с обеих сторон до применения; продолжение пути
-# node_cert_push_to_node — sqlite webCertFile/webCertKey + restart x-ui.
+# node_cert_push_to_node — sqlite webCertFile/webKeyFile + restart x-ui.
 node_cert_push_files() { # $1 rec, $2 fullchain.pem, $3 privkey.pem -> 0/1
   local rec="$1" cf="$2" kf="$3" b64c b64k h_chain h_key
   [ -s "$cf" ] && [ -s "$kf" ] || { err "Нет файлов: $cf / $kf"; return 1; }
@@ -11846,7 +11846,7 @@ install -m 644 "\$d/fullchain.pem" /etc/x-ui/panel-cert.pem
 install -m 600 "\$d/privkey.pem" /etc/x-ui/panel-key.pem
 rm -rf "\$d"
 command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установлен — сертификат панели не применён'; exit 1; }
-for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
+for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webKeyFile|/etc/x-ui/panel-key.pem"; do
   key="\${kv%%|*}"; val="\${kv#*|}"
   sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
@@ -11912,7 +11912,7 @@ case "\$MODE" in
 esac
 command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установлен — сертификат панели не применён'; exit 1; }
 [ -s "\$C" ] && [ -s "\$K" ] || { echo 'ERR: файлы сертификата панели пусты'; exit 1; }
-for kv in "webCertFile|\$C" "webCertKey|\$K"; do
+for kv in "webCertFile|\$C" "webKeyFile|\$K"; do
   key="\${kv%%|*}"; val="\${kv#*|}"
   sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
@@ -12070,6 +12070,13 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       ;;
     *) err "Режим '$mode' не знаю (self|ip|domain|wildcard|own)"; return 1 ;;
   esac
+  local tls_probe='' tls_try
+  for tls_try in 1 2 3 4 5; do
+    tls_probe="$(cert_pin "$nhost" "$(jq -r '.panel.port' <<<"$rec")")"
+    [ -n "$tls_probe" ] && break
+    sleep 2
+  done
+  [ -n "$tls_probe" ] || { err "Панель $nname не прошла TLS-handshake после перезапуска — реестр оставлен на прежней схеме"; return 1; }
   node_cert_reg_set "$nname" --argjson c "$(jq -nc --arg m "$mode" --arg d "$certdomain" --arg l "$lineage" --arg r "$renew" \
       '{mode:$m, domain:$d, lineage:$l, renew:$r}')" \
       'map(if .name==$n then .panel.cert=$c | .panel.tls=true else . end)' \
