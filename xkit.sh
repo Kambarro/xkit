@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.11 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.12 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.11"
+XKIT_VERSION="7.5.12"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6058,8 +6058,7 @@ if [ -s "$C" ] && [ -s "$K" ] && command -v sqlite3 >/dev/null 2>&1; then
   for kv in "webCertFile|$C" "webCertKey|$K"; do
     key="${kv%%|*}"; val="${kv#*|}"
     sqlite3 /etc/x-ui/x-ui.db \
-      "INSERT INTO settings (key,value) VALUES('$key','$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;" 2>/dev/null \
-      || sqlite3 /etc/x-ui/x-ui.db "INSERT OR REPLACE INTO settings (key,value) VALUES('$key','$val');" 2>/dev/null || true
+      "UPDATE settings SET value='$val' WHERE key='$key'; INSERT INTO settings(key,value) SELECT '$key','$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='$key');"
   done
   systemctl restart x-ui
 else
@@ -11817,7 +11816,7 @@ rm -rf "\$d"
 command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установлен — сертификат панели не применён'; exit 1; }
 for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
   key="\${kv%%|*}"; val="\${kv#*|}"
-  sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+  sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
 systemctl restart x-ui
 EOF
@@ -11849,7 +11848,7 @@ rm -rf "\$d"
 command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установлен — сертификат панели не применён'; exit 1; }
 for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webCertKey|/etc/x-ui/panel-key.pem"; do
   key="\${kv%%|*}"; val="\${kv#*|}"
-  sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+  sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
 systemctl restart x-ui
 echo OK-OWN-CERT
@@ -11915,7 +11914,7 @@ command -v sqlite3 >/dev/null 2>&1 || { echo 'ERR: sqlite3 не установл
 [ -s "\$C" ] && [ -s "\$K" ] || { echo 'ERR: файлы сертификата панели пусты'; exit 1; }
 for kv in "webCertFile|\$C" "webCertKey|\$K"; do
   key="\${kv%%|*}"; val="\${kv#*|}"
-  sqlite3 /etc/x-ui/x-ui.db "INSERT INTO settings (key,value) VALUES('\$key','\$val') ON CONFLICT(key) DO UPDATE SET value=excluded.value;"
+  sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
 systemctl restart x-ui
 echo OK-CERT-\$MODE
@@ -12026,7 +12025,7 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       is_domain "$d" || { err "'$d' не похож на домен"; return 1; }
       local aip; aip="$(node_cert_a_record "$d")"
       [ -n "$aip" ] || { err "A-запись $d не нашлась — выпуск отменён (пропишите и повторите)"; return 1; }
-      [ "$aip" = "$nhost" ] || warn "A-запись $d -> $aip, а нода $nhost — продолжаю, но LE будет биться в $aip"
+      [ "$aip" = "$nhost" ] || [ "$d" = "$nhost" ] || warn "A-запись $d -> $aip, а нода $nhost — продолжаю, но LE будет биться в $aip"
       certdomain="$d"
       node_cert_apply_remote "$rec" domain "$d" || return 1
       lineage="$d"
