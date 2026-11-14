@@ -4,7 +4,7 @@
 
 **TUI и мастер-меню для nginx + 3X-UI: VPN-панель, подписки, REALITY, ноды, балансировка и мониторинг — в одном инструменте.**
 
-![Version](https://img.shields.io/badge/version-7.5.5-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-7.5.9-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -180,12 +180,14 @@ TUI написан на Go с Bubble Tea/Lipgloss и не дублирует л�
 
 | Клавиша | Действие |
 |---|---|
-| `↑` / `↓`, `j` / `k` | Перемещение по элементам |
+| `↑` / `↓`, `j` / `k` (`о` / `л`) | Перемещение по элементам |
 | `Enter` | Открыть раздел или запустить действие |
-| `Esc` / `q` | Назад; на главном экране — выход |
-| `/` | Поиск пользователей |
-| `r` | Обновить состояние |
+| `Esc` / `←` / `q` (`й`) | Назад; на главном экране — выход |
+| `/` (`.` в русской раскладке) | Поиск в текущем разделе |
+| `r` (`к`) | Обновить состояние |
 | `?` | Справка |
+
+В разделе «Пользователи и подписки» пункт «Выбрать пользователя» открывает визуальный список. После `Enter` доступны подключения и QR, сброс трафика и удаление. Удаление стоит последним среди операций и требует отдельного подтверждения с именем; по умолчанию выбрана отмена.
 
 На главном экране доступны состояние nginx, 3X-UI и Xray, количество клиентов и нод, срок сертификата и возраст последнего бэкапа. Состояние периодически обновляется через санитизированный snapshot без ключей, UUID, паролей и токенов.
 
@@ -424,6 +426,9 @@ xkit snapshot                     # JSON состояния для TUI
 xkit route [--yes]                # автопроброс инбаундов
 xkit sub [-q]                     # перегенерация подписок
 xkit client add|del|list|reset    # пользователи
+xkit client show EMAIL            # ссылки и локальный QR выбранного пользователя
+xkit client del EMAIL --yes       # удалить из всех протоколов без выбора номером
+xkit client reset EMAIL --yes     # сбросить трафик во всех протоколах
 xkit reality                      # мастер REALITY
 xkit sockopt on|off|status        # TCP Fast Open + TCP_NODELAY (7.4.3)
 xkit nodes [repair|repin]         # обслуживание нод
@@ -459,6 +464,9 @@ xkit restart defer|apply|status   # безопасный отложенный re
 xkit maintenance install|run      # logrotate и systemd maintenance timer
 xkit geodata update TAG SHA1 SHA2 # pinned geodata с двумя SHA-256
 xkit sub qr SUBID [svg|png]       # локальный QR подписки
+xkit sub qr SUBID awg             # animated HTML QR + текстовый конфиг AmneziaWG
+# Клиентская страница с QR и конфигом также создаётся автоматически:
+# https://HOST/SUB_PATH/SUBID/amnezia
 xkit reality scan-csv [TSV CSV]   # CSV с issuer/TLS/cipher/ALPN
 xkit telegram bot once|run|on|off # read-only Telegram bot
 

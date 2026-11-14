@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.5 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.5.9 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.5"
+XKIT_VERSION="7.5.9"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -2798,6 +2798,15 @@ sub_regen_impl() {
         # v6.0.0: аккумулятор для Clash-YAML (id инбаунда + запись клиента)
         printf '%s\t%s\n' "$id" "$cl" >> "${SUBS_DIR}/.clash.${subid}"
         printf '%s\t%s\t%s\t%s\t%s\n' "$subid" "$email" "${tag:0:20}" "$proto" "$port" >> "$idx"
+        if [ "$proto" = amneziawg ]; then
+          if amnezia_qr_html "$link" "${SUBS_DIR}/${subid}.amnezia.html" >/dev/null; then
+            chgrp www-data "${SUBS_DIR}/${subid}.amnezia.html" 2>/dev/null || true
+            chmod 640 "${SUBS_DIR}/${subid}.amnezia.html"
+          else
+            rm -f "${SUBS_DIR}/${subid}.amnezia.html"
+            warn "Amnezia-страница ${subid} не создана: нужен qrencode или python3-qrcode"
+          fi
+        fi
       fi
     done
   done < <(jq -c '.[]' <<<"$INBOUNDS")
@@ -2854,15 +2863,19 @@ sub_regen_impl() {
 # показать URL подписок (по одному на subId)
 sub_show() {
   load_xkit_env || die "Сначала установка (пункт 1)"
-  local idx="${XKIT_DIR}/subs.index"
+  local only="${1:-}" idx="${XKIT_DIR}/subs.index"
   [ -s "$idx" ] || { warn "Подписок ещё нет — создайте пользователей (пункты 4-6) и выполните пункт 2"; return 0; }
   local sp; sp="$(sub_path)"
   echo ""
   log "URL подписок (вставить в клиент: v2rayNG / Streisand / Hiddify / v2rayN):"
   awk -F'\t' '!seen[$1 FS $2]++ {print $1"\t"$2"\t"$3}' "$idx" | while IFS=$'\t' read -r subid email tag; do
+    [ -n "$only" ] && [ "$email" != "$only" ] && continue
     printf '  %-18s %-18s https://%s%s%s\n' "${subid:0:18}" "${email}" "$XKIT_HOST" "$sp" "$subid"
     printf '  %-18s %-18s https://%s%s%s.yaml  (Clash/Mihomo)\n' "" "" "$XKIT_HOST" "$sp" "$subid"
     printf '  %-18s %-18s https://%s%s%s.json  (sing-box)\n' "" "" "$XKIT_HOST" "$sp" "$subid"
+    if awk -F'\t' -v s="$subid" -v e="$email" '$1==s && $2==e && $4=="amneziawg" {found=1} END {exit !found}' "$idx"; then
+      printf '  %-18s %-18s https://%s%s%s/amnezia  (AmneziaVPN: QR + конфиг)\n' "" "" "$XKIT_HOST" "$sp" "$subid"
+    fi
   done
   echo ""
   log "Форматы: base64 — v2ray-приложения (v2rayNG/Streisand/Hiddify/v2rayN);"
@@ -2955,6 +2968,17 @@ client_add() {
   return 0
 }
 
+client_show() {
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  kit_session || return 1
+  local email="${1:-}" subid
+  [ -n "$email" ] || { err "xkit client show <email>"; return 1; }
+  subid="$(jq -r --arg email "$email" '[.[].settings|fromjson?|.clients[]?|select(.email==$email)|.subId // empty][0] // empty' <<<"$INBOUNDS")"
+  [ -n "$subid" ] || { err "Пользователь '$email' не найден"; return 1; }
+  sub_show "$email"
+  sub_qr "$subid" svg
+}
+
 client_del() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   kit_session || return 1
@@ -2963,15 +2987,21 @@ client_del() {
   local -a users=()
   mapfile -t users < <(jq -r '[.[].settings|fromjson?|.clients[]?|.email // empty]|unique[]' <<<"$INBOUNDS")
   [ "${#users[@]}" -gt 0 ] || { warn "Пользователей нет"; return 0; }
-  printf '%-3s %s
-' "#" "ПОЛЬЗОВАТЕЛЬ"
-  local i=0 email
-  for email in "${users[@]}"; do i=$((i+1)); printf '%-3s %s
-' "$i" "$email"; done
-  read -r -p "Номер пользователя для удаления [1-$i] (Enter — отмена): " n
-  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { warn "Отменено"; return 0; }
-  email="${users[$((n-1))]}"
-  confirm "Удалить '$email' из всех протоколов? [y/N] " n || { warn "Отменено"; return 0; }
+  local requested="${1:-}" assume_yes="${2:-}" i=0 email n
+  [ -z "$assume_yes" ] || [ "$assume_yes" = "--yes" ] || { err "xkit client del [email] [--yes]"; return 1; }
+  if [ -n "$requested" ]; then
+    printf '%s\n' "${users[@]}" | grep -Fxq -- "$requested" || { err "Пользователь '$requested' не найден"; return 1; }
+    email="$requested"
+  else
+    printf '%-3s %s\n' "#" "ПОЛЬЗОВАТЕЛЬ"
+    for email in "${users[@]}"; do i=$((i+1)); printf '%-3s %s\n' "$i" "$email"; done
+    read -r -p "Номер пользователя для удаления [1-$i] (Enter — отмена): " n
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { warn "Отменено"; return 0; }
+    email="${users[$((n-1))]}"
+  fi
+  if [ "$assume_yes" != "--yes" ]; then
+    confirm "Удалить '$email' из всех протоколов? [y/N] " n || { warn "Отменено"; return 0; }
+  fi
 
   local ib id cid deleted=0 failed=0
   while IFS= read -r ib; do
@@ -5547,14 +5577,17 @@ for n in nodes:
     tag = n.get("outbound_tag") or ("node-" + n.get("name", ""))
     proto = t.get("proto", "vless")
     if proto == "hysteria2":
+        if t.get("insecure", False) and not t.get("tls_pin"):
+            raise ValueError("Hysteria2: самоподписанный сертификат без tls_pin; повторите profile switch")
+        tls = {"serverName": t.get("sni") or n.get("host"), "alpn": ["h3"]}
+        if t.get("tls_pin"):
+            tls.update({"pinnedPeerCertSha256": t["tls_pin"],
+                        "verifyPeerCertByName": t.get("sni") or n.get("host")})
         generated.append({
             "tag": tag, "protocol": "hysteria",
             "settings": {"version": 2, "servers": [{"address": n.get("host"),
                 "port": int(t.get("port", 443)), "auth": t.get("auth", "")}]},
-            "streamSettings": {"network": "hysteria", "security": "tls",
-                "tlsSettings": dict({"serverName": t.get("sni") or n.get("host"),
-                                "allowInsecure": bool(t.get("insecure", False)), "alpn": ["h3"]},
-                                **({"pinnedPeerCertChainSha256": [t["tls_pin"]]} if t.get("tls_pin") else {}))},
+            "streamSettings": {"network": "hysteria", "security": "tls", "tlsSettings": tls},
             "mux": {"enabled": False, "concurrency": -1}})
     elif proto == "external" and isinstance(t.get("outbound"), dict):
         # Host-level AWG и другие внешние каналы: только явно сохранённый и
@@ -6737,38 +6770,43 @@ client_reset() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   kit_session || return 1
   routes_load
-  list_inbounds_menu || return 1
-  local ib="$PICK_IB" id
-  id="$(jq -r '.id' <<<"$ib")"
-  local -a cls=()
-  mapfile -t cls < <(jq -c '.settings|fromjson?|.clients[]?' <<<"$ib")
-  [ "${#cls[@]}" -gt 0 ] || { warn "В инбаунде нет клиентов"; return 0; }
-  echo ""
-  local i=0 cl
-  for cl in "${cls[@]}"; do
-    i=$((i+1))
-    printf '%-3s %s\n' "$i" "$(jq -r '.email // "-"' <<<"$cl" | cut -c1-40)"
-  done
-  read -r -p "Номер пользователя [1-$i] (Enter — отмена): " n
-  [[ "$n" =~ ^[0-9]+$ ]] || { warn "Отменено"; return 0; }
-  [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { warn "Отменено"; return 0; }
-  cl="${cls[$((n-1))]}"
-  local email
-  email="$(jq -r '.email // empty' <<<"$cl" | tr -dc 'A-Za-z0-9._@-')"
-  [ -n "$email" ] || { err "У клиента нет email"; return 1; }
-  confirm "Сбросить трафик '$email'? [y/N] " n || return 0
-  local resp
+  local requested="${1:-}" assume_yes="${2:-}" email n
+  [ -z "$assume_yes" ] || [ "$assume_yes" = "--yes" ] || { err "xkit client reset [email] [--yes]"; return 1; }
+  if [ -n "$requested" ]; then
+    jq -e --arg email "$requested" '[.[].settings|fromjson?|.clients[]?|.email] | index($email) != null' <<<"$INBOUNDS" >/dev/null \
+      || { err "Пользователь '$requested' не найден"; return 1; }
+    email="$requested"
+  else
+    list_inbounds_menu || return 1
+    local ib="$PICK_IB"
+    local -a cls=()
+    mapfile -t cls < <(jq -c '.settings|fromjson?|.clients[]?' <<<"$ib")
+    [ "${#cls[@]}" -gt 0 ] || { warn "В инбаунде нет клиентов"; return 0; }
+    echo ""
+    local i=0 cl
+    for cl in "${cls[@]}"; do
+      i=$((i+1)); printf '%-3s %s\n' "$i" "$(jq -r '.email // "-"' <<<"$cl" | cut -c1-40)"
+    done
+    read -r -p "Номер пользователя [1-$i] (Enter — отмена): " n
+    [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { warn "Отменено"; return 0; }
+    cl="${cls[$((n-1))]}"
+    email="$(jq -r '.email // empty' <<<"$cl" | tr -dc 'A-Za-z0-9._@-')"
+    [ -n "$email" ] || { err "У клиента нет email"; return 1; }
+  fi
+  if [ "$assume_yes" != "--yes" ]; then confirm "Сбросить трафик '$email'? [y/N] " n || return 0; fi
+  local resp id reset=0 failed=0
   if [ "$API_V3" = "1" ]; then
     resp="$(api_post_raw "panel/api/clients/resetTraffic/${email}")"
+    jq -e '.success == true' <<<"$resp" >/dev/null 2>&1 && reset=1 || failed=1
   else
-    resp="$(api_post_raw "panel/api/inbounds/${id}/resetClientTraffic/${email}")"
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      resp="$(api_post_raw "panel/api/inbounds/${id}/resetClientTraffic/${email}")"
+      if jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then reset=$((reset+1)); else failed=$((failed+1)); fi
+    done < <(jq -r --arg email "$email" '.[]|select(.settings|fromjson?|.clients[]?|.email==$email)|.id' <<<"$INBOUNDS")
   fi
-  if jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
-    ok "Трафик '$email' сброшен"
-  else
-    err "Не удалось сбросить: $(api_err_msg "$resp" 2>/dev/null | head -c 200)"
-  fi
-  return 0
+  [ "$failed" -eq 0 ] || { err "Сброшено: $reset; ошибок: $failed — $(api_err_msg "$resp" 2>/dev/null | head -c 200)"; return 1; }
+  ok "Трафик '$email' сброшен во всех протоколах ($reset)"
 }
 
 #=========================== v4.1: SSH-ВХОД ===================================
@@ -8598,7 +8636,7 @@ xkit_tui_run() {
 xkit_snapshot() { # только агрегаты; без UUID, privateKey, паролей и токенов
   load_xkit_env >/dev/null 2>&1 || true
   local host="${XKIT_HOST:-}" mode=solo nodes=0 nodes_ok=0 clients=0 cert_days=-1 backup_hours=-1
-  local nginx=false xui=false xray=false protocols='[]' inbounds='' nodes_metrics='[]' metrics_generated=0
+  local nginx=false xui=false xray=false protocols='[]' inbounds='' nodes_metrics='[]' metrics_generated=0 client_names='[]'
   systemctl is-active --quiet nginx 2>/dev/null && nginx=true
   systemctl is-active --quiet x-ui 2>/dev/null && xui=true
   pgrep -x xray >/dev/null 2>&1 && xray=true
@@ -8627,7 +8665,8 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
   if [ -n "$latest" ]; then backup_hours=$(( ($(date +%s)-$(stat -c %Y "$latest" 2>/dev/null || date +%s))/3600 )); fi
   if kit_session >/dev/null 2>&1; then
     inbounds="$(api_list 2>/dev/null || true)"
-    clients="$(jq '[.[]?|(.settings|fromjson?|.clients[]?)|.email]|unique|length' <<<"$inbounds" 2>/dev/null || echo 0)"
+    client_names="$(jq -c '[.[]?|(.settings|fromjson?|.clients[]?)|.email // empty]|unique' <<<"$inbounds" 2>/dev/null || echo '[]')"
+    clients="$(jq 'length' <<<"$client_names" 2>/dev/null || echo 0)"
   fi
   [[ "$clients" =~ ^[0-9]+$ ]] || clients=0
   if xkit_protocols_load >/dev/null 2>&1; then
@@ -8648,8 +8687,8 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
     --argjson nodes "$nodes" --argjson nodes_ok "$nodes_ok" --argjson clients "$clients" \
     --argjson nginx "$nginx" --argjson xui "$xui" --argjson xray "$xray" \
     --argjson cert_days "$cert_days" --argjson backup_hours "$backup_hours" --argjson protocols "$protocols" \
-    --argjson nodes_metrics "$nodes_metrics" --argjson metrics_generated "$metrics_generated" \
-    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,nodes_metrics:$nodes_metrics,metrics_generated:$metrics_generated,generated:$generated}'
+    --argjson nodes_metrics "$nodes_metrics" --argjson metrics_generated "$metrics_generated" --argjson client_names "$client_names" \
+    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,client_names:$client_names,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,nodes_metrics:$nodes_metrics,metrics_generated:$metrics_generated,generated:$generated}'
 }
 
 #=========================== ФАЙЛ ОТВЕТОВ (v7.2.0) ============================
@@ -8694,8 +8733,10 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
                          пакеты nginx/certbot если чужих сайтов нет; бэкап не создаётся)
   xkit route [--yes]   — автопроброс всех инбаундов за nginx (без вопросов: --yes)
   xkit sub [-q]        — base64 + Clash + sing-box подписки и metadata
-  xkit sub qr <subId> [svg|png] — локальный QR без внешнего API
+  xkit sub qr <subId> [svg|png|awg] — QR подписки или animated QR для AmneziaVPN
   xkit client add|del|list|reset — управление пользователями
+  xkit client show <email> — ссылки и локальный QR конкретного пользователя
+  xkit client del|reset <email> [--yes] — действие без выбора по номеру
   xkit client all      — пользователь во ВСЕ протоколы сразу (одна подписка)
   xkit reality          — Reality: создать inbound (wizard)
   xkit sockopt [on|off|status] — TCP Fast Open + TCP_NODELAY на TCP-инбаундах
@@ -8796,9 +8837,10 @@ xkit_main_impl() {
              else [ "${1:-}" = "-q" ] && export SUB_QUIET=1; require_root; sub_regen; fi ;;
     client)  shift; require_root
              case "${1:-list}" in
-               add) client_add_all ;; del) client_del ;; list) client_list ;; reset) client_reset ;;
+               add) client_add_all ;; del) shift; client_del "$@" ;; list) client_list ;;
+               reset) shift; client_reset "$@" ;; show) shift; client_show "$@" ;;
                all) client_add_all ;;
-               *) err "xkit client add|all|del|list|reset"; exit 1 ;;
+               *) err "xkit client add|all|del|list|reset|show"; exit 1 ;;
              esac ;;
     reality) shift; require_root; load_xkit_env || true
              if [ "${1:-}" = scan-csv ]; then reality_scan_csv "${2:-${XKIT_DIR}/reality-scan.tsv}" "${3:-${XKIT_DIR}/reality-scan.csv}"; else reality_wizard; fi ;;
@@ -10649,6 +10691,14 @@ subscription_nginx_headers() { # $1 subId, $2 metadata file; только чис
         add_header X-Robots-Tag "noindex, nofollow" always;
         access_log off;
     }
+    location = ${sub_path}${sub}/amnezia {
+        alias ${SUBS_DIR}/${sub}.amnezia.html;
+        default_type text/html;
+        add_header Referrer-Policy "no-referrer" always;
+        add_header Cache-Control "no-store" always;
+        add_header X-Robots-Tag "noindex, nofollow" always;
+        access_log off;
+    }
 EOF
 }
 
@@ -10664,10 +10714,85 @@ subscription_metadata_update() { # subId + inbounds; aggregate stats/quota/expir
      expire:([$cl[]|.expiryTime//0|select(.>0)|./1000|floor]|min//0)}'
 }
 
-sub_qr() { # локальный SVG/PNG; никакого внешнего QR API
+amnezia_qr_html() { # $1 vpn:// с plain-base64 .conf, $2 HTML с родными QR-фрагментами Amnezia
+  AWG_QR_LINK="$1" AWG_QR_OUT="$2" python3 - <<'PY'
+import base64,configparser,html as html_escape,io,json,os,shutil,struct,subprocess,zlib
+from pathlib import Path
+
+link=os.environ['AWG_QR_LINK']; out=Path(os.environ['AWG_QR_OUT'])
+if not link.startswith('vpn://'): raise SystemExit('Нужна vpn:// ссылка AmneziaWG')
+try: conf=base64.b64decode(link[6:],validate=True).decode()
+except Exception as e: raise SystemExit(f'Некорректный AWG vpn://: {e}')
+p=configparser.ConfigParser(interpolation=None); p.optionxform=str; p.read_string(conf)
+if not p.has_section('Interface') or not p.has_section('Peer'): raise SystemExit('AWG конфиг без Interface/Peer')
+i=p['Interface']; peer=p['Peer']; endpoint=peer.get('Endpoint','')
+try: host,port=endpoint.rsplit(':',1); port=int(port)
+except ValueError: raise SystemExit('AWG Endpoint должен быть host:port')
+if not host or not 1<=port<=65535: raise SystemExit('Некорректный AWG Endpoint')
+host=host.strip('[]'); dns=[x.strip() for x in i.get('DNS','').split(',') if x.strip()]
+fields={
+ 'Jc':'junkPacketCount','Jmin':'junkPacketMinSize','Jmax':'junkPacketMaxSize',
+ 'S1':'initPacketJunkSize','S2':'responsePacketJunkSize','S3':'cookieReplyPacketJunkSize',
+ 'S4':'transportPacketJunkSize','H1':'initPacketMagicHeader','H2':'responsePacketMagicHeader',
+ 'H3':'underloadPacketMagicHeader','H4':'transportPacketMagicHeader',
+ 'I1':'specialJunk1','I2':'specialJunk2','I3':'specialJunk3','I4':'specialJunk4','I5':'specialJunk5',
+ 'HeaderProtectionKey':'headerProtectionKey','ContentPaddingAddition':'contentPaddingAddition',
+ 'RekeyAfterTime':'rekeyAfterTime','RekeyTimeout':'rekeyTimeout','RejectAfterTime':'rejectAfterTime',
+ 'KeepaliveTimeout':'keepaliveTimeout','MaxHandshakeAttempts':'maxHandshakeAttempts',
+ 'RandomTrailers':'randomTrailers','DisableCookies':'disableCookies'}
+extra={dst:i[src] for src,dst in fields.items() if i.get(src,'')!=''}
+last={'config':conf,'hostName':host,'port':port,'client_ip':i.get('Address',''),
+ 'client_priv_key':i.get('PrivateKey',''),'client_pub_key':'0',
+ 'server_pub_key':peer.get('PublicKey',''),'psk_key':peer.get('PresharedKey',''),
+ 'allowedIps':[x.strip() for x in peer.get('AllowedIPs','').split(',') if x.strip()],
+ 'persistentKeepAlive':i.get('PersistentKeepalive',peer.get('PersistentKeepalive','')),
+ 'mtu':i.get('MTU',''),**extra}
+server={'isThirdPartyConfig':True,'transport_proto':'udp','port':str(port),
+ 'last_config':json.dumps(last,ensure_ascii=False,separators=(',',':')),**extra}
+data={'containers':[{'container':'amnezia-awg','awg':server}],
+ 'defaultContainer':'amnezia-awg','description':'XKIT AmneziaWG','hostName':host,
+ 'dns1':dns[0] if dns else '','dns2':dns[1] if len(dns)>1 else ''}
+plain=json.dumps(data,ensure_ascii=False,separators=(',',':')).encode()
+packed=struct.pack('>I',len(plain))+zlib.compress(plain,8)  # Qt qCompress
+chunks=[packed[n:n+850] for n in range(0,len(packed),850)]
+payloads=[base64.urlsafe_b64encode(struct.pack('>hBBI',1984,len(chunks),n,len(c))+c).rstrip(b'=').decode()
+          for n,c in enumerate(chunks)]
+def svg(payload):
+ if shutil.which('qrencode'):
+  return subprocess.run(['qrencode','-t','SVG','-l','L','-o','-',payload],check=True,capture_output=True).stdout
+ import qrcode,qrcode.image.svg
+ im=qrcode.make(payload,error_correction=qrcode.constants.ERROR_CORRECT_L,
+                image_factory=qrcode.image.svg.SvgPathImage)
+ buf=io.BytesIO(); im.save(buf); return buf.getvalue()
+try: frames=['data:image/svg+xml;base64,'+base64.b64encode(svg(x)).decode() for x in payloads]
+except ImportError: raise SystemExit('Для QR установите qrencode или python3-qrcode')
+html='''<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>XKIT — AmneziaWG</title><style>body{margin:0;background:#111;color:#eee;font:16px sans-serif;text-align:center}img{width:min(92vw,720px);image-rendering:pixelated;background:white}p{margin:16px}pre{margin:20px auto;padding:16px;max-width:900px;overflow:auto;text-align:left;background:#222;white-space:pre-wrap;overflow-wrap:anywhere}button{padding:12px 20px;font-size:16px;cursor:pointer}</style>
+<h2>AmneziaWG</h2><img id="qr" alt="QR для AmneziaVPN"><p id="status"></p><p>Сканируйте через AmneziaVPN до завершения импорта.</p>
+<h2>Или скопируйте конфиг</h2><button id="copy">Скопировать конфиг</button><span id="copied"></span><pre id="config">CONFIG</pre>
+<script>const f=FRAMES;let n=0;const img=document.getElementById('qr');function show(){img.src=f[n];document.getElementById('status').textContent=`Фрагмент ${n+1} из ${f.length}`;n=(n+1)%f.length}show();setInterval(show,700);document.getElementById('copy').onclick=async()=>{await navigator.clipboard.writeText(document.getElementById('config').textContent);document.getElementById('copied').textContent=' Скопировано'};</script></html>'''.replace('FRAMES',json.dumps(frames,separators=(',',':'))).replace('CONFIG',html_escape.escape(conf))
+tmp=out.with_suffix(out.suffix+'.tmp'); tmp.write_text(html,encoding='utf-8'); os.chmod(tmp,0o600); os.replace(tmp,out)
+print(f'Amnezia QR: {len(frames)} фрагмент(а)')
+PY
+}
+
+sub_qr() { # локальный SVG/PNG или родной animated HTML для AmneziaVPN
   local sub="${1:-}" fmt="${2:-svg}" url out
-  [[ "$sub" =~ ^[A-Za-z0-9_-]+$ ]] || { err "xkit sub qr <subId> [svg|png]"; return 1; }
+  [[ "$sub" =~ ^[A-Za-z0-9_-]+$ ]] || { err "xkit sub qr <subId> [svg|png|awg]"; return 1; }
   load_xkit_env >/dev/null 2>&1 || return 1
+  if [ "$fmt" = awg ]; then
+    kit_session || return 1
+    local pair ib cl link
+    pair="$(api_list | jq -c --arg sub "$sub" '[.[] as $ib | select($ib.protocol=="amneziawg") | ($ib.settings|if type=="string" then fromjson else . end|.clients//[])[] | select(.subId==$sub) | {ib:$ib,cl:.}][0] // empty')"
+    [ -n "$pair" ] || { err "Пользователь с subId ${sub} не найден"; return 1; }
+    ib="$(jq -c '.ib' <<<"$pair")"; cl="$(jq -c '.cl' <<<"$pair")"
+    [ "$(jq -r '.protocol' <<<"$ib")" = amneziawg ] || { err "У пользователя нет AmneziaWG"; return 1; }
+    link="$(link_for_client "$ib" "$cl")"; [ -n "$link" ] || { err "Не удалось собрать AWG конфиг"; return 1; }
+    out="${XKIT_DIR}/qr-${sub}-amnezia.html"
+    amnezia_qr_html "$link" "$out" || return 1
+    ok "QR AmneziaVPN сохранён локально: $out (откройте в браузере)"
+    return 0
+  fi
   url="https://${XKIT_HOST}$(sub_path)${sub}"
   out="${XKIT_DIR}/qr-${sub}.${fmt}"
   if command -v qrencode >/dev/null 2>&1; then
