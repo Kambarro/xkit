@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.7.1"
+XKIT_VERSION="7.7.2"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5355,8 +5355,10 @@ node_ssh() { # $1 rec-json, остальные — команда на ноде
   local -a a=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$kh" -o ConnectTimeout=10 -p "$port")
   # v7.6.1: ssh без -n вычитывает stdin вызывающего до EOF — node_add при пайпе/
   # не-интерактиве терял ответы read («Что делать?» получал EOF). Команды без
-  # heredoc stdin ноды не нужен → -n; bash -s читает скрипт из stdin (heredoc).
-  case " $* " in *" bash -s "*) ;; *) a+=(-n) ;; esac
+  # heredoc stdin ноды не нужен → -n; bash -s и python3 - читают скрипт из stdin.
+  # v7.7.2: добавлен python3 - (node_profile survey/switch падали «Не удалось
+  # выделить candidate port» — heredoc уходил в /dev/null, порт приходил пустой)
+  case " $* " in *" bash -s "*|*" python3 - "*) ;; *) a+=(-n) ;; esac
   if [ "$auth" = "password" ]; then
     node_ensure_sshpass || return 1   # v7.2.9: автоустановка вместо голой ошибки
     SSHPASS="$NODE_SSH_PASS" sshpass -e ssh "${a[@]}" "${user}@${host}" "$@"
@@ -6850,6 +6852,7 @@ nodes_menu() {
     echo "15) Получить новый ключ доступа и обновить список в 3X-UI"
     echo "16) Добавить/обновить сервер в «Узлах» 3X-UI (без импорта)"
     echo "17) Спрятать панель сервера за nginx 443 (loopback + секретный путь)"
+    echo "18) Версии 3X-UI/Xray на серверах и обновление"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -6871,6 +6874,11 @@ nodes_menu() {
       15) local _rl; read -r -p "Нода: " _rl; node_relogin "$_rl"; pause_enter ;;
       16) local _ps; read -r -p "Нода (Enter — все): " _ps; node_panel_sync "${_ps:-all}"; pause_enter ;;
       17) local _hd; read -r -p "Нода (Enter — все): " _hd; node_hide_one "${_hd:-all}"; pause_enter ;;
+      18) nodes_versions all
+          local _un
+          read -r -p "Обновить ноду (Enter — отмена, all — все): " _un || _un=""
+          [ -z "$_un" ] || nodes_upgrade "$_un" ""
+          pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac
@@ -8608,6 +8616,29 @@ xkit_summary_save() { # тихо: только файл (вызывается п
 }
 
 #=========================== ОБНОВЛЕНИЕ =======================================
+# v7.7.2: raw.githubusercontent.com кэширует ответы (max-age=300): после пуша
+# xkit.sh мог отдаваться СТАРЫМ, а пломба xkit.sh.sha256 — уже новой, и SHA не
+# сходился ("файл битый или изменён", хотя репо цел). Пинним HEAD-коммит через
+# API и качаем по commit-SHA — этот URL неизменяем и не кэшируется вразнобой.
+# Не-GitHub-источники и недоступный API — фолбэк на исходный base (как раньше).
+xkit_update_base() { # $1 base -> stdout: base с пином коммита (или исходный)
+  local base="$1" owner repo branch sha
+  case "$base" in
+    https://raw.githubusercontent.com/*/*/*)
+      owner="${base#https://raw.githubusercontent.com/}"; owner="${owner%%/*}"
+      repo="${base#https://raw.githubusercontent.com/$owner/}"; repo="${repo%%/*}"
+      branch="${base#https://raw.githubusercontent.com/$owner/$repo/}"; branch="${branch%%/*}"
+      [[ "$owner" =~ ^[A-Za-z0-9_.-]+$ && "$repo" =~ ^[A-Za-z0-9_.-]+$ && "$branch" =~ ^[A-Za-z0-9_./-]+$ ]] || { printf '%s' "$base"; return 0; }
+      sha="$(curl -fsSL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/$owner/$repo/commits/$branch" 2>/dev/null | jq -r '.sha // empty' 2>/dev/null)"
+      if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+        printf 'https://raw.githubusercontent.com/%s/%s/%s' "$owner" "$repo" "$sha"
+      else
+        printf '%s' "$base"
+      fi ;;
+    *) printf '%s' "$base" ;;
+  esac
+}
+
 # Фоновая проверка для TUI: только версия из удалённого ядра, никакой установки.
 xkit_update_check() { # [--force] [--quiet]
   require_root
@@ -8628,6 +8659,7 @@ xkit_update_check() { # [--force] [--quiet]
   fi
   if [ -z "$latest" ]; then
     tmp="$(mktemp /tmp/.xkit-version.XXXXXX)" || return 1
+    base="$(xkit_update_base "$base")"   # v7.7.2: пин коммита против кэша raw
     curl -fsSL --connect-timeout 4 --max-time 10 "${base}/xkit.sh" -o "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
     nv="$(grep -m1 '^XKIT_VERSION=' "$tmp" | cut -d'"' -f2)"; rm -f "$tmp"
     [[ "$nv" =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1
@@ -8660,6 +8692,11 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
     return 1
   fi
   case "$base" in */xkit.sh) base="${base%/*}" ;; esac
+  # v7.7.2: пин HEAD-коммита — кэш raw мог отдать компонент и пломбу из РАЗНЫХ
+  # коммитов (SHA не сходился, старый TUI молча оставался). По commit-SHA пара
+  # неизменяема; недоступный API — фолбэк на исходный base (локальные зеркала
+  # тестов — http://127.0.0.1 — пинниться не должны)
+  case "$base" in https://raw.githubusercontent.com/*) base="$(xkit_update_base "$base")" ;; esac
   # K-02: http:// наружу запрещён (локальные зеркала для тестов — можно)
   case "$base" in
     http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;;
@@ -8875,6 +8912,9 @@ xkit_component_fetch() { # $1 имя в репо, $2 конечный файл; 
   local base="${XKIT_REPO_URL:-}" name="$1" dst="$2" tmp sumf want got
   [ -n "$base" ] || return 1
   case "$base" in */xkit.sh) base="${base%/*}" ;; esac
+  # v7.7.2: пин HEAD-коммита (кэш raw отдавал TUI и пломбу из разных коммитов —
+  # SHA не сходился, старый TUI молча оставался). Локальные зеркала не пинним.
+  case "$base" in https://raw.githubusercontent.com/*) base="$(xkit_update_base "$base")" ;; esac
   case "$base" in http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;; http://*) return 1 ;; esac
   tmp="$(mktemp /tmp/.xkit-component.XXXXXX)" || return 1
   sumf="$(mktemp /tmp/.xkit-component-sum.XXXXXX)" || { rm -f "$tmp"; return 1; }
@@ -9125,6 +9165,8 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes relogin <имя|all> [none] — обновить API-токен ноды из install-result.env (Bearer вместо пароля)
   xkit nodes panel-sync <имя|all> — добавить/обновить «Узлы» 3X-UI без импорта инбаундов
   xkit nodes hide <имя|all> — спрятать панель ноды за nginx 443 (loopback + секретный путь)
+  xkit nodes versions <имя|all> — версии 3X-UI/Xray на нодах (vs мастер и последний релиз)
+  xkit nodes upgrade <имя|all> [vX.Y.Z] — обновить 3X-UI на нодах (бэкап + проверка панели)
   xkit nodes cert <имя|all> [self|ip|domain|wildcard] [домен] — сертификат панели ноды (wildcard выпускает мастер по dns-01)
   xkit nodes cert show — таблица сертификатов/камо нод
   xkit nodes cert-renew [имя|--cron] — продление wildcard-линейджей мастера + пере-раздача нодам
@@ -9243,6 +9285,8 @@ xkit_main_impl() {
                relogin) shift; node_relogin "${1:-all}" "${2:-}" ;;
                panel-sync) shift; node_panel_sync "${1:-}" ;;
                hide) shift; node_hide_one "${1:-}" ;;
+               versions) shift; nodes_versions "${1:-all}" ;;
+               upgrade) shift; nodes_upgrade "${1:-}" "${2:-}" ;;
                cert) shift; node_cert_dispatch "$@" ;;
                cert-renew) shift; node_cert_dispatch renew "$@" ;;
                camo) shift; node_camo_dispatch "$@" ;;
@@ -13341,6 +13385,132 @@ nodes_freeze_show() {
         "$n" "$(_freeze_verdict_ru "$v")" "$mb" "$tr" "$(date -d "@${at}" '+%F %R' 2>/dev/null || echo '-')"
     done
   ok "Файл вердиктов: $XKIT_FREEZE_STATE (замер валиден для провайдера/региона мастера)"
+}
+#================= XKIT 7.7.2: ВЕРСИИ/ОБНОВЛЕНИЕ КОМПОНЕНТОВ НОД =================
+# Проблема (живой кейс 7.7.1): пользователь не знает, какие версии 3X-UI/Xray
+# стоят на нодах, и не может их обновить — версии были видны только на мастере
+# (xkit versions status), а ноды оставались чёрным ящиком.
+#
+# `xkit nodes versions <имя|all>` — таблица: 3X-UI/Xray/XKIT каждой ноды +
+# сравнение с мастером (отстаёт/совпадает) и последний тег релиза 3X-UI.
+# `xkit nodes upgrade <имя|all> [vX.Y.Z]` — обновление 3X-UI на ноде ОФИЦИАЛЬНЫМ
+# установщиком (тот же URL-контракт, что при добавлении ноды):
+#   - тег по умолчанию = тег мастера (единая версия кластера) или последний;
+#   - бэкап /etc/x-ui -> /root/x-ui-backup-<ts>.tar.gz (600) ДО установки;
+#   - установщик гоняется с XUI_NONINTERACTIVE=1 </dev/null (K-02: bash -n пин);
+#   - после установки: панель должна подняться на 127.0.0.1:<порт> (webListen
+#     сохраняется в БД, таймаут 60с) — иначе WARN и совет проверить вручную;
+#   - реестр nodes.json НЕ трогается: порты/пути/токены переживают обновление.
+# Восстановление после неудачного апгрейда: распаковать бэкап и
+# systemctl restart x-ui.
+
+# тег 3X-UI на мастере (из бинарника; пусто = не установлен)
+node_xui_tag_master() { version_xui_current; }
+
+# версии компонентов ноды -> TSV: xui xray xkit-marker
+node_versions_one() { # $1 rec -> TSV на stdout
+  local rec="$1" v="" x="" k=""
+  v="$(node_ssh "$rec" '/usr/local/x-ui/x-ui -v 2>/dev/null || x-ui version 2>/dev/null || true' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  x="$(node_ssh "$rec" '"$(ls -1 /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -n1)" version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1' 2>/dev/null)"
+  k="$(node_ssh "$rec" 'test -f /etc/xkit/.installed && cat /etc/xkit/.installed 2>/dev/null || echo "-"' 2>/dev/null)"
+  printf '%s\t%s\t%s' "${v:-?}" "${x:-?}" "${k:-?}"
+}
+
+nodes_versions() { # $1 имя|all
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  local want="${1:-all}" arr n rec mv mlatest="" row v x k
+  arr="$(nodes_load)"
+  [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет"; return 0; }
+  mv="$(node_xui_tag_master)"
+  mlatest="$(xui_tag_from_redirect || true)"
+  echo ""
+  printf '%-12s %-10s %-12s %-12s %s\n' "НОДА" "3X-UI" "XRAY" "vs МАСТЕР" "ПОСЛЕДНИЙ"
+  echo "-------------------------------------------------------------------"
+  while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    n="$(jq -r '.name' <<<"$rec")"
+    [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
+    row="$(node_versions_one "$rec")"
+    IFS=$'\t' read -r v x k <<<"$row"
+    local cmp="-"
+    [ "$v" = "?" ] || [ -z "$mv" ] || {
+      cmp="совпадает"
+      [ "$v" = "$mv" ] || cmp="$([ "$(printf '%s\n%s\n' "$v" "$mv" | sort -V | tail -1)" = "$mv" ] && echo "отстаёт" || echo "новее")"
+    }
+    local mark=""
+    [ "$v" != "?" ] && [ -n "$mlatest" ] && [ "$v" != "${mlatest#v}" ] && [ "$(printf '%s\n%s\n' "$v" "${mlatest#v}" | sort -V | tail -1)" = "${mlatest#v}" ] && mark="← доступно ${mlatest}"
+    printf '%-12s %-10s %-12s %-12s %s\n' "$n" "$v" "$x" "$cmp" "$mark"
+  done < <(jq -c '.[]' <<<"$arr")
+  echo "-------------------------------------------------------------------"
+  [ -n "$mv" ] && echo "Мастер: 3X-UI ${mv}, Xray $(version_xray_current || echo '?')" || echo "Мастер: 3X-UI не установлен"
+  [ -n "$mlatest" ] && echo "Последний релиз 3X-UI: ${mlatest} (обновление: xkit nodes upgrade <имя|all>)"
+  return 0
+}
+
+# обновление 3X-UI на ноде официальным установщиком
+node_upgrade_one() { # $1 rec, $2 тег (пусто = как на мастере/последний)
+  local rec="$1" tag="${2:-}" n u url ts vnew
+  n="$(jq -r '.name' <<<"$rec")"
+  [ -n "$tag" ] || tag="$(node_xui_tag_master)"
+  [ -n "$tag" ] || tag="$(xui_tag_from_redirect || true)"
+  [ -n "$tag" ] || { err "${n}: не определён тег 3X-UI (укажите: xkit nodes upgrade ${n} vX.Y.Z)"; return 1; }
+  tag="$(version_norm "${tag#v}")" || { err "${n}: '$tag' не похож на тег (vX.Y.Z)"; return 1; }
+  tag="v${tag}"
+  u="https://raw.githubusercontent.com/mhsanaei/3x-ui/${tag}/install.sh"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  log "${n}: обновляю 3X-UI до ${tag} (официальный установщик, бэкап сначала)..."
+  node_ssh "$rec" "XUI_URL='${u}' TS='${ts}' bash -s" <<'EOS' || { err "${n}: обновление 3X-UI не удалось (бэкап: /root/x-ui-backup-\${TS}.tar.gz)"; return 1; }
+set -u
+# 0. бэкап /etc/x-ui (600) — откат: tar -xzf /root/x-ui-backup-${TS}.tar.gz -C / && systemctl restart x-ui
+if [ -d /etc/x-ui ]; then
+  tar -czf /root/x-ui-backup-${TS}.tar.gz -C / etc/x-ui 2>/dev/null || true
+  chmod 600 /root/x-ui-backup-${TS}.tar.gz 2>/dev/null || true
+fi
+# 1. скачать установщик и проверить синтаксис (K-02, как при добавлении ноды)
+DL="$(mktemp)"
+curl -fsSL "${XUI_URL:?}" -o "$DL" || { echo "ERR: не удалось скачать ${XUI_URL}"; rm -f "$DL"; exit 1; }
+bash -n "$DL" || { echo "ERR: install.sh ${tag} не проходит bash -n"; rm -f "$DL"; exit 1; }
+# 2. сохранить webListen (установщик его затирает) и вернуть после
+WL="$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webListen'" 2>/dev/null || echo 127.0.0.1)"
+# 3. официальный установщик, неинтерактивно
+XUI_NONINTERACTIVE=1 bash "$DL" </dev/null
+rm -f "$DL"
+# 4. webListen обратно (панель не должна светиться наружу после апгрейда)
+if command -v sqlite3 >/dev/null 2>&1 && [ -f /etc/x-ui/x-ui.db ]; then
+  sqlite3 /etc/x-ui/x-ui.db "INSERT OR REPLACE INTO settings (key,value) VALUES ('webListen','${WL}');"
+fi
+systemctl restart x-ui
+# 5. готовность панели (webListen=127.0.0.1, порт из БД; до 60 сек)
+P="$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null)"
+[ -n "$P" ] || P=54321
+up=0; for i in $(seq 1 30); do
+  ss -ltnH 2>/dev/null | grep -q "127.0.0.1:${P} " && { up=1; break; }
+  sleep 2
+done
+[ "$up" = 1 ] || { echo "ERR: панель не поднялась на 127.0.0.1:${P} за 60 сек — проверьте: journalctl -u x-ui -n 30"; exit 1; }
+echo "OK-UPGRADE ${tag}"
+EOS
+  vnew="$(node_ssh "$rec" '/usr/local/x-ui/x-ui -v 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1' 2>/dev/null)"
+  ok "${n}: 3X-UI обновлён до ${tag} (установлено: ${vnew:-?}); бэкап: /root/x-ui-backup-${ts}.tar.gz"
+  audit_event nodes.upgrade "$n" ok "$tag"
+  return 0
+}
+
+nodes_upgrade() { # $1 имя|all, [$2 vX.Y.Z]
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  local want="${1:-}" tag="${2:-}" arr n rec any=0 rc=0
+  [ -n "$want" ] || { err "xkit nodes upgrade <имя|all> [vX.Y.Z]"; return 1; }
+  arr="$(nodes_load)"
+  [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет"; return 0; }
+  while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    n="$(jq -r '.name' <<<"$rec")"
+    [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
+    any=1
+    node_upgrade_one "$rec" "$tag" || rc=1
+  done < <(jq -c '.[]' <<<"$arr")
+  [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes upgrade <имя|all> [vX.Y.Z])"; return 1; }
+  return "$rc"
 }
 #=========================== ДИСПЕТЧЕР (v7.2.5) ================================
 # `main "$@"` — ПОСЛЕДНИЙ модуль сборки (build.sh склеивает src/[0-9][0-9]_*.sh
