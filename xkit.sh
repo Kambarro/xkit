@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT v7.5.15 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
+#  XKIT v7.6.0 — TUI и CLI для nginx + 3X-UI (Ubuntu 24.04+)
 #
 #  Установка:  curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
 #  Запуск:     xkit (TUI) | xkit --classic | xkit help
@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.5.15"
+XKIT_VERSION="7.6.0"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -597,9 +597,16 @@ read_path() {
 #=========================== СЛУЧАЙНОСТИ ======================================
 rand_str() { # [длина] -> [a-zA-Z0-9]; запас входа x3 + доводка циклом: длина всегда точная,
              # head в пайпе нет -> SIGPIPE не роняет цепочку (аудит №9), энтропия base64 сохранена
-  local n="${1:-32}" s
+  local n="${1:-32}" s tries=0
   s="$(openssl rand -base64 $(( n * 3 )) 2>/dev/null | tr -dc 'a-zA-Z0-9')"
   while [ "${#s}" -lt "$n" ]; do
+    # v7.5.16: предохранитель — если openssl недоступен/не даёт энтропию,
+    # не зацикливаемся навсегда, а падаем с ошибкой (раньше был infinite loop).
+    tries=$((tries+1))
+    if [ "$tries" -gt 8 ]; then
+      err "rand_str: openssl не даёт энтропию (проверьте openssl / /dev/urandom)"
+      return 1
+    fi
     s+="$(openssl rand -base64 $(( n * 3 )) 2>/dev/null | tr -dc 'a-zA-Z0-9')"
   done
   printf '%s' "${s:0:$n}"
@@ -1190,6 +1197,38 @@ BLK
 "
     fi
     block+="    }"
+
+  elif [ "$trans_type" == "5" ]; then
+    # === HTTPUpgrade (v7.5.16) — как WebSocket: HTTP Upgrade-заголовок ===
+    block=$(cat <<BLK
+
+    # --- HTTPUpgrade (${path_name}) ---
+    location ${path_name} {
+        if (\$http_upgrade != "websocket") { return 404; }
+        access_log off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+BLK
+)
+    if [ "$is_local" == "true" ]; then
+      block+="        proxy_pass http://${target};
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header Host \$host;
+"
+    else
+      domain_only="$R_HOST"
+      block+="        proxy_pass https://${target};
+        proxy_ssl_server_name on;
+        proxy_ssl_name ${domain_only};
+        proxy_set_header Host ${domain_only};
+"
+    fi
+    block+="    }"
   fi
 
   printf '%s' "$block"
@@ -1458,6 +1497,11 @@ xui_db_candidates() {
 
 xui_db_setting() { # $1 — ключ в settings; печать первого непустого значения
   command -v sqlite3 >/dev/null 2>&1 || return 0
+  # v7.5.16: ключ только [A-Za-z0-9_] — иначе одинарная кавычка в ключе ломает
+  # SQL (инъекция). Все реальные ключи (webPort/webBasePath/...) подходят.
+  case "$1" in
+    *[!A-Za-z0-9_]*|"") return 0 ;;
+  esac
   local db v
   while IFS= read -r db; do
     v="$(sqlite3 "$db" "SELECT value FROM settings WHERE key='$1' ORDER BY rowid LIMIT 1;" 2>/dev/null || true)"
@@ -2123,7 +2167,7 @@ auto_route() {
 
   local yes="${XKIT_YES:-0}"
   local total=0 routed=0 direct=0 changed=0
-  local id port tag proto enable mode net sec reason tag2 path cur_listen cur_path need
+  local id port tag proto enable mode net sec reason tag2 rnet path cur_listen cur_path need
 
   echo ""
   printf '%-4s %-16s %-9s %-6s %-8s %s\n' "ID" "TAG" "PROTO" "PORT" "РЕЖИМ" "ПУТЬ/ПРИЧИНА"
@@ -2165,6 +2209,11 @@ auto_route() {
     fi
 
     tag2="$(net_tag "$net")"
+    # v7.5.16: routes.tsv хранит ДЛИННЫЙ канонический тег (grpc/ws/xhttp/
+    # httpupgrade/tcp) — его ждут gen_xkit_conf, link_for_client, clash.
+    # Короткий tag2 (gr/xh/hu/tc) нужен только для канонического пути /xk-<tag2>-.
+    # splithttp нормализуем в xhttp (как в подписках/health).
+    rnet="$net"; [ "$rnet" = splithttp ] && rnet=xhttp
     if [ "$tag2" = "tc" ]; then
       # tcp+http: путь задаёт пользователь, канонизировать нельзя
       path="$(inbound_path "$ib" tcp)"
@@ -2184,7 +2233,7 @@ auto_route() {
     fi
 
     cur_listen="$(jq -r '.listen // ""' <<<"$ib")"
-    cur_path="$(inbound_path "$ib" "$tag2")"
+    cur_path="$(inbound_path "$ib" "$rnet")"
     need=""
     case "$cur_listen" in ""|"0.0.0.0"|"::"|"*") need="listen" ;; esac
     if [ "$tag2" != "tc" ] && [ "$cur_path" != "$path" ]; then need="${need}+path"; fi
@@ -2222,7 +2271,7 @@ auto_route() {
       fi
     fi
 
-    routes_upsert "$id" local "$tag2" "$path" "127.0.0.1:${port}" "$tag"
+    routes_upsert "$id" local "$rnet" "$path" "127.0.0.1:${port}" "$tag"
     routed=$((routed+1))
     printf '%-4s %-16s %-9s %-6s %-8s %s\n' "$id" "${tag:0:16}" "$proto" "$port" "ЗА nginx" "$path"
   done < <(jq -c '.[]' <<<"$INBOUNDS")
@@ -2331,6 +2380,7 @@ EOF
       ws)   r_num=2 ;;
       xhttp)r_num=3 ;;
       tcp)  r_num=4 ;;
+      httpupgrade) r_num=5 ;;
       tgweb)r_num=9 ;;
       *)    continue ;;
     esac
@@ -2671,7 +2721,7 @@ sockopt_cmd() { # xkit sockopt [on|off|status]
       [ -z "$ib" ] && continue
       id="$(jq -r '.id' <<<"$ib")"; tag="$(jq -r '.tag' <<<"$ib")"; port="$(jq -r '.port' <<<"$ib")"
       net="$(jq -r '.streamSettings|fromjson?|.network // "-"' <<<"$ib" 2>/dev/null)"
-      st="$(jq -r '.streamSettings|fromjson?|.sockopt // {}|c' <<<"$ib" 2>/dev/null)"
+      st="$(jq -c '.streamSettings|fromjson?|.sockopt // {}' <<<"$ib" 2>/dev/null)"
       case "$st" in {}|null) so="-" ;; *) so="$st" ;; esac
       printf '%-4s %-22s %-8s %-6s %s\n' "$id" "$tag" "$net" "$port" "$so"
     done < <(jq -c '.[]' <<<"$(api_list 2>/dev/null)" 2>/dev/null)
@@ -2824,7 +2874,7 @@ sub_regen_impl() {
     # v7.4.2: hy2 отдельной службы — в raw-подписку (и, следом, в sing-box JSON)
     [ -n "$hy2l" ] && printf '%s\n' "$hy2l" >> "$acc"
     f="${SUBS_DIR}/${subid}"
-    sort -u "$acc" | tr '\n' '\n' | base64 -w0 > "$f"
+    sort -u "$acc" | base64 -w0 > "$f"
     rm -f "$acc"
     chmod 644 "$f"
     # v7.0.0: sing-box генерируется локально из тех же проверенных URI.
@@ -3080,12 +3130,23 @@ client_add_all() {
 
   local email total=0 days=0
   echo "Пользователь будет добавлен во ВСЕ активные протоколы (${total_ibs} инбаундов)."
-  read -r -p "Имя (email) пользователя [u$(rand_hex 2)]: " email
+  # Неинтерактив (TUI-форма / CI): client add [email] [gb] [days] — без read.
+  # Интерактив сохранён как fallback для CLI и старых консолей.
+  if [ "$#" -ge 1 ]; then
+    email="$1"; total="${2:-0}"; days="${3:-0}"
+  else
+    read -r -p "Имя (email) пользователя [u$(rand_hex 2)]: " email
+  fi
   email="${email:-u$(rand_hex 2)}"
   email="${email//$'\t'/}"; email="${email//$'\r'/}"; email="${email//$'\n'/}"; email="${email// /}"
   [[ "$email" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]] || warn "Имя содержит нестандартные символы — лучше только A-Za-z0-9._@+-"
-  read -r -p "Квота трафика, ГБ (0 = без лимита) [0]: " total; total="${total:-0}"
-  read -r -p "Срок жизни, дней (0 = бессрочно) [0]: " days; days="${days:-0}"
+  if [ "$#" -lt 1 ]; then
+    read -r -p "Квота трафика, ГБ (0 = без лимита) [0]: " total; total="${total:-0}"
+    read -r -p "Срок жизни, дней (0 = бессрочно) [0]: " days; days="${days:-0}"
+  fi
+  # Валидация на границе доверия: форма TUI/CI не должна ломать арифметику ниже.
+  [[ "$total" =~ ^[0-9]+$ ]] || { err "Квота трафика: целое число ГБ (получено: $total)"; return 1; }
+  [[ "$days" =~ ^[0-9]+$ ]] || { err "Срок жизни: целое число дней (получено: $days)"; return 1; }
 
   local subid expiry=0 gb=0
   subid="$(jq -r --arg email "$email" '[.[].settings|fromjson?|.clients[]?|select(.email==$email)|.subId // empty][0] // empty' <<<"$INBOUNDS")"
@@ -5427,10 +5488,13 @@ node_login() { # $1 rec, $2 cookie — v7.2.9: двухфазный CSRF фор�
   # создаёт сессию и возвращает токен; v2: 404 — без заголовка (как у мастера)
   NODE_CSRF_TOKEN=""
   node_csrf_fetch "$rec" "$ck"
-  # форм-тело вместо JSON; @uri — как в kit_login; пароль идёт через stdin (V-03)
+  # форм-тело вместо JSON; @uri — как в kit_login.
+  # v7.5.16: логин/пароль через env (не --arg в argv) — иначе пароль виден в
+  # /proc/<pid>/cmdline любому локальному юзеру (утечка, противоречила V-03).
   out="$(node_api "$rec" "login" POST \
-    "$(jq -rn --arg u "$(jq -r '.panel.user' <<<"$rec")" --arg p "$(jq -r '.panel.pass' <<<"$rec")" \
-       '"username="+($u|@uri)+"&password="+($p|@uri)')" \
+    "$(XKIT_NU="$(jq -r '.panel.user' <<<"$rec")" \
+       XKIT_NP="$(jq -r '.panel.pass' <<<"$rec")" \
+       jq -rn '"username="+(env.XKIT_NU|@uri)+"&password="+(env.XKIT_NP|@uri)')" \
     "$ck")"
   jq -e '.success == true' <<<"$out" >/dev/null 2>&1 || return 1
   # v4.9.1-логика мастера: панель чистит сессию при логине (SetLoginUser ->
@@ -5843,8 +5907,7 @@ node_panel_sync() { # $1 имя ноды
     id="$(jq -r '.obj.id // empty' <<<"$resp")"
     [[ "$id" =~ ^[0-9]+$ ]] || { err "${n}: панель не вернула ID ноды"; return 1; }
     nodes_load | jq -c --arg n "$n" --argjson id "$id" \
-      'map(if .name==$n then .panel_node_id=$id else . end)' > "${XKIT_NODES}.tmp" \
-      && mv "${XKIT_NODES}.tmp" "$XKIT_NODES" && chmod 600 "$XKIT_NODES" || return 1
+      'map(if .name==$n then .panel_node_id=$id else . end)' | _xkit_atomic_write "$XKIT_NODES" || return 1
   fi
   ok "${n}: добавлена/обновлена в «Узлах» 3X-UI; импорт инбаундов отключён"
 }
@@ -6289,9 +6352,7 @@ EOS
     '.tunnel = {port:$tport, proto:"vless", net:"tcp", sec:"reality", uuid:$uuid, pbk:$pbk,
                 sid:$sid, sni:$sni, dest:$dest, flow:"xtls-rprx-vision"}
       | .outbound_tag = $tag | .created = $created' <<<"$rec")"
-  nodes_load | jq -c --argjson r "$rec" 'map(select(.name != $r.name)) + [$r]' > "${XKIT_NODES}.tmp" \
-    && mv "${XKIT_NODES}.tmp" "$XKIT_NODES"
-  chmod 600 "$XKIT_NODES"
+  nodes_load | jq -c --argjson r "$rec" 'map(select(.name != $r.name)) + [$r]' | _xkit_atomic_write "$XKIT_NODES"
   rm -f "$ck"
 
   local apply_failed=0
@@ -6475,8 +6536,7 @@ node_repin() { # $1 имя ноды или all
         fi
       fi
       nodes_load | jq -c --arg n "$n" --arg p "$pin" \
-        'map(if .name==$n then .panel.pincert=$p else . end)' > "${XKIT_NODES}.tmp" \
-        && mv "${XKIT_NODES}.tmp" "$XKIT_NODES" && chmod 600 "$XKIT_NODES"
+        'map(if .name==$n then .panel.pincert=$p else . end)' | _xkit_atomic_write "$XKIT_NODES"
       ok "${n}: пин обновлён (sha256//$(printf '%s' "$pin" | head -c 16)... )"
     else
       err "${n}: не удалось снять отпечаток сертификата (нода доступна?)"
@@ -6505,8 +6565,7 @@ node_relogin() { # $1 имя|all, [$2 = none]
     [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
     any=1
     if [ "$mode" = "none" ]; then
-      nodes_load | jq -c --arg n "$n" 'map(if .name==$n then del(.panel.token) else . end)' > "${XKIT_NODES}.tmp" \
-        && mv "${XKIT_NODES}.tmp" "$XKIT_NODES" && chmod 600 "$XKIT_NODES"
+      nodes_load | jq -c --arg n "$n" 'map(if .name==$n then del(.panel.token) else . end)' | _xkit_atomic_write "$XKIT_NODES"
       ok "${n}: API-токен удалён — API будет по логину+CSRF (xkit nodes token set вернёт Bearer)"
       continue
     fi
@@ -6515,12 +6574,10 @@ node_relogin() { # $1 имя|all, [$2 = none]
     ntok="$(node_token_fetch "$rec")"
     if [ -n "$ntok" ] && node_token_ok "$(jq -c --arg t "$ntok" '.panel.token = $t' <<<"$trec")" "$tck"; then
       nodes_load | jq -c --arg n "$n" --arg t "$ntok" \
-        'map(if .name==$n then .panel.token=$t else . end)' > "${XKIT_NODES}.tmp" \
-        && mv "${XKIT_NODES}.tmp" "$XKIT_NODES" && chmod 600 "$XKIT_NODES"
+        'map(if .name==$n then .panel.token=$t else . end)' | _xkit_atomic_write "$XKIT_NODES"
       ok "${n}: API-токен панели обновлён (Bearer, из install-result.env ноды)"
     else
-      nodes_load | jq -c --arg n "$n" 'map(if .name==$n then del(.panel.token) else . end)' > "${XKIT_NODES}.tmp" \
-        && mv "${XKIT_NODES}.tmp" "$XKIT_NODES" && chmod 600 "$XKIT_NODES"
+      nodes_load | jq -c --arg n "$n" 'map(if .name==$n then del(.panel.token) else . end)' | _xkit_atomic_write "$XKIT_NODES"
       warn "${n}: токен не получен/не принят панелью — API будет по логину+CSRF"
     fi
     rm -f "$tck"
@@ -6661,8 +6718,7 @@ nodes_del() {
     node_ssh "$rec" "systemctl stop x-ui; systemctl disable x-ui" >/dev/null 2>&1 \
       && ok "x-ui на ноде остановлен" || warn "Не удалось остановить (проверьте доступ)"
   fi
-  nodes_load | jq -c --arg n "$n" 'map(select(.name != $n))' > "${XKIT_NODES}.tmp" \
-    && mv "${XKIT_NODES}.tmp" "$XKIT_NODES"
+  nodes_load | jq -c --arg n "$n" 'map(select(.name != $n))' | _xkit_atomic_write "$XKIT_NODES"
   kit_session >/dev/null 2>&1 || true
   nodes_apply_template || warn "Шаблон xray не обновился"
   # v4.5: последняя нода удалена — убираем pool-инбаунд целиком. Иначе pool
@@ -8750,6 +8806,66 @@ xkit_answers_load() {
   return 0
 }
 
+# Манифест меню для TUI: дерево пунктов + argv. Источник истины — здесь,
+# TUI рендерит из него (xkit menu --json), а не из хардкода в Go.
+# КАЖДЫЙ args зеркалит реальную команду диспетчера xkit_main_impl или функцию
+# CLI-меню (fn). mode: exec=интерактив через ExecProcess, form=TUI-форма,
+# navigate=подменю в TUI, fn=прямой вызов функции ядра (как в xkit_menu.sh).
+# Контракт проверяется тестом test_v7516.sh: каждый args принимается ядром.
+xkit_menu_json() {
+  jq -n '{
+    version: 1,
+    groups: [
+      {id:"users", title:"Пользователи и подписки", items:[
+        {title:"Создать пользователя (все протоколы)", desc:"Одна подписка: VLESS/VMess/Trojan/AWG/Hysteria2", args:["client","add"], mode:"form"},
+        {title:"Пользователи: подписка, трафик, удаление", desc:"Выбор из списка, затем доступное действие", args:["client","list"], mode:"navigate"},
+        {title:"Обновить подписки и показать адреса", desc:"Base64, Clash и sing-box", args:["sub"], mode:"exec"},
+        {title:"QR-код подписки (SVG/PNG/AmneziaVPN)", desc:"Выберите пользователя и формат", args:["sub","qr"], mode:"exec"}
+      ]},
+      {id:"protocols", title:"Протоколы и маскировка", items:[
+        {title:"VLESS + REALITY + Vision", desc:"TCP 443, маскировка под настоящий сайт", args:["reality"], mode:"exec"},
+        {title:"VLESS + XHTTP + REALITY", desc:"Отдельный путь через nginx", args:["protocols","xhttp"], mode:"exec"},
+        {title:"AmneziaWG 3.1 (AWG 2.0)", desc:"Панель или служба, UDP 51820", args:["protocols","awg"], mode:"exec"},
+        {title:"Hysteria 2", desc:"QUIC/UDP 443, TLS и ссылка", args:["protocols","hy2"], mode:"exec"},
+        {title:"Добавить AWG/Hysteria2 в панель", desc:"Инбаунды для единой подписки", args:["protocols","panel"], mode:"exec"},
+        {title:"REALITY: ключи и ссылки", desc:"Показать параметры существующего inbound", args:[], fn:"reality_show_keys", mode:"exec"}
+      ]},
+      {id:"nodes", title:"Дополнительные серверы", items:[
+        {title:"Добавить сервер и распределить нагрузку", desc:"Установка, туннель и проверка подключения", args:["nodes"], mode:"exec"},
+        {title:"Обновить скорость, трафик и нагрузку", desc:"CPU/RAM, скорость и трафик каждого сервера", args:["nodes","metrics"], mode:"exec"},
+        {title:"Проверить все способы соединения", desc:"Найти рабочий путь и измерить задержку/скорость", args:["nodes","profile","survey"], mode:"exec"},
+        {title:"Сменить способ соединения", desc:"При ошибке оставить прежний вариант", args:["nodes","profile","switch"], mode:"exec"},
+        {title:"Сменить IP сервера", desc:"Без переустановки; сначала проверка", args:["nodes","readdress"], mode:"exec"},
+        {title:"Удалить сервер", desc:"Снять туннель и убрать из распределения", args:["nodes"], mode:"exec"}
+      ]},
+      {id:"monitoring", title:"Состояние и уведомления", items:[
+        {title:"Страница состояния", desc:"Серверы, соединения, трафик, срок аренды", args:["dash"], mode:"exec"},
+        {title:"Проверка сервера и доступности", desc:"Службы, порты, nginx и панель", args:["health"], mode:"exec"},
+        {title:"Проверить подключение как клиент", desc:"Реальный клиент по нашим ссылкам", args:["health","deep"], mode:"exec"},
+        {title:"Telegram-уведомления", desc:"Сертификаты, аренда, ошибки серверов", args:["telegram"], mode:"exec"},
+        {title:"Сроки аренды серверов", desc:"Главный и дополнительные серверы", args:["expiry"], mode:"exec"},
+        {title:"Данные для доступа", desc:"Пароли только в /root/xkit-info.txt", args:["info"], mode:"exec"}
+      ]},
+      {id:"service", title:"Обслуживание и безопасность", items:[
+        {title:"Сертификат: выпустить заново", desc:"Домен / IP / самоподписанный", args:[], fn:"menu_service_cert", mode:"exec"},
+        {title:"Резервная копия", desc:"Создать, проверить, восстановить", args:["backup"], mode:"exec"},
+        {title:"Обновить XKIT", desc:"Проверка файла и резервная копия", args:["update"], mode:"exec"},
+        {title:"Версии 3X-UI/Xray", desc:"Список, установка, откат", args:["versions"], mode:"exec"},
+        {title:"Сайт-заглушка", desc:"Состояние или создать заново", args:["camo"], mode:"exec"},
+        {title:"Архив для диагностики", desc:"Без секретов", args:["doctor","export"], mode:"exec"},
+        {title:"BBR и настройки TCP", desc:"Пропускная способность и задержка", args:["bbr"], mode:"exec"},
+        {title:"Журнал действий", desc:"Последние 50 записей", args:["audit"], mode:"exec"}
+      ]},
+      {id:"settings", title:"Настройки", items:[
+        {title:"Открывать меню при входе по SSH", desc:"Автоматический запуск xkit", args:[], fn:"ssh_hook_toggle", mode:"exec"},
+        {title:"Резервные копии: расписание", desc:"Интервал и хранение", args:["backup","settings"], mode:"exec"},
+        {title:"Автоматическое обслуживание", desc:"Очистка журналов и таймеры", args:["maintenance"], mode:"exec"},
+        {title:"Прокси для Telegram", desc:"MTProto / веб-прокси", args:["telegram-proxy"], mode:"exec"}
+      ]}
+    ]
+  }'
+}
+
 usage() {
   cat <<EOF
 XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню как у родного x-ui
@@ -8868,6 +8984,14 @@ xkit_main_impl() {
     --classic|classic) xkit_load_menu || exit 1; menu_loop ;;
     protocols|proto) shift; require_root; xkit_protocols_load || exit 1; protocols_main "$@" ;;
     snapshot) xkit_snapshot ;;
+    menu) shift; if [ "${1:-}" = "--json" ]; then xkit_menu_json; else xkit_load_menu || exit 1; menu_loop; fi ;;
+    --fn) shift; require_root
+          # Прямой вызов функции ядра из манифеста TUI (mode=fn). Имя — только
+          # из белого списка: граница доверия, не произвольный код из argv.
+          case "${1:-}" in
+            reality_show_keys|menu_service_cert|ssh_hook_toggle) "$1" ;;
+            *) err "Неизвестная функция меню: ${1:-}"; exit 1 ;;
+          esac ;;
     install) shift; require_root
              if [ "${1:-}" = "--answers" ]; then xkit_answers_load "${2:-}" || exit 1; shift 2; fi
              one_step_install ;;
@@ -8879,7 +9003,7 @@ xkit_main_impl() {
              else [ "${1:-}" = "-q" ] && export SUB_QUIET=1; require_root; sub_regen; fi ;;
     client)  shift; require_root
              case "${1:-list}" in
-               add) client_add_all ;; del) shift; client_del "$@" ;; list) client_list ;;
+               add) shift; client_add_all "$@" ;; del) shift; client_del "$@" ;; list) client_list ;;
                reset) shift; client_reset "$@" ;; show) shift; client_show "$@" ;;
                all) client_add_all ;;
                *) err "xkit client add|all|del|list|reset|show"; exit 1 ;;
@@ -9144,6 +9268,8 @@ clash_proxy_entry() { # $1 inbound JSON, $2 client JSON, $3 email
     cipher: auto
 "
       [ "$sec" = "tls" ] && body+="    tls: true"$'\n'"    servername: $(clash_q "$XKIT_HOST")"$'\n'
+      # v7.5.16: self-signed (mode 4) — skip-cert-verify, иначе Mihomo рвёт TLS.
+      [ "$sec" = "tls" ] && body+="$(clash_tls_tail)"
       [ "$net" = "ws" ] && { vpath="$(inbound_path "$ib" ws)"; \
         body+="    network: ws"$'\n'"    ws-opts:"$'\n'"      path: $(clash_q "$vpath")"$'\n'; }
       printf '%s' "$body" ;;
@@ -9191,7 +9317,8 @@ clash_proxy_entry() { # $1 inbound JSON, $2 client JSON, $3 email
     port: ${port}
     password: $(clash_q "$hauth")
 "
-      [ "${XKIT_CERT_MODE:-}" != "4" ] && body+="    sni: $(clash_q "$XKIT_HOST")"$'\n'
+      # v7.5.16: SNI всегда (mode 4 тоже — серверу нужен SNI для vhost).
+      body+="    sni: $(clash_q "$XKIT_HOST")"$'\n'
       body+="    alpn:"$'\n'"      - h3"$'\n'
       body+="$(clash_hy2_tls_tail)"
       printf '%s' "$body" ;;
@@ -9253,10 +9380,10 @@ clash_standalone_hy2() { # блок hysteria2 из службы xkit-hysteria2 (
     port: ${HY2_PORT}
     password: $(clash_q "$HY2_AUTH")
 "
+  # v7.5.16: SNI всегда; для self-signed (mode 4) ещё и skip-cert-verify.
+  body+="    sni: $(clash_q "$XKIT_HOST")"$'\n'
   if [ "${XKIT_CERT_MODE:-}" = "4" ]; then
     body+="    skip-cert-verify: true"$'\n'
-  else
-    body+="    sni: $(clash_q "$XKIT_HOST")"$'\n'
   fi
   [ -n "${HY2_OBFS:-}" ] && body+="    obfs: salamander"$'\n'"    obfs-password: $(clash_q "$HY2_OBFS")"$'\n'
   printf '%s' "$body"
@@ -9306,8 +9433,16 @@ clash_yaml_gen() { # $1 subId, $2 файл-аккумулятор «id<TAB>clien
     printf 'dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  nameserver:\n    - "https://1.1.1.1/dns-query"\n    - "https://8.8.8.8/dns-query"\n\n'
     printf 'proxies:\n%s\n' "$proxies"
     printf '\nproxy-groups:\n'
-    printf '  - name: "Авто"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    proxies:\n%s' "$group_auto"
-    printf '  - name: "Прокси"\n    type: select\n    proxies:\n      - "Авто"\n%s' "$group_all"
+    # v7.5.16: если все прокси WireGuard/AWG (names пуст) — url-test группа
+    # не может быть пустой (невалидный YAML). Делаем «Авто»=DIRECT и не ссылаемся
+    # на неё из «Прокси», иначе подписка не импортируется.
+    if [ -n "$group_auto" ]; then
+      printf '  - name: "Авто"\n    type: url-test\n    url: "http://www.gstatic.com/generate_204"\n    interval: 300\n    proxies:\n%s' "$group_auto"
+      printf '  - name: "Прокси"\n    type: select\n    proxies:\n      - "Авто"\n%s' "$group_all"
+    else
+      printf '  - name: "Авто"\n    type: select\n    proxies:\n      - DIRECT\n'
+      printf '  - name: "Прокси"\n    type: select\n    proxies:\n      - DIRECT\n%s' "$group_all"
+    fi
     printf '\nrules:\n  - GEOSITE,category-ru,DIRECT\n  - GEOIP,RU,DIRECT,no-resolve\n  - MATCH,Прокси\n'
   } > "$out"
   chmod 644 "$out"
@@ -10374,12 +10509,21 @@ XKIT_LOGROTATE="${XKIT_LOGROTATE:-/etc/logrotate.d/xkit}"
 XKIT_GEODATA_DIR="${XKIT_GEODATA_DIR:-/usr/local/share/xray}"
 
 _xkit_atomic_write() { # $1 destination; stdin -> same-dir temp -> chmod 600 -> mv
+  # v7.5.16: flock на соседнем .lock сериализует конкурентные записи реестров
+  # (nodes.json и т.п.) — без него read-modify-write терял обновления (TOCTOU).
+  # flock опционален: если утилиты нет, пишем как раньше (atomic mv остаётся).
   local dst="$1" dir tmp
   dir="$(dirname "$dst")"; mkdir -p "$dir" || return 1
   tmp="$(mktemp "${dir}/.xkit-write.XXXXXX")" || return 1
   if ! cat > "$tmp"; then rm -f "$tmp"; return 1; fi
   chmod 600 "$tmp" 2>/dev/null || true
-  if ! mv -f "$tmp" "$dst"; then rm -f "$tmp"; return 1; fi
+  if command -v flock >/dev/null 2>&1; then
+    ( flock -w 10 9 || true
+      mv -f "$tmp" "$dst"
+    ) 9>"${dst}.lock" || { rm -f "$tmp"; return 1; }
+  else
+    mv -f "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+  fi
 }
 
 audit_event() { # action target result [detail]; detail только технический, без значений
@@ -11982,8 +12126,7 @@ node_cert_renew_cron() { # -> 0 = всё продлено/раздаётся
 # Обновление реестра: тот же контур, что node_relogin (tmp + 600).
 node_cert_reg_set() { # $1 имя, $2 jq-фильтр над элементом (пример: '.panel.cert=$c')
   local n="$1" filt="$2"; shift 2
-  nodes_load | jq -c --arg n "$n" "$filt" "${@}" > "${XKIT_NODES}.tmp" \
-    && mv "${XKIT_NODES}.tmp" "$XKIT_NODES" && chmod 600 "$XKIT_NODES"
+  nodes_load | jq -c --arg n "$n" "$filt" "${@}" | _xkit_atomic_write "$XKIT_NODES"
 }
 
 node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 домен/база(для domain/wildcard)
