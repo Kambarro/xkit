@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.6.0"
+XKIT_VERSION="7.7.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -2281,6 +2281,10 @@ auto_route() {
 
   log "Пересобираю конфиг nginx..."
   regen_conf_and_apply || return 1
+
+  # v7.7.1: routing мастера (RU->direct, IPIfNonMatch, без catch-all blocked)
+  # нужен и соло-серверу, не только при нодах — nodes_merge_template без нод
+  nodes_apply_template || warn "Routing мастера не обновился — повторите: xkit nodes repair"
 
   log "Перегенерирую подписки..."
   sub_regen_quiet || true
@@ -4569,6 +4573,7 @@ xkit_install_body() {
   xkit_menu_install || true   # модуль меню (xkit_menu.sh) — v5.0.0
   xkit_extras_install || warn "TUI/модуль протоколов не установлен — выполните xkit update"
   ops_hygiene_install || warn "Maintenance timer не установлен — позже: xkit maintenance install"
+  geodata_timer_install || warn "Таймер geodata не установлен — позже: xkit geodata timer"
 
   echo ""
   echo -e "${GREEN}============================================================${NC}"
@@ -5348,6 +5353,10 @@ node_ssh() { # $1 rec-json, остальные — команда на ноде
   node_ssh_host_key "$host" "$port" "$kh" \
     || { err "Ключ хоста ${host}:${port} не подтверждён — подключение отменено (V-05)"; return 1; }
   local -a a=(-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$kh" -o ConnectTimeout=10 -p "$port")
+  # v7.6.1: ssh без -n вычитывает stdin вызывающего до EOF — node_add при пайпе/
+  # не-интерактиве терял ответы read («Что делать?» получал EOF). Команды без
+  # heredoc stdin ноды не нужен → -n; bash -s читает скрипт из stdin (heredoc).
+  case " $* " in *" bash -s "*) ;; *) a+=(-n) ;; esac
   if [ "$auth" = "password" ]; then
     node_ensure_sshpass || return 1   # v7.2.9: автоустановка вместо голой ошибки
     SSHPASS="$NODE_SSH_PASS" sshpass -e ssh "${a[@]}" "${user}@${host}" "$@"
@@ -5444,7 +5453,10 @@ node_api() { # $1 rec, $2 path, $3 method, $4 JSON-body, $5 cookie
   if [ "$sch" = "https" ]; then
     local pin; pin="$(jq -r '.panel.pincert // ""' <<<"$rec")"
     if [ -n "$pin" ]; then
-      a+=(--pinnedpubkey "sha256//$pin")   # пин снят при добавлении — MITM не пройдёт
+      # v7.6.1: -k обязателен и с пином — серт панели ноды self-signed, без -k
+      # curl падает rc60 (self-signed) ещё ДО проверки пина; пин и есть контроль
+      # доверия (MITM не пройдёт), поэтому -k здесь не ослабляет защиту.
+      a+=(-k --pinnedpubkey "sha256//$pin")   # пин снят при добавлении — MITM не пройдёт
     else
       a+=(-k)   # самоподписанный сертификат панели ноды (пина нет)
     fi
@@ -5711,15 +5723,28 @@ for n in nodes:
 tpl["outbounds"] = generated + outb
 
 r = tpl.setdefault("routing", {})
+# v7.7.1: AsIs не проверяет geoip для доменов — RU-IP, пришедшие доменом,
+# уезжали через ноду. IPIfNonMatch: домен без совпадения резолвится и
+# проверяется по geoip (sniffing в pool-инбаунде даёт домены).
+r["domainStrategy"] = "IPIfNonMatch"
 rules = r.get("rules") or []
 rules = [x for x in rules if x.get("balancerTag") != "XKIT_POOL"]
-if pool_tag:
-    rules = [x for x in rules if not (x.get("outboundTag") == "direct" and x.get("inboundTag") == [pool_tag]
-             and ("geosite:category-ru" in x.get("domain", []) or "geoip:ru" in x.get("ip", [])))]
+# v7.7.1: RU -> direct всегда, в т.ч. соло (без pool/нод): сервер в RU
+# отдаёт RU-трафик напрямую с себя. Идемпотентно: старое правило снимаем.
+rules = [x for x in rules if not (x.get("outboundTag") == "direct"
+         and "geosite:category-ru" in x.get("domain", []) and "geoip:ru" in x.get("ip", []))]
+rules.insert(0, {"domain": ["geosite:category-ru"], "ip": ["geoip:ru"], "outboundTag": "direct"})
 if pool_tag and nodes:
-    rules.insert(0, {"inboundTag": [pool_tag], "domain": ["geosite:category-ru"],
-                     "ip": ["geoip:ru"], "outboundTag": "direct"})
     rules.insert(1, {"inboundTag": [pool_tag], "balancerTag": "XKIT_POOL"})
+# v7.7.1: catch-all "blocked" из дефолтного шаблона 3X-UI молча убивал
+# весь не-RU трафик соло-мастера (и всё вне pool). Остаточный трафик -> direct.
+# xray 26.x отвергает правила без полей ("no effective fields"), а панель
+# выкидывает port без type:field — catch-all = type:field + port 0-65535.
+rules = [x for x in rules if not (x.get("outboundTag") == "blocked"
+         and not x.get("inboundTag") and not x.get("domain") and not x.get("ip"))]
+if not any(x.get("outboundTag") == "direct" and not x.get("inboundTag")
+           and not x.get("domain") and not x.get("ip") for x in rules):
+    rules.append({"type": "field", "port": "0-65535", "outboundTag": "direct"})
 r["rules"] = rules
 
 bal = r.get("balancers") or []
@@ -5867,7 +5892,7 @@ EOS
 # всегда выключен явно: selected + пустой список; outbound XKIT не трогаем.
 node_panel_sync() { # $1 имя ноды
   load_xkit_env || die "Сначала установка (пункт 1)"
-  local n="${1:-}" rec tok scheme pin id path body resp certfp
+  local n="${1:-}" rec tok scheme pin id path body resp certfp existing
   [ -n "$n" ] || { err "xkit nodes panel-sync <имя|all>"; return 1; }
   if [ "$n" = all ]; then
     local nn rc=0
@@ -5891,6 +5916,19 @@ node_panel_sync() { # $1 имя ноды
   fi
   kit_session || { err "Нет сессии мастер-панели"; return 1; }
   id="$(jq -r '.panel_node_id // empty' <<<"$rec")"
+  if [ -z "$id" ]; then
+    # v7.7.0: UNIQUE — имя в «Узлах» уникально; без поиска по имени повторный
+    # add падал на UNIQUE (или плодил дубли). Список недоступен — add как раньше.
+    existing="$(api_get_raw "panel/api/nodes/list" 2>/dev/null || true)"
+    if jq -e '.success == true and (.obj|type=="array")' <<<"$existing" >/dev/null 2>&1; then
+      id="$(jq -r --arg n "$n" '[.obj[]|select(.name==$n)][0].id // empty' <<<"$existing")"
+      [[ "$id" =~ ^[0-9]+$ ]] || id=""
+      if [ -n "$id" ]; then
+        nodes_load | jq -c --arg n "$n" --argjson id "$id" \
+          'map(if .name==$n then .panel_node_id=$id else . end)' | _xkit_atomic_write "$XKIT_NODES" || return 1
+      fi
+    fi
+  fi
   path="panel/api/nodes/add"; [ -n "$id" ] && path="panel/api/nodes/update/${id}"
   body="$(jq -nc --arg name "$n" --arg host "$(jq -r '.host' <<<"$rec")" \
     --argjson port "$(jq -r '.panel.port' <<<"$rec")" --arg base "$(jq -r '.panel.base // "/"' <<<"$rec")" \
@@ -6355,6 +6393,19 @@ EOS
   nodes_load | jq -c --argjson r "$rec" 'map(select(.name != $r.name)) + [$r]' | _xkit_atomic_write "$XKIT_NODES"
   rm -f "$ck"
 
+  # v7.7.0: панель ноды сразу за nginx 443 (loopback + секретный путь, как
+  # мастер) — публичный порт панели не светится. До сохранения обновлённого
+  # rec и до panel_sync: в «Узлы» уезжают уже 443+tls+pin nginx-серта.
+  # Не спряталась — нода остаётся на прямом порту (warn, не блокер).
+  local hrec
+  if hrec="$(node_hide_panel "$rec")"; then
+    rec="$hrec"
+    nodes_load | jq -c --argjson r "$rec" 'map(select(.name != $r.name)) + [$r]' | _xkit_atomic_write "$XKIT_NODES" \
+      || warn "Не обновил реестр после маскировки панели — повторите: xkit nodes hide ${nname}"
+  else
+    warn "Панель ноды осталась на ${psch}://${nhost}:${np_port} — спрятать позже: xkit nodes hide ${nname}"
+  fi
+
   local apply_failed=0
   log "Готовлю pool-инбаунд на мастере (вход для клиентов с балансировкой)..."
   nodes_ensure_pool || apply_failed=1
@@ -6435,12 +6486,11 @@ EOS
         *) ok "Панель ноды остаётся на самоподписанном серте (xkit nodes cert ${nname} — когда понадобится)" ;;
       esac
     fi
-    local _cy=""
-    # (стиль v7.1): [y/N]-промпты только через confirm() (typed-guard, EOF = отказ)
-    if confirm "Развернуть camo-сьют на ноде (сайт-прикрытие + фейк-логин)? [y/N] " _cy; then
-      node_camo_deploy_one "$nname" "" || warn "Camo не развернулся — вернитесь: НОДЫ -> 10 (или xkit nodes camo ${nname})"
-    fi
   fi
+  # v7.7.1: camo-сьют — автоматом (детерминирован от seed, per-node дизайн,
+  # ничего не ломает): максимальная маскировка из коробки, без вопроса.
+  # Снять/перегенерировать: НОДЫ -> 10 (xkit nodes camo / camo-off).
+  node_camo_deploy_one "$nname" "" || warn "Camo не развернулся — вернитесь: НОДЫ -> 10 (или xkit nodes camo ${nname})"
   node_panel_sync "$nname" || warn "${nname}: нода XKIT сохранена; повторите: xkit nodes panel-sync ${nname}"
   nodes_metrics_collect "$nname" >/dev/null 2>&1 || warn "${nname}: метрики пока недоступны"
   return 0
@@ -6758,6 +6808,8 @@ pool_remove_force() { # без вопросов — для nodes_del и меню
   # 3) пересобрать nginx и подписки: ссылки пула исчезают — клиенты должны
   # обновить подписку (она обновится сама при следующем запросе клиента)
   regen_conf_and_apply || { err "Конфиг nginx не применился — выполните: xkit nodes repair"; return 1; }
+  # v7.7.1: соло-режим — routing без pool, но RU->direct остаётся
+  nodes_apply_template || warn "Routing мастера не обновился — повторите: xkit nodes repair"
   sub_regen_quiet || true
   warn "Ссылки пула исчезли из подписок — клиентам нужно обновить подписку (происходит автоматически)"
   ok "Сервер переведён в одиночный режим"
@@ -6797,6 +6849,7 @@ nodes_menu() {
     echo "14) Ограниченный ключ доступа к панели: задать / проверить срок"
     echo "15) Получить новый ключ доступа и обновить список в 3X-UI"
     echo "16) Добавить/обновить сервер в «Узлах» 3X-UI (без импорта)"
+    echo "17) Спрятать панель сервера за nginx 443 (loopback + секретный путь)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -6817,6 +6870,7 @@ nodes_menu() {
       14) local _tn; read -r -p "Нода: " _tn; node_token_set "$_tn"; node_token_expiry_check; pause_enter ;;
       15) local _rl; read -r -p "Нода: " _rl; node_relogin "$_rl"; pause_enter ;;
       16) local _ps; read -r -p "Нода (Enter — все): " _ps; node_panel_sync "${_ps:-all}"; pause_enter ;;
+      17) local _hd; read -r -p "Нода (Enter — все): " _hd; node_hide_one "${_hd:-all}"; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac
@@ -6862,6 +6916,163 @@ node_camo_menu() {
   esac
 }
 
+# v7.7.0: спрятать панель ноды за nginx 443 — как мастер (force_panel_localhost
+# + generate_web_proxy_block): панель на 127.0.0.1, секретный путь проксируется
+# nginx'ом, публичный порт закрыт. Хирургия ТОЛЬКО панельного location в
+# xkit.conf (подписки/маршруты/camo не трогаем); если конфига нет — создаём
+# минимальный camo+панель. Вызывается из node_add после логина/пина.
+node_hide_panel() { # $1 rec -> stdout: обновлённый rec; rc1 = не спряталась
+  local rec="$1" nhost nport nbase
+  nhost="$(jq -r '.host' <<<"$rec")"
+  nport="$(jq -r '.panel.port' <<<"$rec")"
+  nbase="$(normalize_panel_path "$(jq -r '.panel.base // "/"' <<<"$rec")")"
+  is_port "$nport" || { err "node_hide_panel: некорректный порт панели"; return 1; }
+  is_nginx_path "$nbase" || { err "node_hide_panel: небезопасный путь панели '$nbase'"; return 1; }
+  # v7.7.0: панель может быть на HTTP (самоподпись не применилась) — тогда
+  # nginx проксирует http://, иначе https:// (схема из реестра, не угадываем)
+  local pscheme="http"; [ "$(jq -r '.panel.tls // false' <<<"$rec")" = "true" ] && pscheme="https"
+  local pblock; pblock="$(generate_web_proxy_block "Панель 3X-UI (нода)" "$nbase" "127.0.0.1:${nport}" "$pscheme")" \
+    || { err "node_hide_panel: не сгенерировал панельный location"; return 1; }
+  local pb64; pb64="$(printf '%s' "$pblock" | base64 -w0)"
+  # сертификат nginx: существующий LE (без нового выпуска!), иначе self-signed с SAN
+  local crt key
+  crt="$(node_ssh "$rec" 'for d in /etc/letsencrypt/live/*/; do [ -s "${d}fullchain.pem" ] && [ -s "${d}privkey.pem" ] && { printf "%s" "${d}fullchain.pem"; exit 0; }; done; printf ""' 2>/dev/null)"
+  if [ -n "$crt" ]; then key="${crt%fullchain.pem}privkey.pem"; else crt="/etc/x-ui/nginx-cert.pem"; key="/etc/x-ui/nginx-key.pem"; fi
+  log "Прячу панель ноды за nginx 443 (loopback + camo + секретный путь, как мастер)..." >&2
+  node_ssh "$rec" "env NPORT='${nport}' NHOST='${nhost}' XKIT_CRT='${crt}' XKIT_KEY='${key}' PB64='${pb64}' bash -s" >&2 <<'EOS' || { err "Панель ноды не спряталась за nginx"; return 1; }
+set -eu
+: "${NPORT:?}"; : "${NHOST:?}"; : "${XKIT_CRT:?}"; : "${XKIT_KEY:?}"; : "${PB64:?}"
+command -v nginx >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq nginx >/dev/null 2>&1; }
+command -v sqlite3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq sqlite3 >/dev/null 2>&1; }
+command -v python3 >/dev/null 2>&1 || { echo "ERR: python3 нужен для правки nginx"; exit 1; }
+# 0. бэкап xkit.conf до хирургии (откат при провале nginx -t)
+if [ -f /etc/nginx/sites-available/xkit.conf ]; then
+  cp -a /etc/nginx/sites-available/xkit.conf /etc/nginx/sites-available/xkit.conf.bak-hide
+fi
+# 1. панель только на loopback (как force_panel_localhost мастера)
+sqlite3 /etc/x-ui/x-ui.db "INSERT OR REPLACE INTO settings (key,value) VALUES ('webListen','127.0.0.1');"
+systemctl restart x-ui
+# ждём готовности порта (до 20 сек) — рестарт не мгновенный (миграции БД)
+up=0; for i in $(seq 1 10); do
+  if ss -ltnH 2>/dev/null | grep -q "127.0.0.1:${NPORT} "; then up=1; break; fi
+  sleep 2
+done
+[ "$up" = 1 ] || { echo "ERR: панель не поднялась на 127.0.0.1:${NPORT} за 20 сек"; exit 1; }
+if ss -ltnH 2>/dev/null | awk -v p=":${NPORT} " 'index($4,p){if($4 !~ /^127\.0\.0\.1/ && $4 !~ /^\[::1\]/)f=1} END{exit(f?0:1)}'; then
+  echo "ERR: панель ноды всё ещё слушает публично после webListen=127.0.0.1"; exit 1
+fi
+# 2. camo-заглушка + серт nginx (LE уже есть — не выпускаем новый; иначе self-signed с SAN)
+mkdir -p /var/www/html /var/www/camo
+[ -f /var/www/camo/index.html ] || printf '<!doctype html><html><head><title>Welcome</title></head><body><h1>Welcome!</h1><p>This server is up and running.</p></body></html>\n' > /var/www/camo/index.html
+if [ ! -s "$XKIT_CRT" ] || [ ! -s "$XKIT_KEY" ]; then
+  openssl ecparam -name prime256v1 -genkey -noout -out "$XKIT_KEY" 2>/dev/null
+  openssl req -new -x509 -key "$XKIT_KEY" -out "$XKIT_CRT" -days 3650 -subj "/CN=${NHOST}" -addext "subjectAltName=DNS:${NHOST},IP:${NHOST}" 2>/dev/null
+  chmod 600 "$XKIT_KEY"; chmod 644 "$XKIT_CRT"
+fi
+# 3. хирургия панельного location в xkit.conf — подписки/маршруты/camo НЕ трогаем
+printf '%s' "$PB64" | base64 -d > /tmp/.xkit-pblock.$$
+python3 - "$XKIT_CRT" "$XKIT_KEY" "$NHOST" /tmp/.xkit-pblock.$$ <<'PYEOF'
+import sys, re, os
+crt, key, host, pbfile = sys.argv[1:5]
+pblock = open(pbfile).read().strip()
+conf = "/etc/nginx/sites-available/xkit.conf"
+if os.path.exists(conf):
+    s = open(conf).read()
+    # удалить ВСЕ прежние панельные блоки (старый путь мог остаться от прошлой
+    # установки — два location на разные пути = панель торчит по старому адресу)
+    pat = re.compile(r'\n?[ \t]*# --- Панель[^\n]*\n.*?\n[ \t]*\}[ \t]*\n', re.S)
+    s = pat.sub('\n', s)
+    # вставить перед последней закрывающей скобкой server-блока :443
+    idx = s.rfind('\n}')
+    s = (s[:idx] + '\n' + pblock + '\n' + s[idx:]) if idx >= 0 else (s + '\n' + pblock + '\n')
+    open(conf, 'w').write(s)
+else:
+    # конфига нет (чистая нода) — минимальный camo + панель, без default_server
+    # (camo-сьют может занять :80 default_server позже)
+    open(conf, 'w').write(f"""# xkit.conf — маскировка ноды (XKIT). НЕ редактируйте вручную.
+server {{
+    listen 80;
+    server_name {host};
+    location /.well-known/acme-challenge/ {{ root /var/www/html; }}
+    location / {{ return 301 https://$host$request_uri; }}
+}}
+server {{
+    listen 443 ssl;
+    http2 on;
+    server_name {host};
+    ssl_certificate {crt};
+    ssl_certificate_key {key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    server_tokens off;
+    root /var/www/camo;
+    index index.html;
+    location / {{ try_files $uri $uri/ =404; }}
+{pblock}
+}}
+""")
+PYEOF
+rm -f /tmp/.xkit-pblock.$$
+ln -sf /etc/nginx/sites-available/xkit.conf /etc/nginx/sites-enabled/xkit.conf
+rm -f /etc/nginx/sites-enabled/default
+if ! nginx -t 2>/dev/null; then
+  # откат: прежний конфиг обратно, nginx не трогаем
+  [ -f /etc/nginx/sites-available/xkit.conf.bak-hide ] && cp -a /etc/nginx/sites-available/xkit.conf.bak-hide /etc/nginx/sites-available/xkit.conf
+  echo "ERR: nginx -t не прошёл после маскировки панели (конфиг откачен)"; exit 1
+fi
+systemctl enable --now nginx >/dev/null 2>&1 || true
+systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
+# 4. публичный порт панели закрыт (панель на loopback); 443 открыт для API/подписок
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  # удалить ВСЕ allow-правила порта, включая "from <IP мастера>" (delete from any
+  # их не трогает); номера берём из numbered ([ 7] — с пробелом!), с конца — индексы не плывут
+  ufw status numbered 2>/dev/null | awk -v p="${NPORT}/tcp" 'index($0,p) && /ALLOW/ { if (match($0, /\[[ ]*[0-9]+\]/)) { n=substr($0, RSTART+1, RLENGTH-2); gsub(/ /,"",n); print n } }' | sort -rn | while read -r rn; do
+    [ -n "$rn" ] && ufw --force delete "$rn" >/dev/null 2>&1 || true
+  done
+  ufw deny "${NPORT}/tcp" comment 'XKIT:node-panel-hidden' >/dev/null 2>&1 || true
+  ufw allow 443/tcp comment 'XKIT:node-https' >/dev/null 2>&1 || true
+fi
+# 5. продление LE на ноде: панель и nginx должны перечитать новый серт,
+# иначе после renew пин 443 протухнет (копии в /etc/x-ui + reload nginx)
+if [ -d /etc/letsencrypt/live ]; then
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  printf '#!/bin/sh\ninstall -m 644 "$RENEWED_LINEAGE/fullchain.pem" /etc/x-ui/panel-cert.pem\ninstall -m 600 "$RENEWED_LINEAGE/privkey.pem" /etc/x-ui/panel-key.pem\nsystemctl restart x-ui\nnginx -t 2>/dev/null && systemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/xkit-panel.sh
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/xkit-panel.sh
+fi
+echo OK-HIDE
+EOS
+  local npin; npin="$(cert_pin "$nhost" 443)"
+  [ -n "$npin" ] || { err "Не снял пин nginx-серта ноды на 443 — маскировка не подтверждена"; return 1; }
+  rec="$(jq -c --arg p "$npin" '.panel.port = 443 | .panel.tls = true | .panel.pincert = $p | .panel.hidden = true' <<<"$rec")"
+  ok "Панель ноды спрятана: https://${nhost}:443${nbase} (loopback + camo, публичный порт закрыт)" >&2
+  printf '%s' "$rec"
+}
+
+# v7.7.0: точечная маскировка уже добавленной ноды (node_add делает это автоматом)
+node_hide_one() { # $1 имя|all
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  local want="${1:-}" arr n rec hrec any=0 rc=0
+  [ -n "$want" ] || { err "xkit nodes hide <имя|all>"; return 1; }
+  arr="$(nodes_load)"
+  [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет"; return 0; }
+  while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    n="$(jq -r '.name' <<<"$rec")"
+    [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
+    any=1
+    if [ "$(jq -r '.panel.hidden // false' <<<"$rec")" = "true" ]; then
+      ok "${n}: панель уже спрятана (https://$(jq -r '.host' <<<"$rec"):443$(jq -r '.panel.base' <<<"$rec"))"
+      continue
+    fi
+    if hrec="$(node_hide_panel "$rec")"; then
+      nodes_load | jq -c --argjson r "$hrec" 'map(if .name==$r.name then $r else . end)' | _xkit_atomic_write "$XKIT_NODES" || { rc=1; continue; }
+      node_panel_sync "$n" || warn "${n}: повторите xkit nodes panel-sync ${n}"
+    else
+      rc=1
+    fi
+  done < <(jq -c '.[]' <<<"$arr")
+  [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes hide <имя|all>)"; return 1; }
+  return "$rc"
+}
 #=========================== v4.1: ПОЛЬЗОВАТЕЛЬ — СБРОС ТРАФИКА ===============
 client_reset() {
   load_xkit_env || die "Сначала установка (пункт 1)"
@@ -8913,6 +9124,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes token set|remove <имя> — scoped API token (0600, не argv)
   xkit nodes relogin <имя|all> [none] — обновить API-токен ноды из install-result.env (Bearer вместо пароля)
   xkit nodes panel-sync <имя|all> — добавить/обновить «Узлы» 3X-UI без импорта инбаундов
+  xkit nodes hide <имя|all> — спрятать панель ноды за nginx 443 (loopback + секретный путь)
   xkit nodes cert <имя|all> [self|ip|domain|wildcard] [домен] — сертификат панели ноды (wildcard выпускает мастер по dns-01)
   xkit nodes cert show — таблица сертификатов/камо нод
   xkit nodes cert-renew [имя|--cron] — продление wildcard-линейджей мастера + пере-раздача нодам
@@ -8939,6 +9151,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit restart defer <service>|apply|status — отложенные перезапуски
   xkit ledger collect|show|quota-check <bytes> — read-only монотонный учёт
   xkit geodata update <tag> <sha256 geoip> <sha256 geosite> — pinned update
+  xkit geodata auto — обновить до последнего релиза (SHA-256 издателя); timer — таймер 04:10
   xkit status          — сервисы, порты, что светится наружу
   xkit dash [install|gen|url|rotate|uninstall] — веб-дашборд (статусы/трафик/аренда;
                          rotate — новый токен URL + новый логин/пароль)
@@ -8980,11 +9193,11 @@ EOF
 
 xkit_main_impl() {
   case "${1:-menu}" in
-    menu|"") if xkit_tui_run; then exit 0; fi; xkit_load_menu || exit 1; menu_loop ;;
+    menu|"") shift; if [ "${1:-}" = "--json" ]; then xkit_menu_json; exit 0; fi
+             if xkit_tui_run; then exit 0; fi; xkit_load_menu || exit 1; menu_loop ;;
     --classic|classic) xkit_load_menu || exit 1; menu_loop ;;
     protocols|proto) shift; require_root; xkit_protocols_load || exit 1; protocols_main "$@" ;;
     snapshot) xkit_snapshot ;;
-    menu) shift; if [ "${1:-}" = "--json" ]; then xkit_menu_json; else xkit_load_menu || exit 1; menu_loop; fi ;;
     --fn) shift; require_root
           # Прямой вызов функции ядра из манифеста TUI (mode=fn). Имя — только
           # из белого списка: граница доверия, не произвольный код из argv.
@@ -9029,6 +9242,7 @@ xkit_main_impl() {
                       case "${1:-}" in set) node_token_set "${2:-}" ;; remove) node_token_revoke_local "${2:-}" ;; *) err "nodes token set|remove <имя>"; exit 1 ;; esac ;;
                relogin) shift; node_relogin "${1:-all}" "${2:-}" ;;
                panel-sync) shift; node_panel_sync "${1:-}" ;;
+               hide) shift; node_hide_one "${1:-}" ;;
                cert) shift; node_cert_dispatch "$@" ;;
                cert-renew) shift; node_cert_dispatch renew "$@" ;;
                camo) shift; node_camo_dispatch "$@" ;;
@@ -9129,7 +9343,7 @@ xkit_main_impl() {
     ledger) shift; require_root
             case "${1:-show}" in collect) traffic_ledger_collect && ok "Ledger обновлён" ;; show) traffic_ledger_show ;; quota-check) traffic_ledger_quota_check "${2:-}" ;; *) err "ledger collect|show|quota-check <bytes>"; exit 1 ;; esac ;;
     geodata) shift; require_root
-             case "${1:-}" in update) shift; geodata_update "$@" ;; *) err "geodata update <tag> <geoip-sha256> <geosite-sha256>"; exit 1 ;; esac ;;
+             case "${1:-}" in update) shift; geodata_update "$@" ;; auto) shift; geodata_auto_update ;; timer) geodata_timer_install ;; *) err "geodata update <tag> <geoip-sha256> <geosite-sha256> | geodata auto | geodata timer"; exit 1 ;; esac ;;
     update)  shift; if [ "${1:-}" = "--check" ]; then shift; xkit_update_check "$@"; else xkit_self_update "${1:-}"; fi ;;
     info)    require_root; xkit_info ;;
     help|-h|--help) usage ;;
@@ -9406,6 +9620,9 @@ clash_yaml_gen() { # $1 subId, $2 файл-аккумулятор «id<TAB>clien
     email="$(jq -r '.email // "user"' <<<"$cl")"
     block="$(clash_proxy_entry "$ib" "$cl" "$email")" || true
     [ -n "$block" ] || continue
+    # v7.6.1: $(…) съедает завершающий \n — без него записи склеиваются в одну
+    # строку и YAML подписки становится невалидным. Гарантируем перевод строки.
+    block+=$'\n'
     nm="$(sed -n 's/^  - name: //p' <<<"$block" | head -n1)"; nm="${nm%\"}"; nm="${nm#\"}"
     case "$block" in *"type: wireguard"*) wg_names+=("$nm") ;; *) names+=("$nm") ;; esac
     proxies+="$block"
@@ -9414,6 +9631,7 @@ clash_yaml_gen() { # $1 subId, $2 файл-аккумулятор «id<TAB>clien
   # Hysteria 2 отдельной службой: пароль общий для сервера — как и его ссылка
   block="$(clash_standalone_hy2)"
   if [ -n "$block" ]; then
+    block+=$'\n'  # v7.6.1: разделитель записей (см. clash_proxy_entry выше)
     nm="$(sed -n 's/^  - name: //p' <<<"$block" | head -n1)"; nm="${nm%\"}"; nm="${nm#\"}"
     names+=("$nm"); proxies+="$block"
   fi
@@ -9430,7 +9648,7 @@ clash_yaml_gen() { # $1 subId, $2 файл-аккумулятор «id<TAB>clien
   {
     printf '# XKIT v%s — Clash/Mihomo-профиль подписки (генерируется автоматически)\n' "$XKIT_VERSION"
     printf 'mixed-port: 7890\nallow-lan: false\nmode: rule\nlog-level: warning\nipv6: true\n\n'
-    printf 'dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  nameserver:\n    - "https://1.1.1.1/dns-query"\n    - "https://8.8.8.8/dns-query"\n\n'
+    printf 'dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  nameserver:\n    - "https://dns.adguard-dns.com/dns-query"\n    - "https://dns.yandex.net/dns-query"\n    - "tls://dns.adguard-dns.com"\n  fallback:\n    - "https://1.1.1.1/dns-query"\n    - "https://8.8.8.8/dns-query"\n\n'
     printf 'proxies:\n%s\n' "$proxies"
     printf '\nproxy-groups:\n'
     # v7.5.16: если все прокси WireGuard/AWG (names пуст) — url-test группа
@@ -10506,7 +10724,9 @@ XKIT_PLAN_STATE="${XKIT_PLAN_STATE:-${XKIT_DIR}/nodes-plan.json}"
 XKIT_MAINT_SERVICE="${XKIT_MAINT_SERVICE:-/etc/systemd/system/xkit-maintenance.service}"
 XKIT_MAINT_TIMER="${XKIT_MAINT_TIMER:-/etc/systemd/system/xkit-maintenance.timer}"
 XKIT_LOGROTATE="${XKIT_LOGROTATE:-/etc/logrotate.d/xkit}"
-XKIT_GEODATA_DIR="${XKIT_GEODATA_DIR:-/usr/local/share/xray}"
+# v7.7.1: xray из 3X-UI ищет geodata рядом с бинарём (/usr/local/x-ui/bin),
+# а не в /usr/local/share/xray — обновление должно попадать туда, где читает xray
+XKIT_GEODATA_DIR="${XKIT_GEODATA_DIR:-/usr/local/x-ui/bin}"
 
 _xkit_atomic_write() { # $1 destination; stdin -> same-dir temp -> chmod 600 -> mv
   # v7.5.16: flock на соседнем .lock сериализует конкурентные записи реестров
@@ -10774,18 +10994,89 @@ geodata_update() { # pinned tag + обе SHA-256; latest запрещён
   [[ "$tag" =~ ^[0-9A-Za-z._-]+$ ]] && [ "$tag" != latest ] || { err "Нужен pinned tag релиза, не latest"; return 1; }
   [[ "$hip$hsite" =~ ^[0-9a-f]{128}$ ]] || { err "Нужны SHA-256 geoip.dat и geosite.dat"; return 1; }
   tmp="$(mktemp -d)" || return 1; gd="$XKIT_GEODATA_DIR"
-  curl -fsSL --max-time 60 "https://github.com/XTLS/Xray-rules-dat/releases/download/${tag}/geoip.dat" -o "$tmp/geoip.dat" \
-    && curl -fsSL --max-time 60 "https://github.com/XTLS/Xray-rules-dat/releases/download/${tag}/geosite.dat" -o "$tmp/geosite.dat" || { rm -rf "$tmp"; return 1; }
+  # v7.7.1: XTLS/Xray-rules-dat больше не публикует geoip.dat (только full/lite);
+  # источник — Loyalsoldier/v2ray-rules-dat (тот же, что geodataSources панели)
+  curl -fsSL --max-time 120 "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${tag}/geoip.dat" -o "$tmp/geoip.dat" \
+    && curl -fsSL --max-time 120 "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${tag}/geosite.dat" -o "$tmp/geosite.dat" || { rm -rf "$tmp"; err "Скачивание geodata $tag не удалось"; return 1; }
   printf '%s  %s\n%s  %s\n' "$hip" "$tmp/geoip.dat" "$hsite" "$tmp/geosite.dat" | sha256sum -c - || { rm -rf "$tmp"; return 1; }
+  geodata_install_files "$tmp" "$gd" || { rm -rf "$tmp"; return 1; }
+  rm -rf "$tmp"; restart_request x-ui; audit_event geodata.update master ok "$tag"
+  ok "Geodata $tag установлены; restart x-ui отложен"
+}
+
+# v7.7.1: установка проверенных файлов + config-test + откат при провале.
+# $1 tmpdir с geoip.dat/geosite.dat, $2 каталог назначения
+geodata_install_files() {
+  local tmp="$1" gd="$2" ip xr
   mkdir -p "$gd"; for ip in geoip.dat geosite.dat; do [ ! -f "$gd/$ip" ] || cp -a "$gd/$ip" "$tmp/$ip.old"; done
   install -m 644 "$tmp/geoip.dat" "$gd/geoip.dat"; install -m 644 "$tmp/geosite.dat" "$gd/geosite.dat"
   xr="$(ls -1 /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -n1)"
   if [ -n "$xr" ] && ! "$xr" run -test -confdir /usr/local/x-ui/bin >/dev/null 2>&1; then
     for ip in geoip.dat geosite.dat; do [ ! -f "$tmp/$ip.old" ] || cp -a "$tmp/$ip.old" "$gd/$ip"; done
-    rm -rf "$tmp"; err "Config test не прошёл — старые geodata восстановлены"; return 1
+    err "Config test не прошёл — старые geodata восстановлены"; return 1
   fi
-  rm -rf "$tmp"; restart_request x-ui; audit_event geodata.update master ok "$tag"
-  ok "Geodata $tag установлены; restart x-ui отложен"
+  return 0
+}
+
+# v7.7.1: автообновление по таймеру — последний релиз Loyalsoldier, SHA-256
+# сверяется с .sha256sum САМОГО ИЗДАТЕЛЯ (не latest вслепую: pinned tag +
+# проверка обоих файлов до установки). Тихий cron-путь, идемпотентен.
+geodata_auto_update() { # -> 0 = обновлено/актуально, 1 = ошибка
+  local api tag tmp hip hsite gd cur_ip cur_site
+  api="$(curl -fsSL --max-time 30 "https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest" 2>/dev/null)" || { echo "geodata-auto: GitHub API недоступен" >&2; return 1; }
+  tag="$(jq -r '.tag_name // empty' <<<"$api")"
+  [[ "$tag" =~ ^[0-9A-Za-z._-]+$ ]] || { echo "geodata-auto: нет tag релиза" >&2; return 1; }
+  gd="$XKIT_GEODATA_DIR"
+  # уже стоит этот tag? (маркер .geodata-tag) — не качаем 20 МБ дважды в сутки
+  if [ -f "$gd/.geodata-tag" ] && [ "$(cat "$gd/.geodata-tag" 2>/dev/null)" = "$tag" ]; then
+    return 0
+  fi
+  tmp="$(mktemp -d)" || return 1
+  curl -fsSL --max-time 120 "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${tag}/geoip.dat" -o "$tmp/geoip.dat" \
+    && curl -fsSL --max-time 120 "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${tag}/geosite.dat" -o "$tmp/geosite.dat" \
+    && curl -fsSL --max-time 30 "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${tag}/geoip.dat.sha256sum" -o "$tmp/geoip.dat.sha256sum" \
+    && curl -fsSL --max-time 30 "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/${tag}/geosite.dat.sha256sum" -o "$tmp/geosite.dat.sha256sum" \
+    || { rm -rf "$tmp"; echo "geodata-auto: скачивание $tag не удалось" >&2; return 1; }
+  hip="$(awk '{print $1}' "$tmp/geoip.dat.sha256sum")"; hsite="$(awk '{print $1}' "$tmp/geosite.dat.sha256sum")"
+  [[ "$hip$hsite" =~ ^[0-9a-f]{128}$ ]] || { rm -rf "$tmp"; echo "geodata-auto: издатель не дал SHA-256" >&2; return 1; }
+  printf '%s  %s\n%s  %s\n' "$hip" "$tmp/geoip.dat" "$hsite" "$tmp/geosite.dat" | sha256sum -c - >/dev/null 2>&1 \
+    || { rm -rf "$tmp"; echo "geodata-auto: SHA-256 не сошёлся — установка отменена" >&2; return 1; }
+  geodata_install_files "$tmp" "$gd" || { rm -rf "$tmp"; return 1; }
+  printf '%s\n' "$tag" > "$gd/.geodata-tag"
+  rm -rf "$tmp"
+  # cron: перезапуск сразу (очередь restart_request требует ручного apply)
+  systemctl restart x-ui >/dev/null 2>&1 || { echo "geodata-auto: x-ui не перезапущен" >&2; return 1; }
+  audit_event geodata.auto master ok "$tag"
+  ok "Geodata автообновлены: $tag (SHA издателя сверен)"
+  return 0
+}
+
+geodata_timer_install() { # -> 0; ежедневно 04:10, как подписки/серты
+  require_root
+  local sd="${XKIT_SYSTEMD_DIR:-/etc/systemd/system}"
+  local bin="${XKIT_BIN:-$(readlink -f "$0" 2>/dev/null || echo /usr/local/bin/xkit)}"
+  [ -d "$sd" ] || { warn "systemd недоступен — geodata обновляйте вручную (xkit geodata auto)"; return 1; }
+  cat > "$sd/xkit-geodata.service" <<EOF
+[Unit]
+Description=XKIT geodata auto-update (Loyalsoldier, publisher SHA-256)
+[Service]
+Type=oneshot
+ExecStart=$bin geodata auto --cron
+EOF
+  cat > "$sd/xkit-geodata.timer" <<'EOF'
+[Unit]
+Description=XKIT geodata auto-update (daily 04:10)
+[Timer]
+OnCalendar=*-*-* 04:10:00
+RandomizedDelaySec=1800
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now xkit-geodata.timer >/dev/null 2>&1 || true
+  ok "Таймер geodata: xkit-geodata.timer (ежедневно 04:10, SHA издателя)"
+  return 0
 }
 
 #=========================== XKIT 7: SING-BOX И SUBSCRIPTION UX ===============
@@ -11948,13 +12239,14 @@ node_cert_issue_wildcard() { # $1 base, [$2 email] -> 0 = live/$base готов
 # Доставка серта на ноду: tar -h (разыменовать симлинки live->archive) | base64 |
 # stdin node_ssh (V-03: тело не в argv) + sha256 с обеих сторон до применения.
 node_cert_push_to_node() { # $1 rec, $2 lineage -> 0 = нода перезапустила панель с новым сертом
-  local rec="$1" lineage="$2" payload h_chain h_key
+  local rec="$1" lineage="$2" payload h_chain h_key hidden
   [ -s "/etc/letsencrypt/live/$lineage/fullchain.pem" ] || { err "На мастере нет live/$lineage"; return 1; }
   payload="$(tar -C /etc/letsencrypt/live -czf - -h "$lineage" 2>/dev/null | base64 -w0)" || return 1
   h_chain="$(sha256sum "/etc/letsencrypt/live/$lineage/fullchain.pem" | awk '{print $1}')"
   h_key="$(sha256sum "/etc/letsencrypt/live/$lineage/privkey.pem" | awk '{print $1}')"
+  hidden="$(jq -r '.panel.hidden // false' <<<"$rec")"
   log "Доставка сертификата на ноду (stdin, sha256-сверка)..."
-  node_ssh "$rec" 'bash -s' <<EOF || { err "Нода не применила сертификат"; return 1; }
+  node_ssh "$rec" "env XKIT_HIDDEN='${hidden}' bash -s" <<EOF || { err "Нода не применила сертификат"; return 1; }
 set -e
 d="\$(mktemp -d /tmp/.xkit-cert.XXXXXX)"
 printf '%s' '$payload' | base64 -d | tar -xzf - -C "\$d"
@@ -11969,6 +12261,12 @@ for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webKeyFile|/etc/x-ui/panel-key
   sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
 systemctl restart x-ui
+# v7.7.0: скрытая нода — nginx на 443 тоже должен получить новый серт,
+# иначе после продления пин панели (nginx-серт) протухнет
+if [ "\${XKIT_HIDDEN:-false}" = "true" ] && [ -f /etc/nginx/sites-available/xkit.conf ]; then
+  sed -i 's|ssl_certificate .*|ssl_certificate /etc/x-ui/panel-cert.pem;|; s|ssl_certificate_key .*|ssl_certificate_key /etc/x-ui/panel-key.pem;|' /etc/nginx/sites-available/xkit.conf
+  nginx -t 2>/dev/null && { systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true; } || echo 'WARN: nginx -t не прошёл — nginx остался на прежнем серте'
+fi
 EOF
   return 0
 }
@@ -11985,7 +12283,7 @@ node_cert_push_files() { # $1 rec, $2 fullchain.pem, $3 privkey.pem -> 0/1
   h_chain="$(sha256sum "$cf" | awk '{print $1}')"
   h_key="$(sha256sum "$kf" | awk '{print $1}')"
   log "Доставка своего сертификата на ноду (stdin, sha256-сверка)..."
-  node_ssh "$rec" 'bash -s' <<EOF || { err "Нода не применила сертификат"; return 1; }
+  node_ssh "$rec" "env XKIT_HIDDEN='$(jq -r '.panel.hidden // false' <<<"$rec")' bash -s" <<EOF || { err "Нода не применила сертификат"; return 1; }
 set -e
 d="\$(mktemp -d /tmp/.xkit-cert.XXXXXX)"
 printf '%s' '$b64c' | base64 -d > "\$d/fullchain.pem"
@@ -12001,6 +12299,11 @@ for kv in "webCertFile|/etc/x-ui/panel-cert.pem" "webKeyFile|/etc/x-ui/panel-key
   sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
 systemctl restart x-ui
+# v7.7.0: скрытая нода — обновляем серт и в nginx (иначе пин 443 протухнет)
+if [ "\${XKIT_HIDDEN:-false}" = "true" ] && [ -f /etc/nginx/sites-available/xkit.conf ]; then
+  sed -i 's|ssl_certificate .*|ssl_certificate /etc/x-ui/panel-cert.pem;|; s|ssl_certificate_key .*|ssl_certificate_key /etc/x-ui/panel-key.pem;|' /etc/nginx/sites-available/xkit.conf
+  nginx -t 2>/dev/null && { systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true; } || echo 'WARN: nginx -t не прошёл — nginx остался на прежнем серте'
+fi
 echo OK-OWN-CERT
 EOF
   return 0
@@ -12010,10 +12313,11 @@ EOF
 # там; webCertFile панели смотрит прямо в live/ или /etc/x-ui/. Продление — таймер
 # certbot на самой ноде (venv, дважды в сутки — для shortlived IP это обязательно).
 node_cert_apply_remote() { # $1 rec, $2 mode(ip|domain|self), $3 name(IP/домен/CN)
-  local rec="$1" mode="$2" name="$3" ipwait=""
+  local rec="$1" mode="$2" name="$3" ipwait="" hidden
   [ "$mode" = "ip" ] && ipwait="короткоживущий (~6.5 дней), продление автоматом"
+  hidden="$(jq -r '.panel.hidden // false' <<<"$rec")"
   log "Выпускаю сертификат на ноде: режим $mode, $name ($ipwait)"
-  node_ssh "$rec" 'bash -s' <<EOF || { err "Выпуск сертификата на ноде не удался"; return 1; }
+  node_ssh "$rec" "env XKIT_HIDDEN='${hidden}' bash -s" <<EOF || { err "Выпуск сертификата на ноде не удался"; return 1; }
 set -e
 MODE='$mode'; NAME='$name'
 C=/etc/x-ui/panel-cert.pem; K=/etc/x-ui/panel-key.pem
@@ -12067,6 +12371,15 @@ for kv in "webCertFile|\$C" "webKeyFile|\$K"; do
   sqlite3 /etc/x-ui/x-ui.db "UPDATE settings SET value='\$val' WHERE key='\$key'; INSERT INTO settings(key,value) SELECT '\$key','\$val' WHERE NOT EXISTS (SELECT 1 FROM settings WHERE key='\$key');"
 done
 systemctl restart x-ui
+# v7.7.0: скрытая нода — nginx на 443 получает тот же новый серт + reload;
+# deploy-hook продления обновляет и панель, и nginx ( renew не оставляет старый пин)
+if [ "\${XKIT_HIDDEN:-false}" = "true" ] && [ -f /etc/nginx/sites-available/xkit.conf ]; then
+  sed -i 's|ssl_certificate .*|ssl_certificate /etc/x-ui/panel-cert.pem;|; s|ssl_certificate_key .*|ssl_certificate_key /etc/x-ui/panel-key.pem;|' /etc/nginx/sites-available/xkit.conf
+  nginx -t 2>/dev/null && { systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true; } || echo 'WARN: nginx -t не прошёл — nginx остался на прежнем серте'
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+  printf '#!/bin/sh\ninstall -m 644 "\$RENEWED_LINEAGE/fullchain.pem" /etc/x-ui/panel-cert.pem\ninstall -m 600 "\$RENEWED_LINEAGE/privkey.pem" /etc/x-ui/panel-key.pem\nsystemctl restart x-ui\nnginx -t 2>/dev/null && systemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/xkit-panel.sh
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/xkit-panel.sh
+fi
 echo OK-CERT-\$MODE
 EOF
   return 0
