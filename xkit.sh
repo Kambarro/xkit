@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.7.2"
+XKIT_VERSION="7.7.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5751,6 +5751,13 @@ r["rules"] = rules
 
 bal = r.get("balancers") or []
 bal = [b for b in bal if b.get("tag") != "XKIT_POOL"]
+# v7.7.3: xray 26.x паникует (SIGSEGV в tls.WithDestination) при hysteria-outbound +
+# burstObservatory (leastLoad). x-ui добавляет observatory при leastLoad сам, из шаблона
+# его не убрать — поэтому при hysteria-нодах меняем стратегию на roundRobin ДО сборки
+# балансера (балансировка жива; health-пинги hy-нод недоступны до апстрим-фикса xray).
+_hy = any((n.get("tunnel") or {}).get("proto") == "hysteria2" for n in nodes)
+if _hy and strategy in ("leastLoad", "leastPing"):
+    strategy = "roundRobin"
 if nodes:
     bal.append({"tag": "XKIT_POOL", "selector": ["node-"], "strategy": {"type": strategy,
                 **({"expected": 1} if strategy == "leastLoad" else {})}})
@@ -5758,11 +5765,11 @@ r["balancers"] = bal
 
 tpl.pop("observatory", None)
 tpl.pop("burstObservatory", None)
-if nodes and strategy == "leastPing":
+if nodes and strategy == "leastPing" and not _hy:
     tpl["observatory"] = {"subjectSelector": ["node-"],
                           "probeUrl": "https://www.google.com/generate_204",
                           "probeInterval": "1m", "enableConcurrency": True}
-if nodes and strategy == "leastLoad":
+if nodes and strategy == "leastLoad" and not _hy:
     tpl["burstObservatory"] = {"subjectSelector": ["node-"],
                                "pingConfig": {"destination": "https://www.google.com/generate_204",
                                               "connectivity": "http://www.google.com/generate_204",
@@ -7046,11 +7053,56 @@ if [ -d /etc/letsencrypt/live ]; then
   printf '#!/bin/sh\ninstall -m 644 "$RENEWED_LINEAGE/fullchain.pem" /etc/x-ui/panel-cert.pem\ninstall -m 600 "$RENEWED_LINEAGE/privkey.pem" /etc/x-ui/panel-key.pem\nsystemctl restart x-ui\nnginx -t 2>/dev/null && systemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/xkit-panel.sh
   chmod +x /etc/letsencrypt/renewal-hooks/deploy/xkit-panel.sh
 fi
+# 6. внутренний TLS-сайт для Reality dest (127.0.0.1:8444), как на мастере.
+# node_add копирует мастер-dest 127.0.0.1:8444 на ноду, но без этого сайта dest
+# мёртв и Reality-туннель не проходит данные. Серт берём тот же, что у nginx 443
+# ноды (LE или self-signed) — SNI туннеля выравнивается с ним отдельным шагом.
+if ! grep -q 'listen 127.0.0.1:8444' /etc/nginx/sites-available/xkit.conf 2>/dev/null; then
+  cat >> /etc/nginx/sites-available/xkit.conf <<NGXEOF
+
+# Внутренний TLS-сайт для Reality туннеля ноды (XKIT): xray проксирует сюда
+# посторонних, клиент Reality видит легитимный сайт с сертификатом ноды.
+server {
+    listen 127.0.0.1:8444 ssl;
+    server_name ${NHOST};
+    ssl_certificate ${XKIT_CRT};
+    ssl_certificate_key ${XKIT_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    root /var/www/camo;
+    index index.html;
+    location / { try_files \$uri \$uri/ =404; }
+}
+NGXEOF
+  nginx -t 2>/dev/null && systemctl reload nginx >/dev/null 2>&1 || true
+fi
 echo OK-HIDE
 EOS
   local npin; npin="$(cert_pin "$nhost" 443)"
   [ -n "$npin" ] || { err "Не снял пин nginx-серта ноды на 443 — маскировка не подтверждена"; return 1; }
   rec="$(jq -c --arg p "$npin" '.panel.port = 443 | .panel.tls = true | .panel.pincert = $p | .panel.hidden = true' <<<"$rec")"
+  # v7.7.3: SNI Reality-туннеля обязан совпадать с SAN серта ноды (dest 8444 отдаёт
+  # именно его). node_add наследует мастер-SNI (напр. mengin.ru), а серт ноды —
+  # api.mengin.ru: Go-клиент отвергал handshake, туннель рвался. Выравниваем
+  # serverNames туннельного inbound ноды и .tunnel.sni реестра с хостом ноды.
+  local tsni tport tck tlist tib tid tstream tbody
+  tsni="$nhost"; tport="$(jq -r '.tunnel.port // empty' <<<"$rec")"
+  if [ -n "$tport" ]; then
+    tck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)"
+    if node_login "$rec" "$tck" 2>/dev/null; then
+      tlist="$(node_api "$rec" panel/api/inbounds/list GET "" "$tck")"
+      tib="$(jq -c --argjson p "$tport" '[.obj[]|select(.port==$p)][0]//empty' <<<"$tlist")"
+      if [ -n "$tib" ]; then
+        tid="$(jq -r '.id' <<<"$tib")"
+        tstream="$(jq -c '.streamSettings|(if type=="string" then fromjson else . end)|.realitySettings.serverNames=[$s]|.realitySettings.settings.serverName=$s' --arg s "$tsni" <<<"$tib")"
+        tbody="$(jq -c --argjson st "$tstream" '.streamSettings=$st' <<<"$tib")"
+        node_api "$rec" "panel/api/inbounds/update/$tid" POST "$tbody" "$tck" >/dev/null 2>&1 \
+          && node_ssh "$rec" "systemctl restart x-ui" >/dev/null 2>&1 \
+          && rec="$(jq -c --arg s "$tsni" '.tunnel.sni=$s' <<<"$rec")" \
+          || warn "Не выровнял SNI туннеля ноды с сертом — проверьте: xkit nodes repair ${nname}"
+      fi
+    fi
+    rm -f "$tck"
+  fi
   ok "Панель ноды спрятана: https://${nhost}:443${nbase} (loopback + camo, публичный порт закрыт)" >&2
   printf '%s' "$rec"
 }
@@ -11707,8 +11759,10 @@ node_profile_switch() {
       auth="$(rand_str 32)"; crt="/etc/xkit/node-hysteria-${want}.crt"; key="/etc/xkit/node-hysteria-${want}.key"
       local san; san="$(jq -r '.host' <<<"$rec")"; is_ip "$san" && san="IP:$san" || san="DNS:$san"
       node_ssh "$rec" "mkdir -p /etc/xkit && chmod 700 /etc/xkit && openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 -subj /CN=xkit-node -addext subjectAltName=$san -keyout '$key' -out '$crt' >/dev/null 2>&1 && chmod 600 '$key'" || { rm -f "$ck"; err "Не удалось создать сертификат Hysteria2 на ноде ($san)"; return 1; }
-      certmade=1; certpin="$(node_ssh "$rec" "openssl x509 -in '$crt' -outform DER | openssl dgst -sha256 -binary | base64 -w0")"
-      [ -n "$certpin" ] || { rm -f "$ck"; err "Не удалось рассчитать certificate pin Hysteria"; return 1; }
+      certmade=1; certpin="$(node_ssh "$rec" "openssl x509 -in '$crt' -outform DER | openssl dgst -sha256 -hex | awk '{print \$NF}'")"
+      # v7.7.3: xray 26.x требует pinnedPeerCertSha256 в HEX (base64 -> «encoding/hex:
+      # invalid byte», панель отвергает outbound). cert_pin для curl остаётся base64.
+      [[ "$certpin" =~ ^[0-9a-f]{64}$ ]] || { rm -f "$ck"; err "Не удалось рассчитать certificate pin Hysteria"; return 1; }
       ib="$(node_profile_hysteria_ib "$rec" "$port" "$auth" "$crt" "$key")"
       rec="$(jq -c --arg a "$auth" --arg c "$crt" --arg k "$key" --arg p "$certpin" '.tunnel.auth=$a|.tunnel.cert=$c|.tunnel.key=$k|.tunnel.tls_pin=$p' <<<"$rec")" ;;
   esac
@@ -11749,41 +11803,103 @@ node_profile_switch() {
   ok "Активный профиль $want: $profile; постоянных candidate-инбаундов не осталось"
 }
 
-# Полный active-path benchmark: master loopback -> Xray node outbound -> node loopback HTTP.
+# Полный active-path benchmark: master loopback -> Xray node outbound -> нода.
+# v7.7.3: TCP-профили (vless) меряем HTTP-загрузкой 8 MiB; hysteria2 — UDP/QUIC,
+# TCP-проба через него не проходит, меряем UDP-эхо (stop-and-wait с ретраями).
 node_profile_benchmark() {
   local want="${1:-}" quiet="${2:-}" rec rp lp metrics elapsed ms rtt bytes speed rc=0 orig="" merged applied=0 result
   load_xkit_env || return 1
   [ -n "${PANEL_PORT:-}" ] || kit_session || return 1
   rec="$(node_record "$want")"; [ -n "$rec" ] || return 1
   command -v python3 >/dev/null && command -v curl >/dev/null || return 1
+  local nhost tag proto net
+  nhost="$(jq -r '.host' <<<"$rec")"
+  tag="$(jq -r '.outbound_tag//("node-"+.name)' <<<"$rec")"
+  proto="$(jq -r '.tunnel.proto // "vless"' <<<"$rec")"
   lp="$(rand_free_port 31000 59000)" || return 1
-  rp="$(node_ssh "$rec" python3 - <<'PY'
-import socket
-s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()
-PY
-)" || return 1
+  if [ "$proto" = "hysteria2" ]; then net=udp; else net=tcp; fi
+  rp="$(node_profile_remote_port "$rec" "$net")" || return 1
   [[ "$rp" =~ ^[0-9]+$ ]] || return 1
-  node_ssh "$rec" "set -e; rm -rf /run/xkit-node-bench; mkdir -p /run/xkit-node-bench; dd if=/dev/zero of=/run/xkit-node-bench/payload bs=1M count=8 status=none; nohup python3 -m http.server $rp --bind 127.0.0.1 --directory /run/xkit-node-bench </dev/null >/run/xkit-node-bench/server.log 2>&1 & p=\$!; printf '%s\n' \"\$p\" >/run/xkit-node-bench.pid" || return 1
-  orig="$(master_xray_template_get)" || { node_profile_bench_cleanup "$rec"; return 1; }
-  # Любой выход/сигнал восстанавливает исходный master template и убирает HTTP server.
-  trap 'if [ "${applied:-0}" = 1 ]; then master_xray_template_set "$orig" >/dev/null 2>&1 || true; fi; node_profile_bench_cleanup "$rec"' RETURN INT TERM
-  merged="$(printf '%s' "$orig" | node_probe_merge "$lp" "$rp" "$(jq -r '.outbound_tag//("node-"+.name)' <<<"$rec")")" || rc=1
+  # v7.7.3: payload через ПУБЛИЧНЫЙ адрес ноды, НЕ её loopback. Дефолтный шаблон
+  # 3X-UI на ноде содержит geoip:private->blocked — запросы на 127.0.0.1 молча
+  # рвались. Сервер слушаем на 0.0.0.0, dokodemo таргетим в публичный host:rp,
+  # Host-заголовок = host:rp — иначе sniffing ноды переопределит цель на приватный
+  # IP и снова упрётся в blocked (проверено живьём).
+  if [ "$net" = udp ]; then
+    # v7.7.3: через bash -s (heredoc): node_ssh вешает -n на «set -e; cat >» —
+    # stdin (heredoc) уходил в /dev/null, echo-сервер не создавался.
+    node_ssh "$rec" 'bash -s' <<EOS || return 1
+set -e
+cat > /run/xkit-bench-echo.py <<'PY'
+import socket,sys
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.bind(('0.0.0.0',int(sys.argv[1])))
+while True:
+    d,a=s.recvfrom(65535); s.sendto(d,a)
+PY
+nohup python3 /run/xkit-bench-echo.py $rp </dev/null >/run/xkit-bench-echo.log 2>&1 &
+p=\$!; printf '%s\n' "\$p" >/run/xkit-bench.pid
+EOS
+  else
+    node_ssh "$rec" "set -e; rm -rf /run/xkit-bench; mkdir -p /run/xkit-bench; dd if=/dev/zero of=/run/xkit-bench/payload bs=1M count=8 status=none; nohup python3 -m http.server $rp --bind 0.0.0.0 --directory /run/xkit-bench </dev/null >/run/xkit-bench/server.log 2>&1 & p=\$!; printf '%s\n' \"\$p\" >/run/xkit-bench.pid" || return 1
+  fi
+  node_profile_fw "$rec" add "$rp" "$net" || { node_profile_bench_cleanup "$rec"; return 1; }
+  orig="$(master_xray_template_get)" || { node_profile_fw "$rec" del "$rp" "$net"; node_profile_bench_cleanup "$rec"; return 1; }
+  # Любой выход/сигнал восстанавливает исходный master template, firewall и сервер.
+  trap 'if [ "${applied:-0}" = 1 ]; then master_xray_template_set "$orig" >/dev/null 2>&1 || true; fi; node_profile_fw "$rec" del "$rp" "$net" >/dev/null 2>&1 || true; node_profile_bench_cleanup "$rec"' RETURN INT TERM
+  # v7.7.3: у hysteria-пробы убираем observatory из orig-шаблона — xray 26.x
+  # паникует (SIGSEGV) когда observatory пингует через hysteria-outbound
+  local jqfilter='.inbounds[-1].settings.address=$h | .inbounds[-1].settings.network=$n'
+  [ "$net" = udp ] && jqfilter="$jqfilter | del(.burstObservatory, .observatory)"
+  merged="$(printf '%s' "$orig" | node_probe_merge "$lp" "$rp" "$tag" | jq -c --arg h "$nhost" --arg n "$net" "$jqfilter")" || rc=1
   if [ "$rc" -eq 0 ]; then master_xray_template_set "$merged" && applied=1 || rc=1; fi
   if [ "$rc" -eq 0 ]; then
-    sleep 2
-    metrics="$(curl -fsS --max-time 25 -o /dev/null -w '%{time_starttransfer} %{time_total}' "http://127.0.0.1:${lp}/payload")" || rc=1
-  fi
-  if [ "$rc" -eq 0 ]; then
-    rtt="$(awk '{printf "%d",$1*1000}' <<<"$metrics")"
-    elapsed="$(awk '{printf "%d",$2*1000}' <<<"$metrics")"
-    [ "$elapsed" -gt 0 ] || elapsed=1; bytes=8388608; speed=$((bytes*8*1000/elapsed/1000000)); ms="$elapsed"
+    sleep 3
+    if [ "$net" = udp ]; then
+      # UDP-эхо: 256 KiB чанками по 1200 байт, stop-and-wait с ретраями
+      metrics="$(python3 - "$lp" <<'PY'
+import socket,sys,time
+lp=int(sys.argv[1])
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.settimeout(4)
+total=262144; chunk=1200
+t0=time.time(); got=0; seq=0; rtts=[]
+data=b'x'*chunk
+while got<total:
+    pkt=seq.to_bytes(4,'big')+data; ok=False
+    for _ in range(5):
+        ts=time.time(); s.sendto(pkt,('127.0.0.1',lp))
+        try:
+            d,_=s.recvfrom(65535)
+            if d[:4]==seq.to_bytes(4,'big'):
+                rtts.append(time.time()-ts); got+=len(d)-4; seq+=1; ok=True; break
+        except socket.timeout: continue
+    if not ok: sys.exit(1)
+el=time.time()-t0
+print(f"{sum(rtts)/len(rtts):.6f} {el:.6f} {got}")
+PY
+)" || rc=1
+      if [ "$rc" -eq 0 ]; then
+        rtt="$(awk '{printf "%d",$1*1000}' <<<"$metrics")"
+        elapsed="$(awk '{printf "%d",$2*1000}' <<<"$metrics")"
+        bytes="$(awk '{print $3}' <<<"$metrics")"
+        [ "$elapsed" -gt 0 ] || elapsed=1; speed=$((bytes*8*1000/elapsed/1000000)); ms="$elapsed"
+      fi
+    else
+      metrics="$(curl -fsS --max-time 40 -H "Host: ${nhost}:${rp}" -o /dev/null -w '%{time_starttransfer} %{time_total}' "http://127.0.0.1:${lp}/payload")" || rc=1
+      if [ "$rc" -eq 0 ]; then
+        rtt="$(awk '{printf "%d",$1*1000}' <<<"$metrics")"
+        elapsed="$(awk '{printf "%d",$2*1000}' <<<"$metrics")"
+        [ "$elapsed" -gt 0 ] || elapsed=1; bytes=8388608; speed=$((bytes*8*1000/elapsed/1000000)); ms="$elapsed"
+      fi
+    fi
   fi
   if [ "$applied" = 1 ]; then master_xray_template_set "$orig" >/dev/null 2>&1 || { err "Не удалось восстановить master template после benchmark"; rc=1; }; applied=0; fi
+  node_profile_fw "$rec" del "$rp" "$net" >/dev/null 2>&1 || true
   node_profile_bench_cleanup "$rec"; trap - RETURN INT TERM
   [ "$rc" -eq 0 ] || { [ "$quiet" = --quiet ] || err "Full-path benchmark не прошёл"; return 1; }
-  result="$(jq -nc --arg n "$want" --arg profile "$(node_profile_name "$rec")" --argjson rtt "$rtt" --argjson ms "$ms" --argjson mbps "$speed" '{node:$n,profile:$profile,rtt_ms:$rtt,total_ms:$ms,download_mbps:$mbps,bytes:8388608,scope:"master->node full active path",dpi_test:false}')"
+  result="$(jq -nc --arg n "$want" --arg profile "$(node_profile_name "$rec")" --argjson rtt "$rtt" --argjson ms "$ms" --argjson mbps "$speed" --argjson bytes "$bytes" '{node:$n,profile:$profile,rtt_ms:$rtt,total_ms:$ms,download_mbps:$mbps,bytes:$bytes,scope:"master->node full active path",dpi_test:false}')"
   printf '%s\n' "$result" | _xkit_atomic_write "${XKIT_DIR}/benchmark-${want}.json" || return 1
-  [ "$quiet" = --quiet ] || { ok "Полный каскад: RTT ${rtt} ms, 8 MiB за ${ms} ms, ~${speed} Mbps (не DPI test)"; printf '%s\n' "$result"; }
+  [ "$quiet" = --quiet ] || { ok "Полный каскад: RTT ${rtt} ms, ${bytes} байт за ${ms} ms, ~${speed} Mbps (не DPI test)"; printf '%s\n' "$result"; }
 }
 
 node_profile_survey() {
@@ -11817,7 +11933,10 @@ node_profile_survey() {
   node_profile_switch "$want" "${choices[$((choice-1))]}"
 }
 
-node_profile_bench_cleanup() { node_ssh "$1" "p=\$(cat /run/xkit-node-bench.pid 2>/dev/null || true); case \"\$p\" in ''|*[!0-9]*) ;; *) kill \"\$p\" 2>/dev/null || true ;; esac; rm -rf /run/xkit-node-bench /run/xkit-node-bench.pid" >/dev/null 2>&1 || true; }
+node_profile_bench_cleanup() { # v7.7.3: убираем bench-сервер и каталог (nginx не трогаем)
+  # kill по pid-файлу, НЕ pkill -f: паттерн 'http.server.*xkit-bench' матчит и
+  # собственную командную строку bash-процесса -> pkill убивал его до rm -rf.
+  node_ssh "$1" "for f in /run/xkit-bench.pid /run/xkit-node-bench.pid; do p=\$(cat \"\$f\" 2>/dev/null); case \"\$p\" in ''|*[!0-9]*) ;; *) kill \"\$p\" 2>/dev/null || true ;; esac; done; rm -rf /run/xkit-bench /run/xkit-bench.pid /run/xkit-bench-echo.py /run/xkit-bench-echo.log /run/xkit-node-bench /run/xkit-node-bench.pid" >/dev/null 2>&1 || true; }
 
 node_probe_merge() { # stdin=template; local-port remote-port active-tag
   # FIX (аудит): было `python3 - "$@" <<'PY'` — heredoc занимал stdin, из-за чего
@@ -11826,8 +11945,12 @@ node_probe_merge() { # stdin=template; local-port remote-port active-tag
   python3 -c '
 import json,sys
 c=json.load(sys.stdin); lp=int(sys.argv[1]); rp=int(sys.argv[2]); tag=sys.argv[3]
-c.setdefault("inbounds",[]).append({"listen":"127.0.0.1","port":lp,"protocol":"dokodemo-door","tag":"xkit-profile-probe","settings":{"address":"127.0.0.1","port":rp,"network":"tcp"}})
+# v7.7.3: вычищаем прежние probe-хвосты (накапливались при упавших benchmark-ах,
+# revert не выполнялся если set падал) — иначе шаблон мастера раздувается дублями.
+c["inbounds"]=[i for i in c.get("inbounds",[]) if i.get("tag")!="xkit-profile-probe"]
 r=c.setdefault("routing",{}).setdefault("rules",[])
+r[:]=[x for x in r if x.get("inboundTag")!=["xkit-profile-probe"]]
+c["inbounds"].append({"listen":"127.0.0.1","port":lp,"protocol":"dokodemo-door","tag":"xkit-profile-probe","settings":{"address":"127.0.0.1","port":rp,"network":"tcp"}})
 r.insert(0,{"type":"field","inboundTag":["xkit-profile-probe"],"outboundTag":tag})
 print(json.dumps(c,separators=(",",":")))
 ' "$@"
