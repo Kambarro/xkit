@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.7.4"
+XKIT_VERSION="7.7.5"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -744,7 +744,7 @@ certbot_upgrade() {
   local venv="${XKIT_CERTBOT_VENV:-/opt/certbot-venv}"
   local bin="${XKIT_CERTBOT_BIN:-/usr/local/bin/certbot}"
   log "Ставлю certbot в $venv через pip..."
-  apt-get install -y -qq python3-venv python3-pip >/dev/null 2>&1 || true
+  apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3-venv python3-pip >/dev/null 2>&1 || true
   python3 -m venv "$venv" 2>/dev/null || return 1
   "$venv/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
   local spec=""
@@ -4466,8 +4466,8 @@ xkit_install_body() {
   with_spinner "apt-get update..." apt-get update -qq || warn "apt-get update вернул ошибку — продолжаю"
   security_updates_hint
   with_spinner "Установка пакетов..." env DEBIAN_FRONTEND=noninteractive \
-    apt-get install -y -qq nginx curl openssl jq sqlite3 ufw cron python3 \
-    python3-venv python3-pip \
+    apt-get -o DPkg::Lock::Timeout=300 install -y -qq nginx curl openssl jq sqlite3 ufw cron python3 \
+    python3-venv python3-pip sshpass \
     || die "Не удалось установить пакеты — подробности в $XKIT_LOG"
   # v7.2.4 (дискуссия с оператором «нельзя ли сразу актуальный»): certbot —
   # ОДНИМ шагом, сразу актуальный в venv; схема «сначала apt 2.9, потом
@@ -4482,7 +4482,7 @@ xkit_install_body() {
   else
     warn "pip/venv не удался (PyPI недоступен?) — ставлю certbot из репозитория"
     with_spinner "certbot из репозитория..." env DEBIAN_FRONTEND=noninteractive \
-      apt-get install -y -qq certbot || die "certbot не установлен — подробности в $XKIT_LOG"
+      apt-get -o DPkg::Lock::Timeout=300 install -y -qq certbot || die "certbot не установлен — подробности в $XKIT_LOG"
     warn "certbot $(certbot_version) из репозитория: IP-сертификаты недоступны (нужен >= ${CERTBOT_MIN_IP})"
   fi
 
@@ -5322,9 +5322,11 @@ node_ensure_sshpass() {
   command -v apt-get >/dev/null 2>&1 \
     || { err "sshpass не найден, а apt-get отсутствует — установите пакет sshpass вручную"; return 1; }
   warn "sshpass не найден — устанавливаю (apt-get install -y sshpass)..."
-  apt-get install -y -qq sshpass >/dev/null 2>&1 || {
+  # v7.7.5: DPkg::Lock::Timeout — на чистом сервере unattended-upgrades держит
+  # dpkg-лок минутами; без ожидания установка падала сразу (живой кейс 7.7.4)
+  apt-get -o DPkg::Lock::Timeout=300 install -y -qq sshpass >/dev/null 2>&1 || {
     apt-get update -qq >/dev/null 2>&1 || true
-    apt-get install -y -qq sshpass >/dev/null 2>&1 || true
+    apt-get -o DPkg::Lock::Timeout=300 install -y -qq sshpass >/dev/null 2>&1 || true
   }
   if command -v sshpass >/dev/null 2>&1; then
     ok "sshpass установлен" >&2
@@ -5998,7 +6000,7 @@ nodes_restore_reconnect() {
 
 node_add() {
   require_root
-  command -v ssh >/dev/null 2>&1 || apt-get install -y -qq openssh-client >/dev/null 2>&1
+  command -v ssh >/dev/null 2>&1 || apt-get -o DPkg::Lock::Timeout=300 install -y -qq openssh-client >/dev/null 2>&1
   load_xkit_env || die "Сначала установка (пункт 1)"
   kit_session || return 1
 
@@ -6138,7 +6140,7 @@ export DEBIAN_FRONTEND=noninteractive
 # самоподписанного серта в x-ui.db молча пропускалась и панель оставалась на HTTP
 miss=""
 for b in curl sqlite3; do command -v "$b" >/dev/null 2>&1 || miss="$miss $b"; done
-[ -z "$miss" ] || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq $miss >/dev/null 2>&1; }
+[ -z "$miss" ] || { apt-get update -qq >/dev/null 2>&1 || true; apt-get -o DPkg::Lock::Timeout=300 install -y -qq $miss >/dev/null 2>&1; }
 if ! command -v x-ui >/dev/null 2>&1; then
   DL="$(mktemp)"
   curl -fsSL "${XUI_URL:?}" -o "$DL" \
@@ -6951,8 +6953,8 @@ node_hide_panel() { # $1 rec -> stdout: обновлённый rec; rc1 = не �
   node_ssh "$rec" "env NPORT='${nport}' NHOST='${nhost}' XKIT_CRT='${crt}' XKIT_KEY='${key}' PB64='${pb64}' bash -s" >&2 <<'EOS' || { err "Панель ноды не спряталась за nginx"; return 1; }
 set -eu
 : "${NPORT:?}"; : "${NHOST:?}"; : "${XKIT_CRT:?}"; : "${XKIT_KEY:?}"; : "${PB64:?}"
-command -v nginx >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq nginx >/dev/null 2>&1; }
-command -v sqlite3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq sqlite3 >/dev/null 2>&1; }
+command -v nginx >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get -o DPkg::Lock::Timeout=300 install -y -qq nginx >/dev/null 2>&1; }
+command -v sqlite3 >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get -o DPkg::Lock::Timeout=300 install -y -qq sqlite3 >/dev/null 2>&1; }
 command -v python3 >/dev/null 2>&1 || { echo "ERR: python3 нужен для правки nginx"; exit 1; }
 # 0. бэкап xkit.conf до хирургии (откат при провале nginx -t)
 if [ -f /etc/nginx/sites-available/xkit.conf ]; then
@@ -12174,7 +12176,7 @@ test -d /var/www/camo
 ! ss -ltn | grep -Eq ':(8080|8081|2398|8888) '
 W=/var/tmp/xkit-tproxy-install; rm -rf "\$W"; mkdir -p "\$W"; chmod 700 "\$W"
 trap 'systemctl disable --now tproxy-server mtproxy mtproxy-config-refresh.timer refresh-mtproxy-config.timer tproxy-firewall >/dev/null 2>&1 || true; rm -rf /etc/tproxy-server /etc/mtproxy "\$W"' ERR
-export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get install -y -qq golang-go git nftables >/dev/null
+export DEBIAN_FRONTEND=noninteractive; apt-get update -qq; apt-get -o DPkg::Lock::Timeout=300 install -y -qq golang-go git nftables >/dev/null
 curl -fsSL --proto '=https' --proto-redir '=https' 'https://github.com/telegramdesktop/tproxy-server/archive/${commit}.tar.gz' -o "\$W/src.tgz"
 printf '%s  %s\n' '${sha}' "\$W/src.tgz" | sha256sum -c -
 tar -xzf "\$W/src.tgz" -C "\$W" --strip-components=1
@@ -12533,7 +12535,7 @@ case "\$MODE" in
     fi
     if ! command -v certbot >/dev/null 2>&1 || ! certbot --version 2>/dev/null | grep -qE '(3\.[9-9]|[4-9]|[1-9][0-9])'; then
       echo '[INFO] Ставлю certbot (venv) на ноду...'
-      apt-get install -y -qq python3-venv python3-pip >/dev/null 2>&1 || true
+      apt-get -o DPkg::Lock::Timeout=300 install -y -qq python3-venv python3-pip >/dev/null 2>&1 || true
       python3 -m venv /opt/certbot-venv
       /opt/certbot-venv/bin/pip install -q --upgrade pip >/dev/null 2>&1 || true
       /opt/certbot-venv/bin/pip install -q certbot >/dev/null 2>&1
@@ -12984,7 +12986,7 @@ node_camo_deploy_one() { # $1 имя, [$2 домен|""], [$3 force]
   log "Доставка camo на ноду $nname (nginx + сайт, stdin, sha256-сверка)..."
   node_ssh "$rec" 'bash -s' <<EOF || { err "Нода не развернула camo"; return 1; }
 set -e
-command -v nginx >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get install -y -qq nginx >/dev/null 2>&1; }
+command -v nginx >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get -o DPkg::Lock::Timeout=300 install -y -qq nginx >/dev/null 2>&1; }
 printf '%s' '$payload' | base64 -d | sha256sum | awk '{print \$1}' | grep -qx '$htar' || { echo 'ERR: camo payload sha256 не сошёлся'; exit 1; }
 s="\$(mktemp -d /tmp/.xkit-camo-node.XXXXXX)"
 printf '%s' '$payload' | base64 -d | tar -xzf - -C "\$s"
