@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.7.3"
+XKIT_VERSION="7.7.4"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -826,7 +826,7 @@ issue_cert_le_domain() {
   mapfile -t extra < <(le_email_args "$email")
   log "Останавливаю nginx для standalone-выпуска (порт 80)..."
   systemctl stop nginx 2>/dev/null || true
-  certbot certonly --standalone -d "$d" --non-interactive --agree-tos "${extra[@]}" || rc=$?
+  certbot certonly -q --standalone -d "$d" --non-interactive --agree-tos "${extra[@]}" || rc=$?
   systemctl start nginx 2>/dev/null || true
   if [ $rc -ne 0 ]; then
     err "Certbot не смог выпустить сертификат (nginx снова запущен). Проверьте A-запись и порт 80."
@@ -854,7 +854,7 @@ issue_cert_le_ip() {
   mapfile -t extra < <(le_email_args "$email")
   log "Останавливаю nginx для standalone-выпуска (порт 80)..."
   systemctl stop nginx 2>/dev/null || true
-  certbot certonly --standalone --ip-address "$ip" --preferred-profile shortlived \
+  certbot certonly -q --standalone --ip-address "$ip" --preferred-profile shortlived \
     --non-interactive --agree-tos "${extra[@]}" || rc=$?
   systemctl start nginx 2>/dev/null || true
   if [ $rc -ne 0 ]; then
@@ -4586,11 +4586,8 @@ xkit_install_body() {
   ok "Панель:  https://${XKIT_HOST}${PANEL_WBP}"
   [ -n "$PANEL_USER" ] && ok "Логин:   ${PANEL_USER}   Пароль: ${PANEL_PASS}"
   ok "Креды также в ${XUI_RESULT} (chmod 600)"
-  echo ""
-  log "Дальше:"
-  log "  1) Зайдите в панель, создайте инбаунд: Listen IP = 127.0.0.1, порт любой"
-  log "  2) Введите xkit -> пункт 2 — он сам всё пробросит за nginx и сделает подписки"
-  log "  3) Проверка: xkit -> пункт 7 (жизнеспособность и «что светится»)"
+  # v7.7.4: блок «Дальше: 1/2/3» убран — он дублировал меню «Что дальше?» ниже
+  # и сбивал с толку (инбаунд создавать вручную не нужно — автопроброс сам).
   [ "$CERT_MODE" = "3" ] && warn "IP-серт живёт 6 дней — продление настроено (systemd-таймер + hooks)"
   [ "$CERT_MODE" = "4" ] && warn "Самоподписанный серт: на клиентах allowInsecure=true"
   [ "$CERT_MODE" = "0" ] && ok "Сертификат восстановлен из бэкапа/прошлой установки — перевыпуск не потребовался"
@@ -5414,11 +5411,15 @@ node_ssh_host_key_refresh() { # $1 host, $2 port, $3 known_hosts
 # отпечаток публичного ключа сертификата (пин, как SSH TOFU): защита panel-API
 # ноды от MITM. Снимается при добавлении ноды и проверяется curl при каждом вызове
 cert_pin() { # $1 host, $2 port -> base64 sha256 публичного ключа (или пусто)
-  echo | timeout 8 openssl s_client -connect "$1:$2" -servername "$1" 2>/dev/null \
-    | openssl x509 -pubkey -noout 2>/dev/null \
-    | openssl pkey -pubin -outform DER 2>/dev/null \
-    | openssl dgst -sha256 -binary 2>/dev/null \
-    | base64 -w0 2>/dev/null
+  # v7.7.4: без этой проверки недоступный порт давал base64(sha256("")) =
+  # «47DEQpj8...» — валидный на вид пин ПУСТОГО ключа, который потом молча
+  # ломал каждый API-вызов. Теперь: нет серта от s_client -> пусто (rc=1).
+  local pem
+  pem="$(echo | timeout 8 openssl s_client -connect "$1:$2" -servername "$1" 2>/dev/null \
+    | openssl x509 -pubkey -noout 2>/dev/null)"
+  [ -n "$pem" ] || return 1
+  printf '%s\n' "$pem" | openssl pkey -pubin -outform DER 2>/dev/null \
+    | openssl dgst -sha256 -binary 2>/dev/null | base64 -w0 2>/dev/null
 }
 
 # v7.2.9: CSRF-токен сессии панели ноды (заполняет node_csrf_fetch). 3X-UI v3+
@@ -6446,15 +6447,8 @@ EOS
     warn "Выполните: xkit (меню) -> пункт 2 (автопроброс), затем НОДЫ -> health"
   fi
   ok "Туннель: мастер -> ${nhost}:${tport} (VLESS+Reality, SNI ${nsni})"
-  if [ "$node_ufw" = "1" ]; then
-    if [ -n "$myip" ]; then
-      ok "Панель ноды: ${psch}://${nhost}:${np_port}${nbase} (UFW: только с IP мастера)"
-    else
-      ok "Панель ноды: ${psch}://${nhost}:${np_port}${nbase} (UFW: внешний доступ закрыт)"
-    fi
-  else
-    warn "Панель ноды: ${psch}://${nhost}:${np_port}${nbase} (UFW не управляется XKIT)"
-  fi
+  # v7.7.4: URL панели ноды показывается ОДИН раз — в реквизитах ниже (раньше
+  # дублировался здесь с UFW-статусом, который к маскировке уже не относится).
   ok "Стратегия: ${XKIT_BAL_STRATEGY:-leastLoad} (сменить: Ноды -> стратегия)"
   # (7.4.0): реквизиты панели ноды показываем в конце установки — пользователь
   # должен видеть логин/пароль один раз глазами, не выковыривая их из реестра
@@ -6981,7 +6975,15 @@ mkdir -p /var/www/html /var/www/camo
 [ -f /var/www/camo/index.html ] || printf '<!doctype html><html><head><title>Welcome</title></head><body><h1>Welcome!</h1><p>This server is up and running.</p></body></html>\n' > /var/www/camo/index.html
 if [ ! -s "$XKIT_CRT" ] || [ ! -s "$XKIT_KEY" ]; then
   openssl ecparam -name prime256v1 -genkey -noout -out "$XKIT_KEY" 2>/dev/null
-  openssl req -new -x509 -key "$XKIT_KEY" -out "$XKIT_CRT" -days 3650 -subj "/CN=${NHOST}" -addext "subjectAltName=DNS:${NHOST},IP:${NHOST}" 2>/dev/null
+  # v7.7.4: SAN по типу хоста — домен НЕЛЬЗЯ класть в IP: (openssl «bad ip address»,
+  # rc=1 -> set -eu ронял весь hide на доменных нодах; ключ оставался без серта).
+  case "$NHOST" in
+    *[!0-9.]*) NSAN="DNS:${NHOST}" ;;                 # домен (есть не-цифра/точка)
+    *)         NSAN="IP:${NHOST}" ;;                  # IPv4
+  esac
+  case "$NHOST" in *:*) NSAN="IP:${NHOST}" ;; esac    # IPv6
+  openssl req -new -x509 -key "$XKIT_KEY" -out "$XKIT_CRT" -days 3650 -subj "/CN=${NHOST}" -addext "subjectAltName=${NSAN}" 2>/dev/null \
+    || { echo "ERR: self-signed серт nginx не создан (openssl rc=$?)"; exit 1; }
   chmod 600 "$XKIT_KEY"; chmod 644 "$XKIT_CRT"
 fi
 # 3. хирургия панельного location в xkit.conf — подписки/маршруты/camo НЕ трогаем
@@ -6997,9 +6999,30 @@ if os.path.exists(conf):
     # установки — два location на разные пути = панель торчит по старому адресу)
     pat = re.compile(r'\n?[ \t]*# --- Панель[^\n]*\n.*?\n[ \t]*\}[ \t]*\n', re.S)
     s = pat.sub('\n', s)
-    # вставить перед последней закрывающей скобкой server-блока :443
-    idx = s.rfind('\n}')
-    s = (s[:idx] + '\n' + pblock + '\n' + s[idx:]) if idx >= 0 else (s + '\n' + pblock + '\n')
+    # v7.7.4: вставляем в server-блок «listen 443», а НЕ перед последней '}' файла —
+    # после блока 8444 (внутренний Reality-сайт) последняя скобка принадлежит ЕМУ,
+    # и панельный location уезжал на 8444 вместо 443 (живой баг: API ноды 404).
+    m = re.search(r'server\s*\{[^{}]*listen\s+443[^{}]*\}', s)
+    if not m:
+        # многострочный server-блок: ищем открывающую скобку блока с listen 443
+        # и его парную закрывающую (с учётом вложенности location)
+        pos = s.find('listen 443')
+        if pos < 0:
+            raise SystemExit('ERR: server-блок listen 443 не найден в xkit.conf')
+        start = s.rfind('server', 0, pos)
+        brace = s.find('{', start)
+        depth = 0; end = -1
+        for i in range(brace, len(s)):
+            if s[i] == '{': depth += 1
+            elif s[i] == '}':
+                depth -= 1
+                if depth == 0: end = i; break
+        if end < 0:
+            raise SystemExit('ERR: не нашёл закрывающую скобку server-блока 443')
+        s = s[:end] + '\n' + pblock + '\n' + s[end:]
+    else:
+        blk = m.group(0)
+        s = s[:m.start()] + blk[:-1] + '\n' + pblock + '\n}' + s[m.end():]
     open(conf, 'w').write(s)
 else:
     # конфига нет (чистая нода) — минимальный camo + панель, без default_server
@@ -7075,7 +7098,7 @@ server {
 NGXEOF
   nginx -t 2>/dev/null && systemctl reload nginx >/dev/null 2>&1 || true
 fi
-echo OK-HIDE
+echo OK-HIDE >&2
 EOS
   local npin; npin="$(cert_pin "$nhost" 443)"
   [ -n "$npin" ] || { err "Не снял пин nginx-серта ноды на 443 — маскировка не подтверждена"; return 1; }
@@ -12392,7 +12415,7 @@ node_cert_issue_wildcard() { # $1 base, [$2 email] -> 0 = live/$base готов
   node_cert_master_plugin || return 1
   mapfile -t extra < <(le_email_args "$email")
   log "Выпускаю сертификат $base + *.$base (dns-01, зона через API)..."
-  certbot certonly --dns-cloudflare \
+  certbot certonly -q --dns-cloudflare \
     --dns-cloudflare-credentials "$(node_cert_cf_ini)" \
     --dns-cloudflare-propagation-seconds "${NODE_CERT_DNS_WAIT:-30}" \
     -d "$base" -d "*.$base" \
@@ -12491,8 +12514,14 @@ C=/etc/x-ui/panel-cert.pem; K=/etc/x-ui/panel-key.pem
 case "\$MODE" in
   self)
     openssl ecparam -name prime256v1 -genkey -noout -out "\$K" 2>/dev/null
+    # v7.7.4: SAN по типу хоста (домен в IP: = openssl «bad ip address»); фолбэк без SAN сохранён
+    case "\$NAME" in
+      *[!0-9.]*) NSAN="DNS:\$NAME" ;;
+      *)         NSAN="IP:\$NAME" ;;
+    esac
+    case "\$NAME" in *:*) NSAN="IP:\$NAME" ;; esac
     openssl req -new -x509 -key "\$K" -out "\$C" -days 825 \
-      -subj "/CN=\$NAME" -addext "subjectAltName=IP:\$NAME" 2>/dev/null \
+      -subj "/CN=\$NAME" -addext "subjectAltName=\$NSAN" 2>/dev/null \
       || openssl req -new -x509 -key "\$K" -out "\$C" -days 825 -subj "/CN=\$NAME" 2>/dev/null
     chmod 600 "\$K"; chmod 644 "\$C"
     ;;
@@ -12511,10 +12540,10 @@ case "\$MODE" in
       ln -sf /opt/certbot-venv/bin/certbot /usr/local/bin/certbot
     fi
     if [ "\$MODE" = "ip" ]; then
-      certbot certonly --standalone --ip-address "\$NAME" --preferred-profile shortlived \
+      certbot certonly -q --standalone --ip-address "\$NAME" --preferred-profile shortlived \
         --register-unsafely-without-email --non-interactive --agree-tos || { systemctl start nginx >/dev/null 2>&1 || true; exit 1; }
     else
-      certbot certonly --standalone -d "\$NAME" \
+      certbot certonly -q --standalone -d "\$NAME" \
         --register-unsafely-without-email --non-interactive --agree-tos || { systemctl start nginx >/dev/null 2>&1 || true; exit 1; }
     fi
     systemctl start nginx >/dev/null 2>&1 || true
@@ -12547,7 +12576,7 @@ if [ "\${XKIT_HIDDEN:-false}" = "true" ] && [ -f /etc/nginx/sites-available/xkit
   printf '#!/bin/sh\ninstall -m 644 "\$RENEWED_LINEAGE/fullchain.pem" /etc/x-ui/panel-cert.pem\ninstall -m 600 "\$RENEWED_LINEAGE/privkey.pem" /etc/x-ui/panel-key.pem\nsystemctl restart x-ui\nnginx -t 2>/dev/null && systemctl reload nginx\n' > /etc/letsencrypt/renewal-hooks/deploy/xkit-panel.sh
   chmod +x /etc/letsencrypt/renewal-hooks/deploy/xkit-panel.sh
 fi
-echo OK-CERT-\$MODE
+echo OK-CERT-\$MODE >&2
 EOF
   return 0
 }
@@ -12640,14 +12669,12 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
   case "$mode" in
     self)
       node_cert_apply_remote "$rec" self "$nname" || return 1
-      ok "Самоподписанный серт ноды обновлён (CN=$nname) — панель перезапущена"
       ;;
     ip)
       is_ip "$nhost" || { err "Хост ноды не IP ('$nhost') — режим ip только для IP-нод"; return 1; }
       certdomain="$nhost"
       node_cert_apply_remote "$rec" ip "$nhost" || return 1
       lineage="$nhost"
-      ok "LE shortlived-сертификат выпущен на ноде ($nhost); продление — таймер certbot на ноде"
       ;;
     domain)
       [ -n "$d" ] || { read -r -p "Домен панели ноды (A -> $nhost): " d || return 1; }
@@ -12658,7 +12685,6 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       certdomain="$d"
       node_cert_apply_remote "$rec" domain "$d" || return 1
       lineage="$d"
-      ok "Сертификат для $d выпущен на ноде; продление — таймер certbot на ноде"
       ;;
     wildcard)
       [ -n "$d" ] || { read -r -p "База wildcard (пример: n1.example.com — сама база + *.база): " d || return 1; }
@@ -12695,7 +12721,6 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       certdomain="$(openssl x509 -in "$cf" -noout -subject -nameopt multiline 2>/dev/null | sed -n 's/.*commonName *= *//p' | head -n1 | tr -d ' ')"
       node_cert_push_files "$rec" "$cf" "$kf" || return 1
       lineage="-"; renew="none"
-      ok "Свой сертификат доставлен и применён панелью ноды; продление — на вашей стороне (обновить: xkit nodes cert $nname own)"
       ;;
     *) err "Режим '$mode' не знаю (self|ip|domain|wildcard|own)"; return 1 ;;
   esac
@@ -12710,9 +12735,9 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       '{mode:$m, domain:$d, lineage:$l, renew:$r}')" --arg p "$tls_probe" \
       'map(if .name==$n then .panel.cert=$c | .panel.tls=true | .panel.pincert=$p else . end)' \
     || { err "Не записал HTTPS, сертификат и pin панели в реестр"; return 1; }
-  ok "Пин сертификата панели обновлён после проверенного TLS-handshake"
+  # v7.7.4: одна итоговая строка вместо двух ok («Пин обновлён» + «Готово»)
   [ -z "$(jq -r '.panel_node_id // empty' <<<"$rec")" ] || node_panel_sync "$nname" || warn "Схему в «Узлах» 3X-UI обновите: xkit nodes panel-sync $nname"
-  ok "Готово: панель ноды $nname на сертификате '$mode' (${certdomain:-CN=$nname})"
+  ok "Панель ноды $nname: сертификат '$mode' (${certdomain:-CN=$nname}), TLS проверен, пин обновлён"
 }
 
 node_cert_show() { # $1 имя|all|пусто
@@ -12794,7 +12819,8 @@ node_camo_seed_for() { # $1 имя ноды -> hex64 (детерминирова
   if [ -z "$ms" ]; then
     ms="$(rand_hex 32)"
     camo_seed_save "$ms" || { err "Не сохраняю seed мастера"; return 1; }
-    warn "Seed мастера не был задан — создан новый (camo regenerate мастера поменяет сайт)"
+    # v7.7.4: это штатная первая генерация, не проблема — INFO вместо WARN
+    log "Seed мастера создан (детерминированный дизайн camo для всех нод)"
   fi
   printf '%s' "$(printf 'xkit-node-camo:v1:%s:%s' "$ms" "$1" | sha256sum | awk '{print $1}')"
 }
@@ -12943,7 +12969,8 @@ node_camo_deploy_one() { # $1 имя, [$2 домен|""], [$3 force]
     if [ -n "$d" ]; then
       ok "Найден wildcard-сертификат ($d) — поднимаю vhost api./dev./login.$d"
     else
-      warn "Wildcard-сертификата нет — камо будет catch-all по IP (+/login); для vhost'ов: xkit nodes cert $nname wildcard"
+      # v7.7.4: catch-all по IP — штатный режим без wildcard, не предупреждение
+      log "Camo: catch-all по IP (+/login); vhost'ы api./dev./login — при wildcard (xkit nodes cert $nname wildcard)"
     fi
   fi
   stage="$(mktemp -d "${TMPDIR:-/tmp}/.xkit-camo.XXXXXX")" || return 1
@@ -12982,7 +13009,7 @@ fi
 nginx -t 2>/dev/null || { echo 'ERR: nginx -t не прошёл'; exit 1; }
 systemctl enable --now nginx >/dev/null 2>&1 || true
 systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
-echo OK-CAMO
+echo OK-CAMO >&2
 EOF
   local cjson
   cjson="$(jq -nc --arg s "$seed" --arg d "$d" --arg t "$(date -u +%Y-%m-%dT%H:%MZ)" '{seed:$s, domain:$d, deployed:$t}')"
@@ -13014,7 +13041,7 @@ rm -f /etc/nginx/sites-enabled/xkit-camo.conf /etc/nginx/sites-available/xkit-ca
 ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default 2>/dev/null || true
 nginx -t 2>/dev/null && systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
 rm -rf /var/www/camo-node
-echo OK-CAMO-OFF
+echo OK-CAMO-OFF >&2
 EOS
   node_cert_reg_set "$want" 'map(if .name==$n then del(.camo) else . end)' \
     || warn "Не убрал .camo из реестра"
