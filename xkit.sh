@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.7.5"
+XKIT_VERSION="7.7.7"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -4591,12 +4591,15 @@ xkit_install_body() {
   [ "$CERT_MODE" = "3" ] && warn "IP-серт живёт 6 дней — продление настроено (systemd-таймер + hooks)"
   [ "$CERT_MODE" = "4" ] && warn "Самоподписанный серт: на клиентах allowInsecure=true"
   [ "$CERT_MODE" = "0" ] && ok "Сертификат восстановлен из бэкапа/прошлой установки — перевыпуск не потребовался"
-  # v7.2.0: рекомендация BBR (не навязываем — одна команда, если ядро позволяет)
+  # v7.7.6: BBR включается АВТОМАТОМ при установке (ядро позволяет) — раньше
+  # только рекомендация, и пользователь видел «BBR не активен» после установки.
+  # Не навязываем на ядрах без модуля; выключение: xkit bbr off.
   if command -v sysctl >/dev/null 2>&1; then
     if bbr_active; then
       ok "BBR активен"
     elif bbr_supported; then
-      log "Рекомендация: включите BBR — xkit bbr on (пропускная способность и latency под нагрузкой)"
+      bbr_on >/dev/null 2>&1 && ok "BBR включён автоматически (xkit bbr off — выключить)" \
+        || log "Рекомендация: включите BBR — xkit bbr on (пропускная способность и latency под нагрузкой)"
     fi
   fi
   echo -e "${GREEN}============================================================${NC}"
@@ -6390,7 +6393,40 @@ fi
 echo "UFW на ноде: правила применены, firewall остаётся активен"
 EOS
   else
-    warn "UFW на ноде неактивен — не включаю его и не меняю правила; ограничьте порты своим firewall"
+    # v7.7.7: неактивный UFW = все порты ноды открыты всем. Предлагаем включить
+    # (сначала allow SSH/80/443/туннель, потом enable — без риска локаута).
+    # Интерактив: подтверждение (дефолт да); XKIT_YES=1: включаем автоматом.
+    local want_enable=0
+    if [ -t 0 ]; then
+      confirm "UFW на ноде неактивен — её порты открыты всем. Включить UFW (SSH ${nport}, 80, 443, туннель ${tport}; остальное закрыть)? [Y/n] " y && want_enable=1
+    elif [ "${XKIT_YES:-0}" = "1" ]; then
+      want_enable=1
+    fi
+    if [ "$want_enable" = "1" ]; then
+      log "Включаю UFW на ноде (сначала разрешаю SSH ${nport}, 80, 443, туннель ${tport})..."
+      node_ssh "$rec" "env MYIP='${myip}' NPORT='${nport}' TP='${tport}' NPP='${np_port}' bash -s" <<'EOS' \
+        && node_ufw=1 || warn "UFW на ноде НЕ включился — включите вручную: ufw allow ${nport}/tcp && ufw allow 80,443/tcp && ufw enable"
+set -u
+: "${NPORT:?}"; : "${TP:?}"; : "${NPP:?}"
+command -v ufw >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get -o DPkg::Lock::Timeout=300 install -y -qq ufw >/dev/null 2>&1; }
+command -v ufw >/dev/null 2>&1 || { echo "ERR: ufw не установился"; exit 1; }
+# allow ДО enable — иначе enable отрежет текущий SSH-вход
+ufw allow "${NPORT}/tcp" comment 'XKIT:node-ssh' || { echo "ERR: правило SSH"; exit 1; }
+ufw allow 80/tcp comment 'XKIT:node-http' || { echo "ERR: правило 80"; exit 1; }
+ufw allow 443/tcp comment 'XKIT:node-https' || { echo "ERR: правило 443"; exit 1; }
+ufw allow "${TP}/tcp" comment 'XKIT:node-tunnel' || { echo "ERR: правило туннеля"; exit 1; }
+if [ -n "${MYIP:-}" ]; then
+  ufw allow from "${MYIP}" to any port "${NPP}" proto tcp comment 'XKIT:node-panel' || { echo "ERR: правило панели"; exit 1; }
+else
+  ufw deny "${NPP}/tcp" comment 'XKIT:node-panel' || { echo "ERR: deny панели"; exit 1; }
+fi
+ufw --force enable >/dev/null || { echo "ERR: ufw enable не прошёл"; exit 1; }
+ufw status | grep -q '^Status: active' || { echo "ERR: ufw не активен после enable"; exit 1; }
+echo "UFW на ноде включён: SSH/80/443/туннель открыты, остальное закрыто"
+EOS
+    else
+      warn "UFW на ноде неактивен — её порты открыты всем; включите: xkit nodes ufw ${nname}"
+    fi
   fi
   if [ "$node_ufw" = "1" ] && [ -z "$myip" ]; then
     warn "Публичный IP мастера не определён — панель ноды (${np_port}/tcp) ЗАКРЫТА в ufw."
@@ -6449,6 +6485,10 @@ EOS
     warn "Выполните: xkit (меню) -> пункт 2 (автопроброс), затем НОДЫ -> health"
   fi
   ok "Туннель: мастер -> ${nhost}:${tport} (VLESS+Reality, SNI ${nsni})"
+  # v7.7.7: напоминание про firewall — если UFW ноды не включён, её порты открыты всем
+  if [ "${node_ufw:-0}" != "1" ]; then
+    warn "UFW на ноде не активен — её порты открыты всем. Включить: xkit nodes ufw ${nname} on"
+  fi
   # v7.7.4: URL панели ноды показывается ОДИН раз — в реквизитах ниже (раньше
   # дублировался здесь с UFW-статусом, который к маскировке уже не относится).
   ok "Стратегия: ${XKIT_BAL_STRATEGY:-leastLoad} (сменить: Ноды -> стратегия)"
@@ -6856,6 +6896,7 @@ nodes_menu() {
     echo "16) Добавить/обновить сервер в «Узлах» 3X-UI (без импорта)"
     echo "17) Спрятать панель сервера за nginx 443 (loopback + секретный путь)"
     echo "18) Версии 3X-UI/Xray на серверах и обновление"
+    echo "19) UFW на сервере: статус / включить (закрыть лишние порты)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -6881,6 +6922,10 @@ nodes_menu() {
           local _un
           read -r -p "Обновить ноду (Enter — отмена, all — все): " _un || _un=""
           [ -z "$_un" ] || nodes_upgrade "$_un" ""
+          pause_enter ;;
+      19) local _uf; read -r -p "Нода (Enter — все): " _uf; node_ufw_one "${_uf:-all}" status
+          local _uo; read -r -p "Включить UFW на ноде (Enter — отмена, all — все): " _uo || _uo=""
+          [ -z "$_uo" ] || node_ufw_one "$_uo" on
           pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
@@ -7156,6 +7201,54 @@ node_hide_one() { # $1 имя|all
     fi
   done < <(jq -c '.[]' <<<"$arr")
   [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes hide <имя|all>)"; return 1; }
+  return "$rc"
+}
+
+# v7.7.7: UFW ноды — показать статус или включить (allow SSH/80/443/туннель ДО enable).
+# node_add предлагает это интерактивно; команда — для уже добавленных нод.
+node_ufw_one() { # $1 имя|all, [$2 = on|status]
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  local want="${1:-}" mode="${2:-status}" arr n rec any=0 rc=0
+  [ -n "$want" ] || { err "xkit nodes ufw <имя|all> [on|status]"; return 1; }
+  arr="$(nodes_load)"
+  [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет"; return 0; }
+  while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    n="$(jq -r '.name' <<<"$rec")"
+    [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
+    any=1
+    local nport tport np_port myip
+    nport="$(jq -r '.ssh_port // 22' <<<"$rec")"
+    tport="$(jq -r '.tunnel.port // 443' <<<"$rec")"
+    np_port="$(jq -r '.panel.port // empty' <<<"$rec")"
+    myip="$(pubip)"; is_ip "$myip" || myip=""
+    if [ "$mode" = "on" ]; then
+      log "${n}: включаю UFW (SSH ${nport}, 80, 443, туннель ${tport})..."
+      node_ssh "$rec" "env MYIP='${myip}' NPORT='${nport}' TP='${tport}' NPP='${np_port}' bash -s" <<'EOS' || { rc=1; continue; }
+set -u
+: "${NPORT:?}"; : "${TP:?}"
+command -v ufw >/dev/null 2>&1 || { apt-get update -qq >/dev/null 2>&1 || true; apt-get -o DPkg::Lock::Timeout=300 install -y -qq ufw >/dev/null 2>&1; }
+command -v ufw >/dev/null 2>&1 || { echo "ERR: ufw не установился"; exit 1; }
+ufw allow "${NPORT}/tcp" comment 'XKIT:node-ssh' || exit 1
+ufw allow 80/tcp comment 'XKIT:node-http' || exit 1
+ufw allow 443/tcp comment 'XKIT:node-https' || exit 1
+ufw allow "${TP}/tcp" comment 'XKIT:node-tunnel' || exit 1
+if [ -n "${NPP:-}" ]; then
+  if [ -n "${MYIP:-}" ]; then ufw allow from "${MYIP}" to any port "${NPP}" proto tcp comment 'XKIT:node-panel' || exit 1
+  else ufw deny "${NPP}/tcp" comment 'XKIT:node-panel' || exit 1; fi
+fi
+ufw --force enable >/dev/null || exit 1
+ufw status | grep -q '^Status: active' || exit 1
+echo "UFW включён"
+EOS
+      ok "${n}: UFW включён (SSH/80/443/туннель открыты, остальное закрыто)"
+    else
+      local st
+      st="$(node_ssh "$rec" "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 || echo 'ufw не установлен'" 2>/dev/null)"
+      printf '%-12s %s\n' "$n" "$st"
+    fi
+  done < <(jq -c '.[]' <<<"$arr")
+  [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes ufw <имя|all> [on|status])"; return 1; }
   return "$rc"
 }
 #=========================== v4.1: ПОЛЬЗОВАТЕЛЬ — СБРОС ТРАФИКА ===============
@@ -9163,6 +9256,12 @@ xkit_menu_json() {
         {title:"Обновить скорость, трафик и нагрузку", desc:"CPU/RAM, скорость и трафик каждого сервера", args:["nodes","metrics"], mode:"exec"},
         {title:"Проверить все способы соединения", desc:"Найти рабочий путь и измерить задержку/скорость", args:["nodes","profile","survey"], mode:"exec"},
         {title:"Сменить способ соединения", desc:"При ошибке оставить прежний вариант", args:["nodes","profile","switch"], mode:"exec"},
+        {title:"Версии 3X-UI/Xray на серверах", desc:"Сравнение с мастером и последним релизом", args:["nodes","versions","all"], mode:"exec"},
+        {title:"Обновить 3X-UI на серверах", desc:"Бэкап, официальный установщик, webListen сохраняется", args:["nodes","upgrade"], mode:"exec"},
+        {title:"Сертификат панели сервера", desc:"Домен / IP / самоподписанный / wildcard / свой", args:["nodes","cert"], mode:"exec"},
+        {title:"Спрятать панель сервера за nginx 443", desc:"Loopback + секретный путь, публичный порт закрыт", args:["nodes","hide"], mode:"exec"},
+        {title:"UFW на сервере (firewall)", desc:"Статус или включить: SSH/80/443/туннель открыты, остальное закрыто", args:["nodes","ufw"], mode:"exec"},
+        {title:"Сайт-прикрытие сервера (camo)", desc:"Сайт и страница входа; снять или перегенерировать", args:["nodes","camo"], mode:"exec"},
         {title:"Сменить IP сервера", desc:"Без переустановки; сначала проверка", args:["nodes","readdress"], mode:"exec"},
         {title:"Удалить сервер", desc:"Снять туннель и убрать из распределения", args:["nodes"], mode:"exec"}
       ]},
@@ -9200,7 +9299,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
 
 Использование:
   xkit                 — полноэкранный TUI (при наличии; иначе классическое меню)
-  xkit --classic       — классическое Bash-меню (6 групп с подменю)
+  xkit --classic (--cli) — классическое Bash-меню (6 групп с подменю)
   xkit protocols       — REALITY/XHTTP/AmneziaWG/Hysteria 2
   xkit protocols list [--json] — санитизированная сводка профилей
   xkit protocols remove — удалить выбранный inbound и обновить nginx/подписки
@@ -9242,6 +9341,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes relogin <имя|all> [none] — обновить API-токен ноды из install-result.env (Bearer вместо пароля)
   xkit nodes panel-sync <имя|all> — добавить/обновить «Узлы» 3X-UI без импорта инбаундов
   xkit nodes hide <имя|all> — спрятать панель ноды за nginx 443 (loopback + секретный путь)
+  xkit nodes ufw <имя|all> [on|status] — UFW ноды: статус / включить (SSH/80/443/туннель, остальное закрыть)
   xkit nodes versions <имя|all> — версии 3X-UI/Xray на нодах (vs мастер и последний релиз)
   xkit nodes upgrade <имя|all> [vX.Y.Z] — обновить 3X-UI на нодах (бэкап + проверка панели)
   xkit nodes cert <имя|all> [self|ip|domain|wildcard] [домен] — сертификат панели ноды (wildcard выпускает мастер по dns-01)
@@ -9314,7 +9414,7 @@ xkit_main_impl() {
   case "${1:-menu}" in
     menu|"") shift; if [ "${1:-}" = "--json" ]; then xkit_menu_json; exit 0; fi
              if xkit_tui_run; then exit 0; fi; xkit_load_menu || exit 1; menu_loop ;;
-    --classic|classic) xkit_load_menu || exit 1; menu_loop ;;
+    --classic|classic|--cli|cli) xkit_load_menu || exit 1; menu_loop ;;
     protocols|proto) shift; require_root; xkit_protocols_load || exit 1; protocols_main "$@" ;;
     snapshot) xkit_snapshot ;;
     --fn) shift; require_root
@@ -9362,6 +9462,7 @@ xkit_main_impl() {
                relogin) shift; node_relogin "${1:-all}" "${2:-}" ;;
                panel-sync) shift; node_panel_sync "${1:-}" ;;
                hide) shift; node_hide_one "${1:-}" ;;
+               ufw) shift; node_ufw_one "${1:-}" "${2:-}" ;;
                versions) shift; nodes_versions "${1:-all}" ;;
                upgrade) shift; nodes_upgrade "${1:-}" "${2:-}" ;;
                cert) shift; node_cert_dispatch "$@" ;;
@@ -11770,6 +11871,15 @@ node_profile_switch() {
   node_login "$rec" "$ck" || { rm -f "$ck"; return 1; }
   list="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck")"; oldport="$(jq -r '.tunnel.port' <<<"$rec")"
   oldib="$(jq -c --argjson p "$oldport" '[.obj[]|select(.port==$p)][0]//empty' <<<"$list")"; [ -n "$oldib" ] || { rm -f "$ck"; err "Старый inbound не найден — switch отменён"; return 1; }
+  # v7.7.6: идемпотентная очистка сирот — прежние candidate-inbound этой ноды
+  # (remark xkit-tunnel-<имя>, порт != текущего). Если прошлый probe/switch не
+  # удалил candidate (сбой del, прерывание), они копились с клиентами при каждой
+  # проверке. Удаляем ДО создания нового — список не растёт.
+  local orphan oid
+  while IFS= read -r oid; do
+    [ -n "$oid" ] || continue
+    node_api "$rec" "panel/api/inbounds/del/$oid" POST "" "$ck" >/dev/null 2>&1 || true
+  done < <(jq -r --arg r "xkit-tunnel-$want" --argjson p "$oldport" '.obj[]?|select(.remark==$r and .port!=$p)|.id' <<<"$list")
   [ "$profile" = hysteria2 ] && proto=udp
   port="$(node_profile_remote_port "$rec" "$proto" 443)" || { rm -f "$ck"; return 1; }
   is_port "$port" || { rm -f "$ck"; err "Не удалось выделить candidate port"; return 1; }
@@ -12679,7 +12789,9 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       lineage="$nhost"
       ;;
     domain)
-      [ -n "$d" ] || { read -r -p "Домен панели ноды (A -> $nhost): " d || return 1; }
+      # v7.7.6: Enter (и EOF) на промпте = домен ноды — он уже в подсказке;
+      # раньше пустой ввод давал «'' не похож на домен» и серт не ставился
+      [ -n "$d" ] || { read -r -p "Домен панели ноды [${nhost}]: " d || true; d="${d:-$nhost}"; }
       is_domain "$d" || { err "'$d' не похож на домен"; return 1; }
       local aip; aip="$(node_cert_a_record "$d")"
       [ -n "$aip" ] || { err "A-запись $d не нашлась — выпуск отменён (пропишите и повторите)"; return 1; }
@@ -13002,6 +13114,32 @@ $(node_camo_nginx_conf "$d" "$portal")
 NGINXEOF
 ln -sf /etc/nginx/sites-available/xkit-camo.conf /etc/nginx/sites-enabled/xkit-camo.conf
 rm -f /etc/nginx/sites-enabled/default
+# v7.7.6: camo-сайт и на :443 (xkit.conf от hide оставлял root=/var/www/camo —
+# Welcome-заглушку; пользователь видел «обычную страничку nginx» вместо camo).
+# Меняем root только в server-блоке listen 443, панельный location не трогаем.
+if [ -f /etc/nginx/sites-available/xkit.conf ]; then
+  python3 - <<'PYCAMO'
+import re
+p = "/etc/nginx/sites-available/xkit.conf"
+s = open(p).read()
+pos = s.find("listen 443")
+if pos >= 0:
+    start = s.rfind("server", 0, pos)
+    brace = s.find("{", start)
+    depth = 0; end = -1
+    for i in range(brace, len(s)):
+        if s[i] == "{": depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0: end = i; break
+    if end > 0:
+        blk = s[brace:end]
+        blk2 = re.sub(r"root\s+/var/www/camo\s*;", "root /var/www/camo-node;", blk)
+        if blk2 != blk:
+            s = s[:brace] + blk2 + s[end:]
+            open(p, "w").write(s)
+PYCAMO
+fi
 # renewal-hooks: nginx занял 80 — certbot renew (standalone) должен уметь его освободить
 if [ -d /etc/letsencrypt/renewal-hooks ] || mkdir -p /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post; then
   printf '#!/bin/sh\nsystemctl stop nginx >/dev/null 2>&1 || true\n' > /etc/letsencrypt/renewal-hooks/pre/xkit-camo-nginx.sh
