@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.0.0"
+XKIT_VERSION="8.0.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -13290,7 +13290,7 @@ _tg_curl_via() { # $1 transport-json, $2 method, $3 data -> stdout ответ; r
   out="$({ printf 'request = "POST"\nurl = "https://api.telegram.org/bot%s/%s"\n' "$token" "$method"
     [ -n "$data" ] && printf 'data = "%s"\n' "$data"
     true
-  } | curl -sf --max-time 8 ${px[@]+"${px[@]}"} -K - 2>/dev/null)"
+  } | curl -sf --connect-timeout 3 --max-time 8 ${px[@]+"${px[@]}"} -K - 2>/dev/null)"
   rc=$?
   printf '%s' "$out"
   return $rc
@@ -13319,19 +13319,36 @@ tg_transport_check_all() {
   printf '%s' "$arr" | tg_transports_save
 }
 
-# --- единый tg_api: пробует транспорты по порядку (рабочие первыми) ---
+# --- единый tg_api: рабочие транспорты ПЕРВЫМИ (РФ-мастер: direct заблокирован,
+# не тратим таймаут на каждый запрос), direct — запасной, статусы запоминаются ---
 # $1 method, $2 data -> stdout ответ первой успешной попытки; rc1 если все упали
+tg_transport_mark() { # $1 key (node|url), $2 status
+  local key="$1" st="$2" now
+  now="$(date +%s)"
+  tg_transports_load | jq -c --arg k "$key" --arg s "$st" --argjson t "$now" \
+    'map(if (.node//.url)==$k then .status=$s | .checked=$t else . end)' | tg_transports_save
+}
 tg_api() {
-  local method="$1" data="${2:-}" arr tr i n resp
-  # 1) напрямую (если не РФ — сработает)
-  resp="$(_tg_curl_via '{"type":"direct"}' "$method" "$data")" && { printf '%s' "$resp"; return 0; }
-  # 2) транспорты из реестра (рабочие первыми)
+  local method="$1" data="${2:-}" arr tr i n st key resp
   arr="$(tg_transports_load)"
   arr="$(jq -c 'sort_by(if .status=="ok" then 0 elif .status=="unknown" then 1 else 2 end)' <<<"$arr")"
   n="$(jq 'length' <<<"$arr")"
+  # 1) транспорты со статусом ok — быстрый путь (через ноды)
   for ((i=0; i<n; i++)); do
     tr="$(jq -c ".[$i]" <<<"$arr")"
+    st="$(jq -r '.status' <<<"$tr")"; [ "$st" = "ok" ] || break
     resp="$(_tg_curl_via "$tr" "$method" "$data")" && { printf '%s' "$resp"; return 0; }
+    key="$(jq -r '.node//.url' <<<"$tr")"; tg_transport_mark "$key" dead
+  done
+  # 2) direct (не-РФ мастер; на РФ упадёт быстро — 4с)
+  resp="$(_tg_curl_via '{"type":"direct"}' "$method" "$data")" && { printf '%s' "$resp"; return 0; }
+  # 3) остальные транспорты (unknown/dead) — вдруг ожили
+  for ((i=0; i<n; i++)); do
+    tr="$(jq -c ".[$i]" <<<"$arr")"
+    st="$(jq -r '.status' <<<"$tr")"; [ "$st" = "ok" ] && continue
+    resp="$(_tg_curl_via "$tr" "$method" "$data")" && {
+      key="$(jq -r '.node//.url' <<<"$tr")"; tg_transport_mark "$key" ok
+      printf '%s' "$resp"; return 0; }
   done
   return 1
 }
@@ -13618,9 +13635,9 @@ tg_bot_handle_callback() { # $1 callback-json
     m:status) tg_bot_status "$cid" ;;
     m:expiry) tg_bot_expiry "$cid" ;;
     m:service) tg_bot_service_menu "$cid" ;;
-    m:transport) tg_transport_check_all >/dev/null 2>&1; tg_bot_reply "$cid" "$(printf '🔀 TG транспорты:\n%s' "$(tg_transports_load | jq -r '.[]|"\(.type) \(.node//.url) — \(.status)"')")" "$(tg_bot_main_menu)" ;;
-    u:*) tg_bot_user_card "$cid" "${data#u:}" ;;
+    m:transport) tg_bot_reply "$cid" "$(printf '🔀 TG транспорты (статусы обновляются при проверке):\n%s' "$(tg_transports_load | jq -r '.[]|"\(.type) \(.node//.url) — \(.status)"')")" "$(tg_bot_main_menu)" ;;
     u:add) tg_bot_reply "$cid" "Создать: /adduser <email> [дней] [ГБ]" ;;
+    u:*) tg_bot_user_card "$cid" "${data#u:}" ;;
     n:*) tg_bot_node_card "$cid" "${data#n:}" ;;
     sub:*) tg_bot_user_sub "$cid" "${data#sub:}" ;;
     reset:*) tg_bot_confirm "$cid" "reset:${data#reset:}" "Сбросить трафик ${data#reset:}" ;;
@@ -13791,6 +13808,10 @@ telegram_bot_once() {
 
 telegram_bot_run() {
   log "XKIT bot v8 запущен (inline-меню); Ctrl-C — остановить"
+  # стартовая проверка транспортов: рабочие помечаются ok -> первый запрос
+  # идёт быстрым путём через ноду, без таймаута direct на РФ-мастере
+  tg_transports_sync_nodes >/dev/null 2>&1 || true
+  tg_transport_check_all >/dev/null 2>&1 || true
   while true; do telegram_bot_once || sleep 5; done
 }
 # стратегия балансировки (прямая установка + apply)
