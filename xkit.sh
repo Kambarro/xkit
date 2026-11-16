@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.0.1"
+XKIT_VERSION="8.0.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -8047,9 +8047,14 @@ telegram_menu() {
          if xkit_tg_send "[XKIT] тест: канал доставки работает"; then ok "Доставлено"; else err "Не доставлено (напрямую и через ноды)"; fi
          pause_enter ;;
       4) telegram_off; pause_enter ;;
-      5) echo " 1) Включить бота (systemd)  2) Выключить  3) Статус  0) Назад"
+      5) echo " 1) Включить бота (systemd)  2) Выключить  3) Статус  4) Перезапустить  0) Назад"
          local b; read -r -p "Выбор: " b
-         case "$b" in 1) telegram_bot_service on ;; 2) telegram_bot_service off ;; 3) telegram_bot_service status ;; esac
+         case "$b" in
+           1) telegram_bot_service on ;;
+           2) telegram_bot_service off ;;
+           3) telegram_bot_service status ;;
+           4) if systemctl restart xkit-telegram-bot >/dev/null 2>&1; then ok "Бот перезапущен"; else err "Не удалось перезапустить (бот не включён?)"; fi ;;
+         esac
          pause_enter ;;
       6) tg_transport_menu ;;
       0) return 0 ;;
@@ -8325,6 +8330,24 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
   # v8.0.0: миграция — снос веб-дашборда (заменён Telegram-ботом). Идемпотентно:
   # cron, nginx-локация, файлы, htpasswd. Метрики нод (nodes_metrics_collect) целы.
   xkit_dash_migrate_remove
+  # v8.0.3: запущенный бот крутит СТАРЫЙ код после замены файла — перезапускаем,
+  # иначе фиксы доставки/меню не применятся до ручного restart.
+  if systemctl is-active xkit-telegram-bot >/dev/null 2>&1; then
+    case "${INVOCATION_ID:-}" in
+      "") # обычный CLI-запуск — рестарт сразу
+        if systemctl restart xkit-telegram-bot >/dev/null 2>&1; then
+          ok "Telegram-бот перезапущен (новый код v${nv})"
+        else
+          warn "Не удалось перезапустить бота — выполните: systemctl restart xkit-telegram-bot"
+        fi ;;
+      *) # update запущен кнопкой бота (systemd-run): мгновенный рестарт убил бы
+         # этот же юнит до отчёта — откладываем на 15с отдельным transient-юнитом
+        systemd-run --unit="xkit-bot-restart-$(date +%s)" --on-active=15 \
+          /bin/systemctl restart xkit-telegram-bot >/dev/null 2>&1 \
+          && ok "Telegram-бот будет перезапущен через 15с (новый код v${nv})" \
+          || warn "Не удалось запланировать рестарт бота — выполните: systemctl restart xkit-telegram-bot" ;;
+    esac
+  fi
   ok "Обновлено: v${XKIT_VERSION} -> v${nv} ($XKIT_BIN); резервная копия: ${XKIT_BIN}.bak"
   ok "Конфиг nginx, состояние и подписки не тронуты"
   return 0
@@ -8674,7 +8697,7 @@ xkit_menu_json() {
         {title:"Проверка сервера и доступности", desc:"Службы, порты, nginx и панель", args:["health"], mode:"exec"},
         {title:"Проверить подключение как клиент", desc:"Реальный клиент по нашим ссылкам", args:["health","deep"], mode:"exec"},
         {title:"Telegram: бот управления + уведомления", desc:"Бот v8 (inline-меню), транспорты через ноды, алерты", args:["telegram"], mode:"exec"},
-        {title:"Telegram-бот: включить / выключить", desc:"systemd-сервис бота управления", args:["telegram","bot","status"], mode:"exec"},
+        {title:"Telegram-бот: включить / выключить / перезапустить", desc:"systemd-сервис бота управления", args:["telegram","bot","status"], mode:"exec"},
         {title:"Транспорты Telegram", desc:"Через ноды (ssh -D) / прокси: список, проверка, добавить", args:["telegram","transport"], mode:"exec"},
         {title:"Сроки аренды серверов", desc:"Главный и дополнительные серверы", args:["expiry"], mode:"exec"},
         {title:"Данные для доступа", desc:"Пароли только в /root/xkit-info.txt", args:["info"], mode:"exec"}
@@ -8687,7 +8710,9 @@ xkit_menu_json() {
         {title:"Сайт-заглушка", desc:"Состояние или создать заново", args:["camo"], mode:"exec"},
         {title:"Архив для диагностики", desc:"Без секретов", args:["doctor","export"], mode:"exec"},
         {title:"BBR и настройки TCP", desc:"Пропускная способность и задержка", args:["bbr"], mode:"exec"},
-        {title:"Журнал действий", desc:"Последние 50 записей", args:["audit"], mode:"exec"}
+        {title:"Журнал действий", desc:"Последние 50 записей", args:["audit"], mode:"exec"},
+        {title:"Перезапустить всё: 3X-UI / Xray / nginx", desc:"Кратковременный обрыв соединений; после — чек в Telegram", args:["services","restart"], mode:"exec"},
+        {title:"Перезагрузить сервер целиком (reboot)", desc:"Доступ пропадёт на 1-3 мин; после загрузки — чек готовности в Telegram", args:["services","reboot"], mode:"exec"}
       ]},
       {id:"settings", title:"Настройки", items:[
         {title:"Открывать меню при входе по SSH", desc:"Автоматический запуск xkit", args:[], fn:"ssh_hook_toggle", mode:"exec"},
@@ -8924,6 +8949,8 @@ xkit_main_impl() {
                off) bbr_off ;;
                *) die "bbr: status | on | off" ;;
              esac ;;
+    services) shift
+             case "${1:-restart}" in restart) shift; services_restart "$@" ;; reboot) shift; server_reboot "$@" ;; *) err "services restart [--yes] | services reboot [--yes]"; exit 1 ;; esac ;;
     dash)    err "Веб-дашборд удалён в 8.0.0 — управление через Telegram-бота (xkit telegram setup) или CLI/TUI."
              echo "Метрики нод: xkit nodes health · Сроки аренды: xkit expiry · Статус: xkit status"; exit 1 ;;
     expiry)  shift; require_root
@@ -8938,7 +8965,7 @@ xkit_main_impl() {
              case "${1:-menu}" in
                setup) telegram_setup ;;
                bot) shift
-                    case "${1:-status}" in once) telegram_bot_once ;; run) telegram_bot_run ;; on|off|status) telegram_bot_service "${1:-status}" ;; notify) shift; tg_bot_notify_result "${1:-}" "${2:-}" ;; *) err "telegram bot once|run|on|off|status|notify"; exit 1 ;; esac ;;
+                    case "${1:-status}" in once) telegram_bot_once ;; run) telegram_bot_run ;; on|off|status|restart) telegram_bot_service "${1:-status}" ;; notify) shift; tg_bot_notify_result "${1:-}" "${2:-}" ;; check) shift; tg_bot_check_notify "${1:-}" ;; *) err "telegram bot once|run|on|off|status|restart|notify|check"; exit 1 ;; esac ;;
                check) load_xkit_env >/dev/null 2>&1 || true; notify_check ;;
                transport) shift
                     case "${1:-list}" in
@@ -10709,6 +10736,55 @@ EOF
   return 0
 }
 
+# v8.0.3: перезапуск всего стека мастера (3X-UI тянет xray, nginx reload).
+# Кратковременный обрыв клиентских соединений — только по явному запросу/confirm.
+services_restart() { # $1: --yes (без confirm, для бота)
+  require_root
+  load_xkit_env 2>/dev/null || true
+  if [ "${1:-}" != "--yes" ]; then
+    confirm "Перезапустить 3X-UI, Xray и nginx? Клиентские соединения кратковременно оборвутся. [y/N] " n || { log "Отменено"; return 0; }
+  fi
+  local rc=0
+  if systemctl restart x-ui >/dev/null 2>&1; then ok "3X-UI перезапущен (xray подтянется панелью)"; else err "x-ui не перезапустился"; rc=1; fi
+  # xray отдельно через API — если панель ещё не подняла его сама
+  sleep 2
+  if pgrep -x xray >/dev/null 2>&1; then ok "Xray работает"; else xray_restart || { warn "Xray не поднялся — проверьте: xkit health"; rc=1; }; fi
+  if nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx >/dev/null 2>&1 && ok "nginx перезагружен (без обрыва)" || { err "nginx reload не удался"; rc=1; }
+  else
+    warn "nginx -t не проходит — reload пропущен (проверьте конфиг)"
+  fi
+  # бота здесь НЕ рестартим: services_restart может вызываться кнопкой самого
+  # бота (systemd-run юнит убился бы вместе с ним). Рестарт бота — после update
+  # (автоматом) или пунктом меню Telegram -> Бот -> Перезапустить.
+  audit_event services.restart master "$([ $rc = 0 ] && echo ok || echo fail)" 2>/dev/null || true
+  # v8.0.3: после перезапуска — короткий чек в TG («мастер активен»), если бот настроен
+  if [ -n "${XKIT_TG_TOKEN:-}" ] && [ -n "${XKIT_TG_CHAT:-}" ] && declare -F tg_bot_check_notify >/dev/null 2>&1; then
+    tg_bot_check_notify "${XKIT_TG_CHAT}" >/dev/null 2>&1 || true
+  fi
+  return $rc
+}
+
+# v8.0.3: ребут сервера ЦЕЛИКОМ. Только явное подтверждение (typed guard):
+# после reboot доступ к серверу временно пропадёт; если VPS не встанет —
+# восстановление только через консоль провайдера. Бот после загрузки сам
+# поднимется (systemd) и пришлёт чек «мастер активен».
+server_reboot() { # $1: --yes (для бота, confirm уже пройден кнопкой)
+  require_root
+  if [ "${1:-}" != "--yes" ]; then
+    echo "Перезагрузка сервера ЦЕЛИКОМ: все соединения оборвутся, доступ пропадёт на 1-3 минуты."
+    local a
+    read -r -p "Введите REBOOT для подтверждения: " a || { log "Отменено"; return 0; }
+    [ "${a^^}" = "REBOOT" ] || { log "Отменено"; return 0; }
+  fi
+  audit_event server.reboot master ok 2>/dev/null || true
+  if [ -n "${XKIT_TG_TOKEN:-}" ] && [ -n "${XKIT_TG_CHAT:-}" ]; then
+    xkit_tg_send "🔁 Мастер ${XKIT_HOST:-?}: ухожу в перезагрузку. После загрузки пришлю чек готовности." >/dev/null 2>&1 || true
+  fi
+  log "Перезагрузка через 5 секунд..."
+  ( sleep 5; systemctl reboot ) >/dev/null 2>&1 &
+  return 0
+}
 #=========================== XKIT 7: SING-BOX И SUBSCRIPTION UX ===============
 
 singbox_json_gen() { # $1 base64 links file, $2 output JSON; unsupported links skipped
@@ -11097,7 +11173,14 @@ EOF
       require_root; systemctl disable --now xkit-telegram-bot.service >/dev/null 2>&1 || true; rm -f "$unit"; systemctl daemon-reload
       audit_event telegram.bot.off master ok; ok "Бот v8 выключен" ;;
     status) systemctl status xkit-telegram-bot.service --no-pager 2>/dev/null || true ;;
-    *) err "on|off|status"; return 1 ;;
+    restart)
+      require_root
+      if systemctl restart xkit-telegram-bot.service >/dev/null 2>&1; then
+        audit_event telegram.bot.restart master ok; ok "Бот перезапущен"
+      else
+        err "Не удалось перезапустить (бот не включён? xkit telegram bot on)"; return 1
+      fi ;;
+    *) err "on|off|status|restart"; return 1 ;;
   esac
 }
 
@@ -13304,52 +13387,53 @@ tg_transport_check_one() { # $1 transport-json -> 0 рабочий
 
 # проверить все транспорты, обновить status/checked, рабочие в начало
 tg_transport_check_all() {
-  local arr tr i n status now
+  local arr tr i n status now key
   arr="$(tg_transports_load)"; now="$(date +%s)"
   n="$(jq 'length' <<<"$arr")"
   [ "$n" -gt 0 ] || { warn "Транспортов нет (добавьте ноду или прокси)"; return 1; }
   for ((i=0; i<n; i++)); do
     tr="$(jq -c ".[$i]" <<<"$arr")"
     if tg_transport_check_one "$tr"; then status="ok"; else status="dead"; fi
-    arr="$(jq -c --argjson i "$i" --arg s "$status" --argjson t "$now" '.[$i].status=$s | .[$i].checked=$t' <<<"$arr")"
+    key="$(jq -r '.node//.url' <<<"$tr")"
+    tg_transport_mark "$key" "$status"   # под flock: не затереть параллельные отметки бота
     printf '%-12s %-30s %s\n' "$(jq -r '.type' <<<"$tr")" "$(jq -r '.node//.url//"direct"' <<<"$tr")" "$status"
   done
-  # рабочие в начало (ротация: первый рабочий используется)
-  arr="$(jq -c 'sort_by(if .status=="ok" then 0 else 1 end)' <<<"$arr")"
-  printf '%s' "$arr" | tg_transports_save
+  # рабочие в начало (ротация) — под flock, перечитав свежий файл
+  (
+    flock -x 9
+    tg_transports_load | jq -c 'sort_by(if .status=="ok" then 0 else 1 end)' | tg_transports_save
+  ) 9>"${XKIT_TG_TRANSPORTS}.lock"
 }
 
 # --- единый tg_api: рабочие транспорты ПЕРВЫМИ (РФ-мастер: direct заблокирован,
 # не тратим таймаут на каждый запрос), direct — запасной, статусы запоминаются ---
 # $1 method, $2 data -> stdout ответ первой успешной попытки; rc1 если все упали
-tg_transport_mark() { # $1 key (node|url), $2 status
+tg_transport_mark() { # $1 key (node|url), $2 status — атомарно под flock (бот+CLI параллельно)
   local key="$1" st="$2" now
   now="$(date +%s)"
-  tg_transports_load | jq -c --arg k "$key" --arg s "$st" --argjson t "$now" \
-    'map(if (.node//.url)==$k then .status=$s | .checked=$t else . end)' | tg_transports_save
+  (
+    flock -x 9
+    tg_transports_load | jq -c --arg k "$key" --arg s "$st" --argjson t "$now" \
+      'map(if (.node//.url)==$k then .status=$s | .checked=$t else . end)' | tg_transports_save
+  ) 9>"${XKIT_TG_TRANSPORTS}.lock"
 }
 tg_api() {
   local method="$1" data="${2:-}" arr tr i n st key resp
   arr="$(tg_transports_load)"
   arr="$(jq -c 'sort_by(if .status=="ok" then 0 elif .status=="unknown" then 1 else 2 end)' <<<"$arr")"
   n="$(jq 'length' <<<"$arr")"
-  # 1) транспорты со статусом ok — быстрый путь (через ноды)
+  # 1) ok + unknown транспорты (ноды/прокси) — ДО direct: на РФ-мастере direct
+  # заблокирован и каждый запрос к нему = таймаут; unknown пробуем как кандидатов
   for ((i=0; i<n; i++)); do
     tr="$(jq -c ".[$i]" <<<"$arr")"
-    st="$(jq -r '.status' <<<"$tr")"; [ "$st" = "ok" ] || break
-    resp="$(_tg_curl_via "$tr" "$method" "$data")" && { printf '%s' "$resp"; return 0; }
+    st="$(jq -r '.status' <<<"$tr")"; [ "$st" = "dead" ] && continue
+    resp="$(_tg_curl_via "$tr" "$method" "$data")" && {
+      if [ "$st" != "ok" ]; then key="$(jq -r '.node//.url' <<<"$tr")"; tg_transport_mark "$key" ok; fi
+      printf '%s' "$resp"; return 0; }
     key="$(jq -r '.node//.url' <<<"$tr")"; tg_transport_mark "$key" dead
   done
-  # 2) direct (не-РФ мастер; на РФ упадёт быстро — 4с)
+  # 2) direct — только если транспортов нет или все dead (не-РФ мастер)
   resp="$(_tg_curl_via '{"type":"direct"}' "$method" "$data")" && { printf '%s' "$resp"; return 0; }
-  # 3) остальные транспорты (unknown/dead) — вдруг ожили
-  for ((i=0; i<n; i++)); do
-    tr="$(jq -c ".[$i]" <<<"$arr")"
-    st="$(jq -r '.status' <<<"$tr")"; [ "$st" = "ok" ] && continue
-    resp="$(_tg_curl_via "$tr" "$method" "$data")" && {
-      key="$(jq -r '.node//.url' <<<"$tr")"; tg_transport_mark "$key" ok
-      printf '%s' "$resp"; return 0; }
-  done
   return 1
 }
 
@@ -13610,7 +13694,8 @@ tg_bot_service_menu() { # $1 chat
   kb="$(jq -nc '[
     [{text:"💾 Бэкап",callback_data:"s:backup"},{text:"📜 Аудит",callback_data:"s:audit"}],
     [{text:"🩺 Health",callback_data:"s:health"},{text:"🔄 Обновить XKIT",callback_data:"s:update"}],
-    [{text:"⚖️ Стратегия",callback_data:"s:strategy"},{text:"🏠 Меню",callback_data:"m:main"}]
+    [{text:"⚖️ Стратегия",callback_data:"s:strategy"},{text:"🔁 Перезапустить всё",callback_data:"s:restart"}],
+    [{text:"🔄 Ребут сервера",callback_data:"s:reboot"},{text:"🏠 Меню",callback_data:"m:main"}]
   ]' | _tg_kb)"
   tg_bot_reply "$1" "🛠 Обслуживание:" "$kb"
 }
@@ -13658,6 +13743,8 @@ tg_bot_handle_callback() { # $1 callback-json
     s:health) tg_bot_run_long "$cid" "health" "${XKIT_BIN} health" "health" ;;
     s:update) tg_bot_confirm "$cid" "update" "Обновить XKIT" ;;
     s:strategy) tg_bot_strategy_menu "$cid" ;;
+    s:restart) tg_bot_confirm "$cid" "restart" "Перезапустить 3X-UI/Xray/nginx (соединения кратковременно оборвутся)" ;;
+    s:reboot) tg_bot_confirm "$cid" "reboot" "Перезагрузить сервер ЦЕЛИКОМ (доступ пропадёт на 1-3 минуты)" ;;
     sv:*) tg_bot_run_long "$cid" "survey-${data#sv:}" "${XKIT_BIN} nodes profile survey ${data#sv:}" "survey ${data#sv:}" ;;
     sw:*) local _n="${data#sw:}" _prof="${_n#*:}" _node="${_n%%:*}"; tg_bot_confirm "$cid" "switch:${_node}:${_prof}" "Сменить транспорт ${_node} -> ${_prof}" ;;
     cd:*) tg_bot_run_long "$cid" "cert-${data#cd:}" "${XKIT_BIN} nodes cert ${data#cd:} domain" "cert domain ${data#cd:}" ;;
@@ -13684,6 +13771,8 @@ tg_bot_do_confirm() { # $1 chat, $2 action-key
     switch:*) local _rest="${key#switch:}" _node="${_rest%%:*}" _prof="${_rest#*:}"; tg_bot_run_long "$chat" "switch-${_node}" "${XKIT_BIN} nodes profile switch ${_node} ${_prof}" "switch ${_node} -> ${_prof}" ;;
     ufw:*) tg_bot_run_long "$chat" "ufw-${key#ufw:}" "${XKIT_BIN} nodes ufw ${key#ufw:} on" "ufw on ${key#ufw:}" ;;
     backup) tg_bot_run_long "$chat" "backup" "${XKIT_BIN} backup now" "бэкап" ;;
+    restart) tg_bot_run_long "$chat" "restart" "${XKIT_BIN} services restart --yes" "перезапуск стека (чек придёт отдельно)" ;;
+    reboot) tg_bot_run_long "$chat" "reboot" "${XKIT_BIN} services reboot --yes" "ребут сервера (чек придёт после загрузки)" ;;
     update) tg_bot_run_long "$chat" "update" "${XKIT_BIN} update" "обновление XKIT" ;;
     *) tg_bot_reply "$chat" "Действие не распознано" "$(tg_bot_main_menu)" ;;
   esac
@@ -13812,6 +13901,8 @@ telegram_bot_run() {
   # идёт быстрым путём через ноду, без таймаута direct на РФ-мастере
   tg_transports_sync_nodes >/dev/null 2>&1 || true
   tg_transport_check_all >/dev/null 2>&1 || true
+  # v8.0.3: после ребута сервера / рестарта сервиса — короткий чек «мастер активен»
+  tg_bot_check_notify >/dev/null 2>&1 || true
   while true; do telegram_bot_once || sleep 5; done
 }
 # стратегия балансировки (прямая установка + apply)
@@ -13821,6 +13912,32 @@ tg_bot_set_strategy() { # $1 chat, $2 strategy
   XKIT_BAL_STRATEGY="$2"; save_xkit_env
   nodes_apply_template >/dev/null 2>&1
   tg_bot_reply "$1" "⚖️ Стратегия балансировки: $2 (применена)" "$(tg_bot_main_menu)"
+}
+
+# --- короткий чек после перезапуска/ребута: «мастер активен» ---
+# Ждёт поднятия служб (до 30с), шлёт админу короткий статус.
+tg_bot_check_notify() { # $1 chat (необязательно — берётся XKIT_TG_CHAT)
+  local chat="${1:-${XKIT_TG_CHAT:-}}"
+  [ -n "$chat" ] || return 0
+  load_xkit_env >/dev/null 2>&1 || true
+  local i nginx xui xray
+  # подождать пока службы поднимутся (после restart/reboot)
+  for i in $(seq 1 15); do
+    nginx="$(systemctl is-active nginx 2>/dev/null || true)"
+    xui="$(systemctl is-active x-ui 2>/dev/null || true)"
+    xray="$(pgrep -x xray >/dev/null 2>&1 && echo active || echo inactive)"
+    [ "$nginx" = active ] && [ "$xui" = active ] && [ "$xray" = active ] && break
+    sleep 2
+  done
+  local nodes_all nodes_ok mark="✅"
+  nodes_all="$(nodes_load 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+  nodes_ok=0
+  [ -r "$XKIT_NODES_METRICS" ] && nodes_ok="$(jq '[.nodes[]?|select(.status=="ok")]|length' "$XKIT_NODES_METRICS" 2>/dev/null || echo 0)"
+  { [ "$nginx" = active ] && [ "$xui" = active ] && [ "$xray" = active ]; } || mark="⚠️"
+  tg_send_message "$chat" "${mark} Мастер ${XKIT_HOST:-?}: перезапуск завершён
+nginx: ${nginx:-unknown} · 3X-UI: ${xui:-unknown} · Xray: ${xray:-unknown}
+Ноды: ${nodes_ok}/${nodes_all} ok (по последним метрикам)
+XKIT v${XKIT_VERSION} — бот активен"
 }
 #=========================== ДИСПЕТЧЕР (v7.2.5) ================================
 # `main "$@"` — ПОСЛЕДНИЙ модуль сборки (build.sh склеивает src/[0-9][0-9]_*.sh

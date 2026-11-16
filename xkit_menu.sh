@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v8.0.1
+#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v8.0.3
 #
 #  Меню вынесено из xkit.sh в отдельный файл: ядро (API, установка, nginx,
 #  подписки, ноды) не раздувается, а правки меню не трогают xkit.sh.
@@ -182,6 +182,8 @@ menu_service() {
     echo "17) BBR: статус / включить (рекомендация для пропускной способности)"
     echo "18) Настройки TCP: TFO / TCP_NODELAY"
     echo "19) Проверить обновление XKIT"
+    echo "20) Перезапустить всё: 3X-UI / Xray / nginx (+чек в Telegram)"
+    echo "21) Перезагрузить сервер целиком (reboot, +чек после загрузки)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -205,6 +207,8 @@ menu_service() {
       17) menu_bbr; pause_enter ;;
       18) sockopt_cmd; pause_enter ;;
       19) xkit_update_check --force; pause_enter ;;
+      20) services_restart; pause_enter ;;
+      21) server_reboot; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac
