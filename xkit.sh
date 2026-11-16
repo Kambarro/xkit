@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="7.7.7"
+XKIT_VERSION="8.0.0"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -337,13 +337,11 @@ XKIT_ENV="${XKIT_DIR}/xkit.env"
 XKIT_ROUTES="${XKIT_DIR}/routes.tsv"
 XKIT_NODES="${XKIT_DIR}/nodes.json"
 XKIT_EXPIRY="${XKIT_DIR}/expiry.tsv"     # сроки аренды: scope<TAB>id<TAB>date<TAB>note
-XKIT_DASH_DIR="/var/lib/xkit/dash"        # веб-дашборд (index.html + data.json)
 XKIT_NODES_METRICS="${XKIT_NODES_METRICS:-/var/lib/xkit/nodes-metrics.json}" # общий кэш TUI/дашборда
 XKIT_NODES_HISTORY="${XKIT_NODES_HISTORY:-/var/lib/xkit/nodes-history.json}" # sanitized ring buffer, без секретов
 XKIT_NODES_HISTORY_MAX="${XKIT_NODES_HISTORY_MAX:-288}"
 XKIT_NODES_PARALLEL="${XKIT_NODES_PARALLEL:-4}"
 XKIT_NODE_DEADLINE="${XKIT_NODE_DEADLINE:-45}"
-XKIT_DASH_HTPASSWD="/etc/nginx/.xkit-dash.htpasswd"  # Basic Auth дашборда
 XKIT_INFO_FILE="/root/xkit-info.txt"      # сводка-реквизиты (терминал + файл)
 XKIT_NOTIFY_STATE="${XKIT_DIR}/notify.state"  # состояние Telegram-алертов (гистерезис/дедуп)
 XKIT_BIN="/usr/local/bin/xkit"
@@ -1647,13 +1645,7 @@ save_xkit_env() {
       printf 'XKIT_POOL_INBOUND=%q\n' "${XKIT_POOL_INBOUND:-}"
       printf 'XKIT_POOL_TAG=%q\n' "${XKIT_POOL_TAG:-}"
       printf 'XKIT_REPO_URL=%q\n' "${XKIT_REPO_URL:-}"
-      printf 'XKIT_DASH=%q\n' "${XKIT_DASH:-0}"
-      printf 'XKIT_DASH_TOKEN=%q\n' "${XKIT_DASH_TOKEN:-}"
-      printf 'XKIT_DASH_ALLOW=%q\n' "${XKIT_DASH_ALLOW:-}"
-      printf 'XKIT_DASH_AUTH=%q\n' "${XKIT_DASH_AUTH:-1}"
-      printf 'XKIT_DASH_USER=%q\n' "${XKIT_DASH_USER:-}"
-      printf 'XKIT_DASH_PASS=%q\n' "${XKIT_DASH_PASS:-}"
-      printf 'XKIT_TG_TOKEN=%q\n' "${XKIT_TG_TOKEN:-}"
+                              printf 'XKIT_TG_TOKEN=%q\n' "${XKIT_TG_TOKEN:-}"
       printf 'XKIT_TG_CHAT=%q\n' "${XKIT_TG_CHAT:-}"
       printf 'XKIT_TG_PROXY=%q\n' "${XKIT_TG_PROXY:-}"
       printf 'XKIT_TG_ADMINS=%q\n' "${XKIT_TG_ADMINS:-}"
@@ -1677,8 +1669,6 @@ load_xkit_env() {
   XKIT_HOST=""; XKIT_CRT=""; XKIT_KEY=""; XKIT_CERT_MODE=""; XKIT_SUB_TOKEN=""; XKIT_UFW="0"
   XKIT_PANEL_SUB_PORT=""; XKIT_PANEL_SUB_PATH=""; XKIT_REALITY_INTERNAL="0"
   XKIT_BAL_STRATEGY="leastLoad"; XKIT_POOL_INBOUND=""; XKIT_POOL_TAG=""
-  XKIT_DASH="0"; XKIT_DASH_TOKEN=""; XKIT_DASH_ALLOW=""
-  XKIT_DASH_AUTH="1"; XKIT_DASH_USER=""; XKIT_DASH_PASS=""
   XKIT_TG_TOKEN=""; XKIT_TG_CHAT=""; XKIT_TG_PROXY=""; XKIT_TG_ADMINS=""
   XKIT_XUI_API_TOKEN=""   # v7.2.5: API-токен панели (Bearer); read_panel_settings дополнит из install-result.env
   # v7.2.0: политика бэкапов — дефолты ДО чтения xkit.env (env переопределит)
@@ -2363,9 +2353,6 @@ EOF
   generate_subs_block
 
   # --- веб-дашборд (секретный путь, как у панели) ---
-  if [ "${XKIT_DASH:-0}" = "1" ] && [ -n "${XKIT_DASH_TOKEN:-}" ]; then
-    generate_dash_block
-  fi
 
   # --- нативные подписки самой панели (проксируются через nginx на 443) ---
   if [ -n "${XKIT_PANEL_SUB_PORT:-}" ] && [ -n "${XKIT_PANEL_SUB_PATH:-}" ]; then
@@ -4044,9 +4031,6 @@ show_status() {
   echo -e "${GREEN}==== XKIT v${XKIT_VERSION}: ${XKIT_HOST} ====${NC}"
   echo "  Панель:  https://${XKIT_HOST}$(read_panel_settings >/dev/null 2>&1 && echo "${PANEL_WBP}")"
   echo "  Подписки: https://${XKIT_HOST}$(sub_path)<subId>"
-  if [ "${XKIT_DASH:-0}" = "1" ] && [ -n "${XKIT_DASH_TOKEN:-}" ]; then
-    echo "  Дашборд: https://${XKIT_HOST}$(dash_path) (данные: cron каждые 5 мин)"
-  fi
   # v4.5: явный режим — «мастер» это состояние (nodes.json не пуст), а не отдельная установка
   local ncnt; ncnt="$(nodes_load 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
   if [ "$ncnt" -gt 0 ]; then
@@ -4273,7 +4257,7 @@ xkit_uninstall() {
   ok "Cron-задачи xkit удалены"
 
   if [ -e "$XKIT_CONF" ] || [ -L "$XKIT_CONF_LINK" ]; then
-    rm -f "$XKIT_CONF" "$XKIT_CONF_LINK" "$XKIT_DASH_HTPASSWD" 2>/dev/null
+    rm -f "$XKIT_CONF" "$XKIT_CONF_LINK" 2>/dev/null
     if command -v nginx >/dev/null 2>&1; then
       if nginx -t >/dev/null 2>&1; then
         systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true
@@ -4315,11 +4299,11 @@ xkit_uninstall() {
   xkit_awg_route_remove "${AWG_DEV:-}" >/dev/null 2>&1 || true
 
   # файлы состояния: /etc/xkit, подписки, дашборд и стандартная база /var/lib/xkit
-  # (SUBS_DIR/XKIT_DASH_DIR — переменные, удаляем явно; /var/lib/xkit — база по
+  # (SUBS_DIR — переменная, удаляем явно; /var/lib/xkit — база по
   # умолчанию, сносит остатки старых версий, если пути переопределены)
-  rm -rf "$XKIT_DIR" "$SUBS_DIR" "$XKIT_DASH_DIR" /var/lib/xkit 2>/dev/null
+  rm -rf "$XKIT_DIR" "$SUBS_DIR" "${XKIT_DASH_DIR:-/var/lib/xkit/dash}" /var/lib/xkit 2>/dev/null
   rm -f "$XKIT_INFO_FILE" 2>/dev/null
-  ok "Файлы xkit удалены ($XKIT_DIR, $SUBS_DIR, $XKIT_DASH_DIR)"
+  ok "Файлы xkit удалены ($XKIT_DIR, $SUBS_DIR)"
 
   if [ "$full" = "1" ]; then
     systemctl disable --now x-ui >/dev/null 2>&1 || true
@@ -6538,6 +6522,9 @@ EOS
   node_camo_deploy_one "$nname" "" || warn "Camo не развернулся — вернитесь: НОДЫ -> 10 (или xkit nodes camo ${nname})"
   node_panel_sync "$nname" || warn "${nname}: нода XKIT сохранена; повторите: xkit nodes panel-sync ${nname}"
   nodes_metrics_collect "$nname" >/dev/null 2>&1 || warn "${nname}: метрики пока недоступны"
+  # v8.0.0: TG-транспорт через ноду (ssh -D SOCKS5) — авто при добавлении.
+  # РФ-мастер: бот ходит через ноды; туннель маскируется под управляющий SSH.
+  tg_transport_add_node "$(node_record "$nname")" 2>/dev/null || true
   return 0
 }
 
@@ -7251,6 +7238,25 @@ EOS
   [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes ufw <имя|all> [on|status])"; return 1; }
   return "$rc"
 }
+
+# v7.7.8: ссылка каскада (pool) — вход мастера, трафик балансируется по нодам.
+# pool-клиент (email pool-XXXX) — учётка этого входа, не фантом; один на мастера.
+node_pool_link() {
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  kit_session || return 1
+  if [ -z "${XKIT_POOL_INBOUND:-}" ]; then
+    err "Pool-инбаунд не создан — добавьте ноду (xkit nodes) или xkit nodes repair"
+    return 1
+  fi
+  local pool_ib pool_cl plink
+  pool_ib="$(api_get_inbound "$XKIT_POOL_INBOUND")" || { err "Pool-инбаунд #${XKIT_POOL_INBOUND} не найден в панели — xkit nodes repair"; return 1; }
+  pool_cl="$(jq -c '.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[0] // empty' <<<"${pool_ib:-}")"
+  [ -n "$pool_cl" ] || { err "В pool-инбаунде нет клиента — xkit nodes repair"; return 1; }
+  plink="$(link_for_client "${pool_ib:-}" "$pool_cl")"
+  [ -n "$plink" ] || { err "Не удалось собрать ссылку каскада"; return 1; }
+  ok "Ссылка каскада (трафик балансируется по нодам):"
+  printf '  %s\n' "$plink"
+}
 #=========================== v4.1: ПОЛЬЗОВАТЕЛЬ — СБРОС ТРАФИКА ===============
 client_reset() {
   load_xkit_env || die "Сначала установка (пункт 1)"
@@ -7354,7 +7360,7 @@ expiry_set() { # $1 scope, $2 id, $3 date, $4 note
   # заметка не должна ломать tab-separated формат (4-е поле съедает остаток)
   note="${note//$'\t'/ }"; note="${note//$'\r'/ }"; note="${note//$'\n'/ }"
   mkdir -p "$XKIT_DIR" 2>/dev/null || true
-  # flock: параллельные записи (cron dash_gen / CLI) не теряют правки друг друга
+  # flock: параллельные записи (cron метрики / CLI) не теряют правки друг друга
   (
     flock -w 5 9 || { err "Файл сроков занят другой операцией — повторите"; exit 1; }
     local tmp; tmp="$(mktemp)"
@@ -7509,75 +7515,16 @@ expiry_cli_del() { # expiry del <master|имя ноды>
 # Скрытая страница рядом с панелью: https://ДОМЕН/d-<токен>/
 # Показывает: статусы нод и каналов (туннелей), потреблённый трафик
 # (инбаунды мастера, ноды, топ пользователей), сроки аренды серверов.
-# Данные строит dash_gen (API панели + nodes.json + expiry.tsv) и кладёт
-# data.json + index.html в $XKIT_DASH_DIR; nginx раздаёт по секретному пути
+# Данные строят метрики нод (nodes_metrics_collect) для бота/TUI/алертов.
 # (noindex/no-referrer/no-store, access_log off, опционально allow IP).
-# Обновление: cron каждые 5 минут (xkit dash gen) + автообновление JS 30 сек.
+# Обновление: cron метрик + бот/алерты.
 
-dash_path() { printf '/d-%s/' "${XKIT_DASH_TOKEN:-CHANGE_ME}"; }
-
-# (7.4.0): логин дашборда — полностью случайный, без палевного префикса «dash»
-# и без 256-вариантного rand_hex 2: 10 символов [a-z0-9] (~57 бит)
-dash_user_gen() { rand_str 10 | tr 'A-Z' 'a-z'; }
-
-# htpasswd для Basic Auth дашборда (apr1-хэш — понимается nginx'ом)
-dash_htpasswd_write() { # из XKIT_DASH_USER / XKIT_DASH_PASS
-  local u="${XKIT_DASH_USER:-}" p="${XKIT_DASH_PASS:-}" h
-  [ -n "$u" ] && [ -n "$p" ] || return 1
-  h="$(printf '%s\n' "$p" | openssl passwd -apr1 -stdin 2>/dev/null)" || return 1   # V-03: не в argv
-  [ -n "$h" ] || return 1
-  printf '%s:%s\n' "$u" "$h" > "${XKIT_DASH_HTPASSWD}"
-  chown root:www-data "${XKIT_DASH_HTPASSWD}" 2>/dev/null || true
-  chmod 640 "${XKIT_DASH_HTPASSWD}"
-  return 0
-}
-
-dash_cron_install() {
-  cat > "$XKIT_CRON_DASH" <<EOF
-# XKIT: обновление веб-дашборда каждые 5 минут
-*/5 * * * * root ${XKIT_BIN} dash gen >/dev/null 2>&1
-EOF
-  chmod 644 "$XKIT_CRON_DASH"
-  ok "Cron: дашборд обновляется каждые 5 минут ($XKIT_CRON_DASH)"
-}
-
-# состояние мастер-сервера -> JSON-объект
-dash_master_json() {
-  local nginx_st="inactive" xui_st="inactive" load1="" up_days=""
-  local mem_total="" mem_avail="" mem_pct="" disk_pct="" cert_end="" xui_ver="" xray_ver=""
-  nginx_st="$(systemctl is-active nginx 2>/dev/null || echo inactive)"
-  xui_st="$(systemctl is-active x-ui 2>/dev/null || echo inactive)"
-  load1="$(awk '{print $1}' /proc/loadavg 2>/dev/null)"
-  up_days="$(awk '{printf "%.1f", $1/86400}' /proc/uptime 2>/dev/null)"
-  mem_total="$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null)"
-  mem_avail="$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)"
-  if [[ "${mem_total:-}" =~ ^[0-9]+$ ]] && [[ "${mem_avail:-}" =~ ^[0-9]+$ ]] && [ "$mem_total" -gt 0 ]; then
-    mem_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
-  fi
-  disk_pct="$(df -P / 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')"
-  [ -n "${XKIT_CRT:-}" ] && [ -r "$XKIT_CRT" ] \
-    && cert_end="$(openssl x509 -enddate -noout -in "$XKIT_CRT" 2>/dev/null | cut -d= -f2-)"
-  xui_ver="$(version_xui_current 2>/dev/null || true)"
-  xray_ver="$(version_xray_current 2>/dev/null || true)"
-  [[ "${disk_pct:-}" =~ ^[0-9]+$ ]] || disk_pct=""
-  jq -nc --arg nginx "$nginx_st" --arg xui "$xui_st" --arg load "${load1:-}" \
-     --arg mem "$mem_pct" --arg disk "$disk_pct" \
-     --arg cert "$cert_end" --arg up "${up_days:-}" \
-     --arg uv "$xui_ver" --arg xv "$xray_ver" '
-    {nginx:$nginx, xui:$xui, load1:(if $load=="" then null else $load end),
-     mem_pct:(if $mem=="" then null else ($mem|tonumber) end),
-     disk_pct:(if $disk=="" then null else ($disk|tonumber) end),
-     cert_end:(if $cert=="" then null else $cert end),
-     xui_version:(if $uv=="" then null else $uv end),
-     xray_version:(if $xv=="" then null else $xv end),
-     uptime_days:(if $up=="" then null else ($up|tonumber) end)}'
-}
-
-# Системные CPU/RAM и версии ноды через существующий защищённый SSH; агент не нужен.
-# Значения неизвестны => null, а не фиктивный ноль. Команда на ноде фиксированная.
+#=========================== МЕТРИКИ НОД (v8.0.0: из 18_dash_core) ==========
+# Общий кэш нод для бота/TUI/алертов. Веб-дашборд удалён в 8.0.0.
 node_resource_stats() { # $1 rec-ноды
   local out cpu ram load xui xray cert
   out="$(node_ssh "$1" 'bash -s' 2>/dev/null <<'EOS'
+
 cpu_sample() { awk '/^cpu /{t=0; for(i=2;i<=NF;i++)t+=$i; print t,$5+$6; exit}' /proc/stat; }
 read -r t0 i0 < <(cpu_sample)
 sleep 1
@@ -7614,6 +7561,7 @@ EOS
 
 # Статистика одной ноды. UDP и реальный клиентский probe не выдумываются:
 # для произвольной ноды они не настроены, поэтому явно имеют состояние unknown/not-run.
+
 dash_node_stats() { # $1 rec-ноды, $2 expiry-дата (или пусто), $3 заметка
   local rec="$1" exp="${2:-}" note="${3:-}"
   local name host tport status="down" lat="" panel="n/a" up=0 down=0 total=0 clients=0
@@ -7675,6 +7623,7 @@ dash_node_stats() { # $1 rec-ноды, $2 expiry-дата (или пусто), $
 
 # Внутренний планировщик: не больше XKIT_NODES_PARALLEL workers, у каждого deadline.
 # Файлы результатов лежат рядом с основным кэшем; порядок нод сохраняется.
+
 _nodes_metrics_reap() { # $1: 1 = ждать хотя бы одного
   local changed i pid now
   while :; do
@@ -7702,6 +7651,7 @@ _nodes_metrics_reap() { # $1: 1 = ждать хотя бы одного
 }
 
 # Sanitized history ring buffer: только агрегаты и состояния, никаких реквизитов нод.
+
 nodes_history_update() { # $1 nodes JSON, $2 timestamp
   local nodes="$1" now="$2" old='{"samples":{}}' tmp limit data
   limit="${XKIT_NODES_HISTORY_MAX:-288}"
@@ -7729,6 +7679,7 @@ nodes_history_update() { # $1 nodes JSON, $2 timestamp
 
 # Общий кэш нод для веб-дашборда и TUI. Сбой одной ноды не обнуляет её прошлые
 # показатели и не мешает остальным; сброс счётчиков => rate=null.
+
 nodes_metrics_collect() {
   local arr rec nname cur prev previous='{}' now dt work idx
   local -a input=() results=() _metric_pids=() _metric_starts=() _metric_files=()
@@ -7791,569 +7742,6 @@ nodes_metrics_collect() {
 # санитизированные данные для data.json: БЕЗ privateKey Reality, UUID/subId
 # клиентов и прочих внутренностей — только агрегаты, которые ждёт JS
 # (поля совпадают с тем, что рендерит index.html: tag/port/proto/enable/...)
-dash_sanitize_inbounds() { # $1 = массив инбаундов (JSON) -> stdout
-  # ИДЕМПОТЕНТНО: raw из API (.protocol, .settings-строка) -> sanitized;
-  # уже sanitized (.proto, .clients-число) проходит без изменений —
-  # на этом построены stale-ветка и финальный барьер перед записью.
-  # Порядок веток clients КРИТИЧЕН: у raw из API поля .clients НЕТ вообще
-  # (клиенты лежат внутри settings-строки), поэтому raw-детект через .settings
-  # должен идти ДО прочих веток; .clients-массив (полу-sanitized) считаем длиной,
-  # null/битое/пусто -> 0. Всегда возвращаем валидный JSON-массив (даже на
-  # пустом входе jq молчит с кодом 0 — потому явная проверка на непустой вывод).
-  local out
-  out="$(jq -c '[ .[] | {
-      tag: (.tag // "inbound"),
-      port: .port,
-      proto: (.protocol // .proto // ""),
-      enable: (if (.enable == null) then true else .enable end),   # // true съел бы явный false
-      up: (.up // 0),
-      down: (.down // 0),
-      total: ((.up // 0) + (.down // 0)),
-      clients: (if (.clients|type) == "number" then .clients
-                elif (.settings? // null) != null and (.settings? // "") != "" then
-                  ([ ((.settings | (if type=="string" then (fromjson? // {}) else (. // {}) end) | (.clients // []))[]) ] | length)
-                elif (.clients|type) == "array" then ([ .clients[] ] | length)
-                else 0 end)
-    } ]' <<<"$1" 2>/dev/null)" || out=""
-  [ -n "$out" ] && echo "$out" || echo '[]'
-}
-
-# топ-10 пользователей по ПОТРАЧЕННОМУ трафику (up+down из clientStats,
-# а не квота .total клиента, как было раньше; clientStats бывает строкой)
-dash_sanitize_users() { # $1 = массив инбаундов (JSON) -> stdout
-  jq -c '[ .[] | . as $ib |
-      ((.settings | (if type=="string" then (fromjson? // {}) else (. // {}) end) | .clients // [])[]) | . as $c |
-      (($ib.clientStats // [] | if type=="string" then (fromjson? // []) else . end)
-        | map(select(.email == $c.email)) | .[0] // {}) as $s |
-      {email:($c.email // "?"), ib:($ib.tag // "?"),
-       up:($s.up // 0), down:($s.down // 0),
-       total:(($s.up // 0) + ($s.down // 0)),
-       enable:(if ($c.enable == null) then true else $c.enable end), expiryTime:($c.expiryTime // 0)} ]
-    | sort_by(-(.total // 0)) | .[0:10]' <<<"$1" 2>/dev/null || echo '[]'
-}
-
-# whitelist полей пользователя (для users из прошлого data.json): пропускаем
-# только safe-поля — дрейф формата или мусор в старом файле не попадёт в запись
-dash_users_whitelist() { # $1 = массив users (JSON) -> stdout
-  jq -c '[ .[] | {
-      email:(.email // "?"), ib:(.ib // "?"),
-      up:(.up // 0), down:(.down // 0), total:(.total // 0),
-      enable:(if (.enable == null) then true else .enable end), expiryTime:(.expiryTime // 0)} ]' <<<"$1" 2>/dev/null || echo '[]'
-}
-
-# права на файлы дашборда: читать должен только nginx, не все локальные юзеры
-dash_fix_perms() {
-  local ngu="www-data" nguser=""
-  if ! getent group www-data >/dev/null 2>&1; then
-    # не-Ubuntu (CentOS и т.п.): находим юзера процесса nginx и берём ЕГО
-    # ПЕРВИЧНУЮ ГРУППУ (id -gn) — юзер ≠ группа, раньше подставляли юзера в chgrp
-    nguser="$(ps -eo user=,comm= 2>/dev/null | awk '$2=="nginx" && $1!="root"{print $1; exit}')"
-    [ -n "$nguser" ] && ngu="$(id -gn "$nguser" 2>/dev/null || true)"
-  fi
-  if [ -z "$ngu" ] || ! getent group "$ngu" >/dev/null 2>&1; then
-    warn "dash_fix_perms: группа nginx не найдена — файлы дашборда могут быть world-readable"
-    return 0
-  fi
-  chgrp "$ngu" /var/lib/xkit "$XKIT_DASH_DIR" 2>/dev/null || true
-  chmod 750 /var/lib/xkit "$XKIT_DASH_DIR" 2>/dev/null || true
-  local f
-  for f in "${XKIT_DASH_DIR}/index.html" "${XKIT_DASH_DIR}/data.json" \
-    "${XKIT_DASH_DIR}/manifest.webmanifest" "${XKIT_DASH_DIR}/sw.js" \
-    "${XKIT_DASH_DIR}/icon-192.png" "${XKIT_DASH_DIR}/icon-512.png"; do
-    [ -f "$f" ] || continue
-    chown root:"$ngu" "$f" 2>/dev/null || true
-    chmod 640 "$f" 2>/dev/null || true
-  done
-  return 0
-}
-
-# построить data.json (+ восстановить index.html, если удалён)
-dash_gen() {
-  load_xkit_env 2>/dev/null || { err "Сначала установка (пункт 1)"; return 1; }
-  [ -n "${XKIT_HOST:-}" ] || { err "Сначала установка (пункт 1)"; return 1; }
-  [ "${XKIT_DASH:-0}" = "1" ] || { err "Дашборд не установлен — меню: «Веб-дашборд» (или xkit dash install)"; return 1; }
-  mkdir -p -m 750 "$XKIT_DASH_DIR" 2>/dev/null || { err "Не удалось создать $XKIT_DASH_DIR"; return 1; }
-
-  # Блокировка В SUBSHELL: fd 9 живёт только внутри ( ... ) 9>lock и закрывается
-  # при его выходе. Раньше `exec 9>` держал lock в интерактивной сессии —
-  # cron (xkit dash gen) не мог обновить дашборд, пока админ сидел в меню.
-  (
-    flock -n 9 || { warn "Предыдущее построение ещё не закончилось — пропускаю"; exit 0; }
-    dash_gen_locked
-  ) 9>"${XKIT_DASH_DIR}/.lock"
-  return $?
-}
-
-# вся работа dash_gen под lock (вызывается в subshell из dash_gen)
-dash_gen_locked() {
-  # 750 СРАЗУ (без окна 755): раньше каждый запуск ставил 755, и между ним
-  # и dash_fix_perms каталог был проходим для всех локальных юзеров
-  # ВАЖНО: umask действует только в ЭТОМ subshell (dash_gen зовёт нас в ( ... ) 9>lock).
-  # НЕ выносить umask в dash_gen вне subshell — иначе он утечёт в интерактивную
-  # сессию админа и все последующие файлы кита будут создаваться с маской 640.
-  umask 027   # новые файлы (data.json/index.html/.tmp) создаются сразу 640
-  chmod 750 /var/lib/xkit "$XKIT_DASH_DIR" 2>/dev/null || true
-
-  # Каркас и PWA перезаписываются при каждой генерации: обновление XKIT
-  # не оставляет старый JS/service worker на диске.
-  local shell_tmp
-  shell_tmp="$(mktemp "${XKIT_DASH_DIR}/.index.html.tmp.XXXXXX")" || return 1
-  dash_write_html > "$shell_tmp" && mv -f "$shell_tmp" "${XKIT_DASH_DIR}/index.html" \
-    || { rm -f "$shell_tmp"; err "Не удалось записать каркас дашборда"; return 1; }
-  dash_write_pwa || { err "Не удалось записать PWA-файлы"; return 1; }
-
-  local panel_st="down" inbounds="[]" users="[]" totals='{"up":0,"down":0,"total":0}'
-  local stale=0
-  if kit_session >/dev/null 2>&1; then
-    panel_st="ok"
-    # ВАЖНО: в data.json уходит САНИТИЗИРОВАННЫЙ список (см. dash_sanitize_*)
-    inbounds="$(dash_sanitize_inbounds "$INBOUNDS")"
-    local sums tu td
-    # total = up+down (потрачено): .total инбаунда — квота, а не трафик
-    sums="$(jq -r '[( [.[].up // 0] | add // 0 ), ( [.[].down // 0] | add // 0 )] | @tsv' <<<"$INBOUNDS" 2>/dev/null)"
-    if [[ "${sums:-}" =~ ^[0-9]+[[:space:]]+[0-9]+$ ]]; then
-      read -r tu td <<<"$sums"
-      totals="$(jq -nc --argjson u "$tu" --argjson d "$td" '{up:$u,down:$d,total:($u+$d)}')"
-    fi
-    users="$(dash_sanitize_users "$INBOUNDS")"
-    rm -f "${COOKIE_JAR:-}" 2>/dev/null || true
-  else
-    # Панель недоступна: НЕ затираем прошлый трафик пустотой —
-    # берём инбаунды/пользователей из прошлого data.json (stale лучше пустого).
-    # ВАЖНО (аудит №4): прошлый data.json мог быть записан v4.3 с СЫРЫМИ
-    # инбаундами (privateKey Reality, UUID/subId). Апгрейд + падение панели
-    # до первого успешного gen = stale-ветка вернула бы утечку. Поэтому
-    # sanitize при ЧТЕНИИ — идемпотентно (sanitized проходит без изменений),
-    # сырые данные не доходят до записи ни при каком сценарии.
-    if [ -r "${XKIT_DASH_DIR}/data.json" ]; then
-      local old old_inb old_users
-      old="$(cat "${XKIT_DASH_DIR}/data.json" 2>/dev/null || true)"
-      if jq -e '(.inbounds|type) == "array"' <<<"$old" >/dev/null 2>&1; then
-        old_inb="$(jq -c '.inbounds // []' <<<"$old")"
-        inbounds="$(dash_sanitize_inbounds "$old_inb")"
-        if [ "$(jq 'length' <<<"$inbounds" 2>/dev/null || echo 0)" -eq 0 ]; then
-          # формат не распознан — пусто безопаснее, чем raw
-          inbounds="[]"; users="[]"
-        elif jq -e '[ .[] | has("settings") or has("streamSettings") ] | any' <<<"$old_inb" >/dev/null 2>&1; then
-          # raw v4.3 ИЛИ смешанный формат (№1, аудит №1): users считаем из СЫРЫХ
-          # элементов и ОБЪЕДИНЯЕМ с users sanitized-элементов прошлого data.json
-          # (раньше смешанный дамп молча терял клиентов sanitized-инбаундов)
-          local raw_inb
-          raw_inb="$(jq -c '[ .[] | select(has("settings") or has("streamSettings")) ]' <<<"$old_inb" 2>/dev/null || echo '[]')"
-          old_users="$(jq -c '.users // []' <<<"$old" 2>/dev/null || true)"
-          jq -e '(.|type) == "array"' <<<"$old_users" >/dev/null 2>&1 || old_users="[]"
-          users="$( { dash_sanitize_users "$raw_inb"; printf '%s\n' "$old_users"; } \
-            | jq -c -s 'add | unique_by((.email // "?")+"\u0000"+(.ib // "?")) | sort_by(-(.total // 0)) | .[0:10]' 2>/dev/null || echo '[]')"
-          users="$(dash_users_whitelist "$users")"
-        else
-          # уже sanitized (v4.4+): оставляем users, пропустив через whitelist
-          old_users="$(jq -c '.users // []' <<<"$old" 2>/dev/null || true)"
-          if jq -e '(.|type) == "array"' <<<"$old_users" >/dev/null 2>&1; then
-            users="$(dash_users_whitelist "$old_users")"
-          else
-            users="[]"
-          fi
-        fi
-        # totals пересчитываем из уже sanitized-инбаундов (up+down)
-        local s2 tu2 td2
-        s2="$(jq -r '[( [.[].up // 0] | add // 0 ), ( [.[].down // 0] | add // 0 )] | @tsv' <<<"$inbounds" 2>/dev/null)"
-        if [[ "${s2:-}" =~ ^[0-9]+[[:space:]]+[0-9]+$ ]]; then
-          read -r tu2 td2 <<<"$s2"
-          totals="$(jq -nc --argjson u "$tu2" --argjson d "$td2" '{up:$u,down:$d,total:($u+$d)}')"
-        else
-          totals='{"up":0,"down":0,"total":0}'
-        fi
-        stale=1
-      fi
-    fi
-  fi
-
-  local master_json
-  master_json="$(dash_master_json)"
-
-  # --- общий сборщик: туннель/API/трафик/CPU/RAM; тот же кэш читает TUI ---
-  local nodes_json="[]" metrics_json history_json='{}'
-  metrics_json="$(nodes_metrics_collect)" || return 1
-  nodes_json="$(jq -c '.nodes' <<<"$metrics_json")" || return 1
-  history_json="$(jq -c '.history // {}' <<<"$metrics_json")" || return 1
-
-  # --- аренда мастер-сервера ---
-  local mexp expiry_json="null" mdl
-  mexp="$(expiry_get master -)"
-  if [ -n "$mexp" ]; then
-    mdl="$(days_left "$mexp")"
-    expiry_json="$(jq -nc --arg d "$mexp" --argjson dl "${mdl:-null}" \
-      --arg n "$(expiry_note master -)" \
-      '{date:$d, days_left:$dl, note:(if $n=="" then null else $n end)}')"
-  fi
-
-  # Последний барьер (аудит №4): идемпотентная санитизация ПЕРЕД записью —
-  # закрывает любые будущие пути попадания сырых данных. users здесь НЕ
-  # пересчитываем: у sanitized-инбаундов нет settings/clientStats (стал бы пуст)
-  inbounds="$(dash_sanitize_inbounds "$inbounds")"
-
-  # v4.5: явный режим на дашборде — снимает вопрос «почему таблица нод пустая»
-  local mode="solo"
-  [ "$(jq 'length' <<<"$nodes_json" 2>/dev/null || echo 0)" -gt 0 ] && mode="master"
-
-  local data
-  data="$(jq -n \
-      --arg v "$XKIT_VERSION" --arg host "$XKIT_HOST" \
-      --arg panel "$panel_st" --arg strat "${XKIT_BAL_STRATEGY:-leastLoad}" \
-      --arg mode "$mode" \
-      --arg gen_str "$(date '+%Y-%m-%d %H:%M:%S %Z')" \
-      --argjson gen "$(date +%s)" \
-      --argjson master "$master_json" --argjson inb "$inbounds" \
-      --argjson users "$users" --argjson nodes "$nodes_json" --argjson history "$history_json" \
-      --argjson totals "$totals" --argjson exp "$expiry_json" \
-      --argjson stale "$( [ "$stale" = "1" ] && echo true || echo false )" \
-      '{version:$v, host:$host, generated:$gen, generated_str:$gen_str, mode:$mode,
-        panel:$panel, strategy:$strat, master:$master, totals:$totals,
-        inbounds:$inb, users:$users, nodes:$nodes, history:$history, expiry_master:$exp, stale:$stale}')" \
-    || { err "Не удалось собрать data.json"; return 1; }
-
-  printf '%s\n' "$data" > "${XKIT_DASH_DIR}/.data.json.tmp" \
-    && mv -f "${XKIT_DASH_DIR}/.data.json.tmp" "${XKIT_DASH_DIR}/data.json" \
-    || { err "Не удалось записать ${XKIT_DASH_DIR}/data.json"; return 1; }
-  dash_fix_perms
-
-  local ncnt ecnt stale_note=""
-  ncnt="$(jq 'length' <<<"$nodes_json" 2>/dev/null || echo 0)"
-  ecnt="$(jq 'length' <<<"$inbounds" 2>/dev/null || echo 0)"
-  [ "$stale" = "1" ] && stale_note=" (панель была недоступна — показаны данные прошлого построения)"
-  ok "Дашборд построен: панель=${panel_st}, нод=${ncnt}, инбаундов=${ecnt}${stale_note}"
-  log "Файлы: ${XKIT_DASH_DIR}/data.json; URL: https://${XKIT_HOST}$(dash_path)"
-  return 0
-}
-
-# nginx-локейшн дашборда: секретный путь + security-заголовки + Basic Auth
-# + опц. allow IP/CIDR. ВНИМАНИЕ: функция пишет В STDOUT конфига — warn/ok тут
-# запрещены (ушли бы в файл конфига), невалидные адреса молча пропускаются
-# (deny all; остаётся — fail-closed)
-generate_dash_block() {
-  local dp; dp="$(dash_path)"
-  cat <<BLK
-
-    # --- веб-дашборд xkit (секретный путь; данные: ${XKIT_DASH_DIR}) ---
-    location = ${dp%/} {
-        return 301 ${dp};
-    }
-    location ^~ ${dp} {
-        alias ${XKIT_DASH_DIR}/;
-        index index.html;
-        types { text/html html; application/json json; application/manifest+json webmanifest; text/javascript js; image/png png; }
-        add_header X-Robots-Tag "noindex, nofollow" always;
-        add_header Referrer-Policy "no-referrer" always;
-        add_header Cache-Control "no-store" always;
-        add_header X-Frame-Options "DENY" always;
-        add_header X-Content-Type-Options "nosniff" always;
-        access_log off;
-BLK
-  if [ "${XKIT_DASH_AUTH:-1}" = "1" ] && [ -s "${XKIT_DASH_HTPASSWD}" ]; then
-    printf '        auth_basic "xkit-dashboard";\n'
-    printf '        auth_basic_user_file %s;\n' "${XKIT_DASH_HTPASSWD}"
-  fi
-  if [ -n "${XKIT_DASH_ALLOW:-}" ]; then
-    local -a _dash_ips=()          # local: не утекает в глобальный scope
-    local a
-    IFS=',' read -ra _dash_ips <<<"${XKIT_DASH_ALLOW}"
-    for a in "${_dash_ips[@]}"; do
-      a="${a// /}"; [ -n "$a" ] || continue
-      # кривой адрес НЕ печатаем (иначе nginx -t падает и откат блокирует все
-      # будущие apply); ручная правка xkit.env больше не ломает nginx
-      is_ip "$a" || is_cidr "$a" || continue
-      printf '        allow %s;\n' "$a"
-    done
-    printf '        deny all;\n'
-  fi
-  printf '    }\n'
-}
-
-# PWA: кэшируется только пустой статический каркас. data.json, метрики,
-# адреса нод и история никогда не попадают в Cache Storage/localStorage.
-dash_write_pwa() {
-  cat > "${XKIT_DASH_DIR}/manifest.webmanifest" <<'JSON'
-{"name":"XKIT Operations","short_name":"XKIT","start_url":"./","scope":"./","display":"standalone","background_color":"#09110f","theme_color":"#09110f","icons":[{"src":"./icon-192.png","sizes":"192x192","type":"image/png"},{"src":"./icon-512.png","sizes":"512x512","type":"image/png"}]}
-JSON
-  cat > "${XKIT_DASH_DIR}/sw.js" <<'JS'
-"use strict";
-const SHELL="xkit-shell-v620";
-const ASSETS=["./index.html","./manifest.webmanifest","./icon-192.png","./icon-512.png"];
-self.addEventListener("install",e=>e.waitUntil(caches.open(SHELL).then(c=>c.addAll(ASSETS)).then(()=>self.skipWaiting())));
-self.addEventListener("activate",e=>e.waitUntil(caches.keys().then(keys=>Promise.all(keys.filter(k=>k.startsWith("xkit-shell-")&&k!==SHELL).map(k=>caches.delete(k)))).then(()=>self.clients.claim())));
-self.addEventListener("fetch",e=>{
-  const u=new URL(e.request.url);
-  if(e.request.method!=="GET"||u.origin!==self.location.origin)return;
-  if(u.pathname.endsWith("/data.json")){e.respondWith(fetch(e.request,{cache:"no-store"}));return;}
-  if(e.request.mode==="navigate"){
-    e.respondWith(fetch(e.request,{cache:"no-store"}).catch(()=>caches.match("./index.html")));return;
-  }
-  if(ASSETS.some(a=>u.pathname.endsWith(a.replace("./","/"))))e.respondWith(caches.match(e.request).then(r=>r||fetch(e.request)));
-});
-JS
-  base64 -d > "${XKIT_DASH_DIR}/icon-192.png" <<'PNG'
-iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAAE1ElEQVR42u3dPW4UQRAG0HHLCREiJENEpKSIs5ByJlLOgkhJiRAZ1yBYybJs2VrP7nTXz/siSw7c2/WmpmZmd33z6s3rTWRvhi0QgAQgAUgAEgFIABKABCARgAQgAUgAEgFIABKABCARgAQgAUgAEoBEABKABCABSAQgAUgAEoBEABKABCCpldt0K3736WPtkvz9+SvRam9SfMVdeTR5MUUH9JjOv99/aqN5++F9IkZBAT1wUx7NmZgCSooI6L6etnSeYhTNUCxA6KRjFAjQnR50zmEUxNCgJ1fu9ifIlWmIDnTaC3R2tKLlfWjQk7oVLe9Dgx6GsgKip4ChQQ9D+QC1fbZVb1fH8kNHUu/kWHWg0FPjRDaW6JEyOzwWHi5SYFe9pVXyADp6+vny41vkvZ6wvPmTUJ0OdCpPWEPBl5cA0KHt535hAhZp5vImN6Hb7EdAxmP6tObvn7/qQEH1hFKVYpEdAT1fgCDlSbHIBICuPgCds/XLy7NqkTPHoHwd6MuPb+dv+kJDL1pk3lY00ulJMWVnWWc7QDWuXCq9tNFhoycf3Dv+XN4Do8uzsGmG6t1rLgho3/E6obT7/kTq83LWDhTQUEM9uU9hBQbqAi9hdCvAQU2o1eBcaoiOYKitnq3tOxKvaKjbZVdBQAsH6p6Dc8EOtMQQPaVOYSkKU+9RTKkZaOZA3XlwNkRfSqH54FwZ0IRhyOhTvAMdaoieFqewUAUrrKfyDHTEQG1w7jVEX9cQPa7C9hty2dUU0FUGaoNz6w50oSF6nMJml7OPnkYz0L6B2uAMkACU58zSrf2060CHFrihno6nsIPK3FNP0xno6sVuq6fvEH3FknfW4ypMAFraOZq3n+4d6MLy0+MUth8BPQAJQBdn5sd6AKKHIYCuWn6GzEAC0NLO4etd6GEIoNXFbmto0MMQQFEK3NCQqzAB6Jje8P3z1/j/lwOgIievtoYGPU+1nwc/MNQR0FU+mMyQGWi/nksMAdRxcN7xq85NaNBzPhGGugAKVbbahgY9L+ouBurigCZ8HxRDrsIuBeGirCagmd8HZaCuBihFeeoZGp31LPlkajFDgx6GdKA1egzUFQBF+CLVzgP1oIehpoAKFKDASxittj7gt7RmNzToYchVWKBrJf/qwOBsoK4LqPD7IpK+tGSAsjw57/OEP98p7EWf91tYlRctMu/klHWIPmfHl1clxSJzAPr789e2bW8/vJ9WniCFWbLI0z6f9lwH2lOeUId1ikXuzm32F3AqQ65LmEr3iorcSLxfkoDlCb68HICOGIMeFylseaYtb+YAtBV7lBH84C75lGMqoKObkExuP5vPhUlKQJpQmV2dDWhmd+2ZyTs8Vr1CTSj79LN+BmKowE6uAeREVmZXx9pXqwnlPXmtP4UxlF3Ptvw+EEOp9WwRbiQylFfPtm03r968jrAd7z59PP3w7/cfOM685opwLRLlUcbdXmhFifQE6kAP+pBW9AydLdJ9kFiAMEpEJy6gB4Y6M3pwQg94AzYooKckdcD0eAqMfOM+OqCnGDVJ/Gc+OQC1wpTrQWE+QBIq3tIqAAlAApAAJAKQACQACUAiAAlAApAAJAKQACQACUAiAAlAApAAJACJACQACUACkAhAApAAJACJACQASbz8BwOpWSUgNQcYAAAAAElFTkSuQmCC
-PNG
-  base64 -d > "${XKIT_DASH_DIR}/icon-512.png" <<'PNG'
-iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAIAAAB7GkOtAAAMQElEQVR42u3dsVIbTQKFUeRyokilkIwiIiWleBalPJNSnkVFSkpEkfEaziiBQCOjmZ7uvudE/wa7a89o7tcjvOvFcr26ACDPH5cAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAEAAABAAAAQBAAAAQAAAEAAABAEAAABAAAAQAAAEAQAAAEAAABAAAAQBAAAAQAAAEAAABAEAAADjur0sQ5eru1kXguLenZxchxGK5XrkKth5UQQAw+iAGAoDRBzEQALrZ/feXV5eO4y5vrpVAAGh79209s1RBCQSAeabf6FNJDGRAACix+0afmmOgBALA+NNv92moBDIgAJh+ZAAB4P/X3+7TQQk0QAAw/cgAAoDpRwYQAOtv+knLgAYIgOk3/cgAM/D3AVh/KOfbT7j/PytvAOnrb/oJfxXwHiAADv6Q2wAZEAAHf/AqQAl+BmD9YU6HT4EfCQiA9QcNYFq+Apph/U0/fOvL10G+CxIAB3/IbYAMTMpXQNYfKuLrIAGw/qABGiAA1h80QAMEoKdPM+CpEYD+j/8+xzBKA7wECID1Bw1AAKw/aAACYP1BAxAA6w8agADU8UkFPFkCkHL8Bzx3ApD4KXRIgWIvARogANYfNAABqOlzCXjWBCDl+A94EgUg8TPnSAIzvgRogAB4IQXPHQLglRM8lQiAYwh4+hCA8Q8aPn9QTwO8BAiA10zwhCIAXj/Bk4gAOFyA5xQBcOgAzyMC4FgBnlYBwHEDPJUCALRns9u6CAjA5G+UgQcN49LEDXKb/G8CBADjkpvnzW7rTiEAUx3/05bly7j4MHhj8+QKgHdMI0LVtyn29vlRsABgVkTazWLYYrleuQonvkWGHC4Gh+Px/sEHo6FXtMD7dXlz/fHPb0/PPi3eADhpU06ZFUfLhtbf/UIAsCmhd8r9QgB+Kef7H5siGz3xPwgQAEyDm/X13+teIwCMswjWpMVUu2sIANYk90XNXUMABvT9AwBrEnu/Qu6aHwMIANbE/Tr2H+vGCQBZUzLdmri86oIA4FGnpbvmgyEAfNLfDwDsiLuWdu/8GEAAsCPu2qn/dW6fANDbiJTfEZe93cvo9gkARsSI+NggAHiMybt3PjwCgAWxILmXzo8EBIAm56OeBXE7Wr9obqIAxGn3z4CaD+s/rtb/NjF/ElQAglT4uGqA9UcA0ABAAADHfwQALwFYfwQADbD+PjwIABpg/X1sEAA0wPpbfwQADQAEABz/Hf8RALwEWH/rjwCgAdbf+iMAaID1t/4IABrgN2v9EQA0ABAAcPx3/BcAl8BLgHG0/ggAGmAirT8CgAYYSuuPAKABGgACADj+IwB4CfASYP0RADRAA6w/AoAGaID1RwDQgMgGWH8EAA1Ifw8AAYAgjv8IAF4CEl8CrD8CgAYkNsD6IwBoQGIDrD8CgAYkNsD6IwBoQPp7AAgABHH8RwDwEpA4uNYfAUADEmfX+iMAaEDi+Fp/BAANMMFuEAKAiYmhPQgAJA6xL38QALwEJDbA+iMAaEBiA6w/AoAGJDbA+iMAkP4eAAIAQRz/EQBIfAmw/ggAJDbA+iMAkNgA648AQGIDrD8CAOnvASAAEMTxHwGAxJcA648AQGIDrD8CAIkNsP4IAKS/B7iYCAAEzZY/OIQAQIcGx92XPwgAdDteRybe+iMAkNgA648AQGIDrD8CAOnvASAAEMTxHwSAxJcA6w8CgGlziRAAMHAuDgIAZs5lQQDA2IEAAIqIAIDJcykQADB8LgICAObPbx8BACPoN44AgCkEAQDN0zwEAAIH0fojAJA4i9YfAYDEcbT+CACYSBAA0DYQAOh4KK0/AgCJc2n9EQBIHE3rjwBA4nRafwQADCgIAKgXCAB0PKPWHwGAxDG1/ggAJE6q9UcAIHFYrT8CAOYVBAD0CQQAOh5Z648AACAAMIHNbusXBgIAGgACgIUFBADr7xcJAoD190sFAcD6+wWDAGBM/bJBAEADQACwoSAAYP39FhAAMJ1+IwgAGE2/HQQAzKXfFAIAaAACAFYSBACsv7whAGAcNQABALOoAQgACJ6LgACANQQBwPr7jYMAYAT99kEAMH8uAggAhs+lAAEADQABwN4BAoD1d1lAADBzLg4IAAbOJQIBwLTtebx/eLx/cKFAAAilASAAxB3/3RcQANLX30sAAgC5Z38NQAAgcf01AAGAzg1OvAYgAJC7XH44jABAb+vf7rJ7CUAAMFiF1t8XQQgA5J79NQABgMT11wAEANJpAAIAccd/EABIX38vAQgA5J79NQABgMT11wAEAHLXXwMQAEinAQgAxB3/QQAgff29BCAAWP/cs78GIABY/8T11wAEAHLXXwMQABz/hccPnBEArL8VdoMQAIxL1Pr7IggBwPrnjq8GIABY/9zZ1QAEAHJpAAKA43/o2oIAYP1z199LAAKA9c89+2sAAoD1T1x/DUAAsP65668BCACk0wAEAMf/uOM/CADWP339vQQgAFj/3LO/BiAAWP/E9dcABADrn7v+GoAAQDoNQABw/I87/oMAYP3T199LAAKACcg9+2sAAoCHP3H9NQABgHQagADgmY87/oMAYP3T199LAAKARz337K8BCAAe8txvfjQAAcD659IABAA0QAMQABz/AQHA+nsJ8IFBALD+GuBjgwBg/TVAAxAArL8GaAACABqgAQgAjv+AAFh/6+8lwEsAAmBE/HrcPg3gR4vleuUqHLq6u/345/eXV68C1j9zc1u/iZc31x///Pb07NPlDcBZ0nC4dyf9MtxEAcCOoN8IAHbEfPjYIAA09DAXfp7Nh3gjACSuiflo92L60l8AsCbWX7kRgGz7f2Js/0+SWROUuxX+DKgAUOg1X10EBgEg8Zk3Ii1utC/9EQCbYv01GwHgsy5/DDD6BNgRza6THwAIANN+CWD9NRsBwKzQwM3ypT8CwDizYkpkHgHoWfc/Bvj1QFgTta6ZHwAIAFN9RWD91RoBIHFcrElDDfClPwJwlqhvgQbHxZpIdf18/yMAlDhgItUIQOjhImFc9nfEpoi3J7Qz/lL4k7T+d8SfabPbWv/Kb5DpPwyA73+8AeBEmXKD3Ca8AXgJAMd/x39vAAAIwHQHDcBTKQCd80YJnlYBwHEDPI8C4FgBeE4FwKED8CQKgMMF4AkVgN4/YY4eUM/x3/oLgNdP8PQhAF4zwVOJADiGgOcOAZjkuOGzCDOuv+O/AHjlBE8iAuCFFDxrCEDJo4fPJRRef8d/AdAAsP4IQAUNADx3AuCQAniyBCDsMOKTCpOuv+O/AGgAWH8EQAPA+iMAGgDWHwHQALD+CEBNn2PAUyMAKS8BPs1w5vo7/guABoD1RwA0AKw/51ks1ytXYWpXd7f7//L95dU1gcH1N/0C0GcDZAAc/GfnK6BCfB0E1l8ANEADwPpXwVdApR1+F3Th6yBMv/UXgOQMaAAO/i6LAHgVAAd/SvAzgNl8+4n3UwGsP94AvAp4FcD0IwCpDZABOp5+6y8AyACmHwFABjD9CAA/NUAJaHT3rb8AIAOYfgSAkTKgBNS8+6ZfAChUAjGgktG3+wLAbBkQA2YZfdMvAFRXAlVgoq23+wJAkyWAUdh9AUAMMPoIAGKA0UcAUAVsPQIAQHX8fQAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAAAuASAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAAAgAAAIAgAAAIAAACAAAAgCAAAAgAAAIAAACAIAAACAAAAgAAAIAgAAAIAAACAAAAgCAAABwun96qUoFCI2xfQAAAABJRU5ErkJggg==
-PNG
-}
-
-# HTML-каркас дашборда (статичный; данные подтягивает JS из ./data.json)
-dash_write_html() { # stdout: index.html
-  cat <<'HTML'
-<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="robots" content="noindex,nofollow">
-<meta name="theme-color" content="#09110f">
-<link rel="manifest" href="./manifest.webmanifest">
-<link rel="icon" href="./icon-192.png">
-<link rel="apple-touch-icon" href="./icon-192.png">
-<title>XKIT · Operations</title>
-<style>
-:root{color-scheme:dark;--bg:#09110f;--panel:#101b18;--line:#243a33;--tx:#e1ebe6;--mut:#82988f;--ok:#6ee7b7;--warn:#f4bf75;--bad:#fb7185;--acc:#93c5fd}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}.wrap{max-width:1440px;margin:auto;padding:24px}.top{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:22px}.brand{font-size:22px;font-weight:650;letter-spacing:-.02em}.brand span{color:var(--ok)}.sub,.mut{color:var(--mut)}.sub{font-size:12px;margin-top:4px}.live{font:12px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--mut);text-align:right}.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:22px}.panel{border-top:1px solid var(--line);background:var(--panel);padding:16px}.panel h2,.section-title{font-size:11px;text-transform:uppercase;letter-spacing:.11em;color:var(--mut);margin:0 0 12px}.kv{display:flex;justify-content:space-between;gap:12px;padding:4px 0}.kv b,.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-weight:550}.badge,.pill{display:inline-block;padding:2px 7px;border:1px solid var(--line);font-size:11px;font-weight:600}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}.badge.ok{border-color:#285f4c;background:#102a22}.badge.warn{border-color:#664c2c;background:#2a2115}.badge.bad{border-color:#6b303c;background:#2b171c}.err{padding:12px 16px;border-left:3px solid var(--bad);background:#25171a;margin-bottom:18px}.notice{padding:12px 16px;border-left:3px solid var(--line);color:var(--mut);margin-bottom:18px}.section{margin:24px 0}.section-head{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:8px}.nodes{display:grid;gap:10px}.node{background:var(--panel);padding:16px;border-left:2px solid var(--line)}.node.fresh{border-left-color:var(--ok)}.node.stale{border-left-color:var(--warn)}.node-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.node-name{font-size:16px;font-weight:650}.host{color:var(--mut);font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.node-grid{display:grid;grid-template-columns:1.2fr 1fr 1fr 1fr;gap:16px;margin-top:14px}.metric-label{font-size:10px;color:var(--mut);text-transform:uppercase;letter-spacing:.08em}.metric-value{font:16px ui-monospace,SFMono-Regular,Consolas,monospace;margin:3px 0}.metric-detail{font-size:11px;color:var(--mut)}.spark{display:block;width:100%;height:34px;margin-top:6px}.spark polyline{fill:none;stroke:var(--ok);stroke-width:1.5;vector-effect:non-scaling-stroke}.probes{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}.probe{font:10px ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--mut);border:1px solid var(--line);padding:2px 5px}.probe.good{color:var(--ok);border-color:#285f4c}.probe.bad{color:var(--bad);border-color:#6b303c}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.07em;padding:8px;border-bottom:1px solid var(--line)}td{padding:8px;border-bottom:1px solid #1a2a25;white-space:nowrap}tr:last-child td{border:0}footer{border-top:1px solid var(--line);padding-top:14px;color:var(--mut);font-size:11px}.offline{display:none}@media(max-width:980px){.grid{grid-template-columns:1fr}.node-grid{grid-template-columns:repeat(2,1fr)}}@media(max-width:600px){.wrap{padding:16px}.node-grid{grid-template-columns:1fr 1fr;gap:12px}.top{display:block}.live{text-align:left;margin-top:10px}}@media(prefers-reduced-motion:no-preference){.node{animation:enter .2s ease-out}@keyframes enter{from{opacity:.6}to{opacity:1}}}
-</style>
-</head>
-<body><main class="wrap">
-<header class="top"><div><div class="brand"><span>XKIT</span> / Operations</div><div class="sub" id="hdr">Ожидание первого ответа сервера…</div></div><div class="live" id="freshness">ДАННЫЕ НЕ ПОЛУЧЕНЫ</div></header>
-<div class="err" id="err" style="display:none"></div><div class="notice offline" id="offline">Офлайн-каркас: метрики не сохраняются в браузере. Подключитесь к серверу для актуальных данных.</div>
-<div class="notice" id="solo" style="display:none"></div>
-<section class="grid" id="cards"></section>
-<section class="section"><div class="section-head"><h2 class="section-title">Ноды / ресурсы и активность</h2><span class="mut">TCP ≠ API ≠ SSH ≠ UDP ≠ клиентский probe</span></div><div class="nodes" id="nodes"></div></section>
-<section class="section"><h2 class="section-title">Инбаунды мастера</h2><div class="tablewrap"><table id="inbounds"></table></div></section>
-<section class="section"><h2 class="section-title">Топ пользователей по потреблённому трафику</h2><div class="tablewrap"><table id="users"></table></div></section>
-<footer>XKIT v<span id="ver">?</span> · сбор каждые 5 минут · опрос страницы каждые 30 секунд · PWA не кэширует метрики</footer>
-</main>
-<script>
-"use strict";
-var D=null;
-function $(id){return document.getElementById(id)}
-function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
-function fmtB(b){if(b==null||!isFinite(Number(b)))return "—";b=Number(b);var u=["Б","КиБ","МиБ","ГиБ","ТиБ"],i=0;while(Math.abs(b)>=1024&&i<4){b/=1024;i++}return (i?b.toFixed(1):String(Math.round(b)))+" "+u[i]}
-function fmtRate(b){return b==null?"—":fmtB(b)+"/с"}
-function pct(v){return v==null?"—":Number(v).toFixed(1)+"%"}
-function age(ts){if(!ts)return "неизвестно";var s=Math.max(0,Math.floor(Date.now()/1000-ts));if(s<60)return s+" сек назад";if(s<3600)return Math.floor(s/60)+" мин назад";return Math.floor(s/3600)+" ч назад"}
-function svcB(s){var c=s==="active"?"ok":(s==="inactive"||s==="failed"?"bad":"warn");return '<span class="badge '+c+'">'+esc(s||"n/a")+'</span>'}
-function panB(s){return '<span class="badge '+(s==="ok"?"ok":(s==="fail"||s==="down"?"bad":"warn"))+'">'+esc(s||"n/a")+'</span>'}
-function stB(s){return '<span class="badge '+(s==="ok"?"ok":"bad")+'">'+(s==="ok"?"TCP доступен":"TCP недоступен")+'</span>'}
-function expChip(d,dl){if(!d)return '<span class="mut">—</span>';var c=dl==null||dl<=30?"warn":"ok";if(dl!=null&&dl<0)c="bad";return '<span class="pill '+c+'">'+esc(d)+(dl==null?"":" · "+dl+" дн.")+'</span>'}
-function certChip(ts){if(!ts)return '<span class="mut">сертификат: —</span>';var d=new Date(ts*1000),dl=Math.ceil((ts-Date.now()/1000)/86400);return expChip(d.toISOString().slice(0,10),dl)}
-function keyExp(ms){if(!ms||ms<=0)return '<span class="mut">∞</span>';return expChip(new Date(ms).toISOString().slice(0,10),Math.ceil((ms-Date.now())/86400000))}
-function spark(a,key){var v=(a||[]).map(function(x){return x[key]}).filter(function(x){return typeof x==="number"&&isFinite(x)});if(v.length<2)return '<div class="metric-detail">история накапливается</div>';var min=Math.min.apply(null,v),max=Math.max.apply(null,v),range=max-min||1,pts=v.map(function(x,i){return (i*100/(v.length-1)).toFixed(1)+","+(30-(x-min)*26/range).toFixed(1)}).join(" ");return '<svg class="spark" viewBox="0 0 100 34" preserveAspectRatio="none" aria-hidden="true"><polyline points="'+pts+'"/></svg>'}
-function probe(label,s){var good=s==="ok"||s==="active",bad=s==="down"||s==="fail"||s==="unavailable";return '<span class="probe '+(good?"good":bad?"bad":"")+'">'+esc(label)+' '+esc(s||"unknown")+'</span>'}
-function render(){if(!D)return;$("ver").textContent=D.version||"?";$("hdr").textContent=(D.host||"?")+" · снимок "+(D.generated_str||"?")+(D.stale?" · данные панели устарели":"");$("freshness").textContent="СНИМОК: "+age(D.generated).toUpperCase();var solo=$("solo");solo.style.display=D.mode==="solo"?"block":"none";solo.textContent="Одиночный режим: ноды не подключены. Добавление: xkit nodes.";
- var m=D.master||{},t=D.totals||{},em=D.expiry_master,c="";
- c+='<div class="panel"><h2>'+(D.mode==="solo"?"Этот сервер":"Этот сервер (мастер)")+'</h2><div class="kv"><span>nginx / 3X-UI</span><b>'+svcB(m.nginx)+' '+svcB(m.xui)+'</b></div><div class="kv"><span>CPU load / RAM</span><b>'+esc(m.load1==null?"—":m.load1)+' / '+pct(m.mem_pct)+'</b></div><div class="kv"><span>Диск / Uptime</span><b>'+pct(m.disk_pct)+' / '+(m.uptime_days==null?"—":m.uptime_days.toFixed(1)+" дн.")+'</b></div><div class="kv"><span>3X-UI / Xray</span><b>'+esc(m.xui_version||"—")+' / '+esc(m.xray_version||"—")+'</b></div><div class="kv"><span>Сертификат</span><b>'+esc(m.cert_end||"—")+'</b></div></div>';
- c+='<div class="panel"><h2>Трафик мастера</h2><div class="kv"><span>Отдано</span><b>'+fmtB(t.up)+'</b></div><div class="kv"><span>Принято</span><b>'+fmtB(t.down)+'</b></div><div class="kv"><span>Всего</span><b>'+fmtB(t.total)+'</b></div><div class="kv"><span>Балансировка</span><b>'+esc(D.strategy||"—")+'</b></div></div>';
- c+='<div class="panel"><h2>Аренда мастера</h2>'+(em&&em.date?'<div class="kv"><span>Действует до</span>'+expChip(em.date,em.days_left)+'</div>'+(em.note?'<div class="kv"><span>Заметка</span><b>'+esc(em.note)+'</b></div>':''):'<div class="mut">Срок не задан.<br>xkit expiry set master ГГГГ-ММ-ДД</div>')+'</div>';$("cards").innerHTML=c;
- var ns=D.nodes||[],h="";if(!ns.length)h='<div class="notice">Нод нет</div>';for(var i=0;i<ns.length;i++){var n=ns[i],hist=(D.history||{})[n.name]||[],pr=n.probes||{};
- h+='<article class="node '+(n.stale?"stale":"fresh")+'"><div class="node-head"><div><span class="node-name">'+esc(n.name)+'</span> <span class="host">'+esc(n.host)+':'+esc(n.tunnel_port)+'</span>'+(n.note?'<div class="mut">'+esc(n.note)+'</div>':'')+'</div><div>'+stB(n.status)+' '+panB(n.panel)+(n.stale?' <span class="badge warn">stale</span>':'')+'</div></div>';
- h+='<div class="node-grid"><div><div class="metric-label">Скорость / интервал</div><div class="metric-value">'+fmtRate(n.rate_bps)+'</div><div class="metric-detail">'+fmtB(n.interval_total)+' за интервал · ↑ '+fmtB(n.interval_up)+' ↓ '+fmtB(n.interval_down)+'</div>'+spark(hist,"rate_bps")+'</div>';
- h+='<div><div class="metric-label">CPU / RAM / load</div><div class="metric-value">'+pct(n.cpu_pct)+' / '+pct(n.ram_pct)+'</div><div class="metric-detail">load '+(n.load1==null?"—":esc(n.load1))+' · SSH '+esc(n.resources||"unknown")+'</div>'+spark(hist,"cpu_pct")+'</div>';
- h+='<div><div class="metric-label">Накопленный трафик</div><div class="metric-value">'+fmtB(n.total)+'</div><div class="metric-detail">↑ '+fmtB(n.up)+' · ↓ '+fmtB(n.down)+'<br>Отклик '+(n.latency_ms==null?"—":n.latency_ms+" мс")+' · inbound '+esc(n.clients==null?"—":n.clients)+'</div></div>';
- h+='<div><div class="metric-label">Версии / сроки</div><div class="metric-value">'+esc(n.xui_version||"—")+' / '+esc(n.xray_version||"—")+'</div><div class="metric-detail">3X-UI / Xray · '+certChip(n.cert_expiry)+'<br>Аренда '+expChip(n.expiry,n.days_left)+'</div></div></div>';
- h+='<div class="probes">'+probe("TCP",pr.tcp)+probe("API",pr.api)+probe("SSH",pr.ssh)+probe("UDP",pr.udp)+probe("CLIENT",pr.client)+'</div><div class="metric-detail" style="margin-top:8px">Опрос: '+age(n.observed_at)+' · последний TCP-ответ: '+age(n.last_seen)+(n.error?' · '+esc(n.error):'')+'</div></article>'}
- $("nodes").innerHTML=h;
- var ib=D.inbounds||[],h2='<tr><th>Инбаунд</th><th>Порт</th><th>Протокол</th><th>Статус</th><th>Клиентов</th><th>↑</th><th>↓</th><th>Σ</th></tr>';for(var j=0;j<ib.length;j++){var b=ib[j];h2+='<tr><td>'+esc(b.tag)+'</td><td class="num">'+esc(b.port)+'</td><td>'+esc(b.proto)+'</td><td>'+(b.enable?'<span class="ok">вкл</span>':'<span class="warn">выкл</span>')+'</td><td class="num">'+esc(b.clients)+'</td><td class="num">'+fmtB(b.up)+'</td><td class="num">'+fmtB(b.down)+'</td><td class="num">'+fmtB(b.total)+'</td></tr>'}if(!ib.length)h2+='<tr><td colspan="8" class="mut">Нет данных</td></tr>';$("inbounds").innerHTML=h2;
- var us=D.users||[],h3='<tr><th>Пользователь</th><th>Инбаунд</th><th>↑</th><th>↓</th><th>Σ</th><th>Срок ключа</th></tr>';for(var k=0;k<us.length;k++){var u=us[k];h3+='<tr><td>'+esc(u.email)+'</td><td class="mut">'+esc(u.ib)+'</td><td class="num">'+fmtB(u.up)+'</td><td class="num">'+fmtB(u.down)+'</td><td class="num">'+fmtB(u.total)+'</td><td>'+keyExp(u.expiryTime)+'</td></tr>'}if(!us.length)h3+='<tr><td colspan="6" class="mut">Нет данных</td></tr>';$("users").innerHTML=h3}
-function load(){fetch("./data.json?ts="+Date.now(),{cache:"no-store",credentials:"same-origin"}).then(function(r){if(!r.ok)throw new Error("HTTP "+r.status);return r.json()}).then(function(j){D=j;$("err").style.display="none";$("offline").style.display="none";render()}).catch(function(e){$("err").textContent="Актуальные метрики недоступны: "+e.message+". Выполните xkit dash gen или дождитесь cron.";$("err").style.display="block";if(!D)$("offline").style.display="block"})}
-load();setInterval(load,30000);setInterval(function(){if(D)render()},60000);
-if("serviceWorker" in navigator)window.addEventListener("load",function(){navigator.serviceWorker.register("./sw.js").catch(function(){})});
-</script></body></html>
-HTML
-}
-
-dash_install() {
-  require_root
-  load_xkit_env || die "Сначала установка (пункт 1)"
-  [ -n "${XKIT_HOST:-}" ] || die "Сначала установка (пункт 1)"
-
-  echo ""
-  echo -e "${YELLOW}=== ВЕБ-ДАШБОРД: статусы нод, каналы, трафик, сроки аренды ===${NC}"
-  echo "Секретная страница рядом с панелью: https://${XKIT_HOST}/d-<токен>/"
-  echo "(без токена — обычный 404, как у панели; сверх токена — Basic Auth; access_log выключен)"
-
-  if [ -z "${XKIT_DASH_TOKEN:-}" ]; then
-    XKIT_DASH_TOKEN="$(rand_str 24)"
-  fi
-  # Basic Auth — как у панели: случайные логин/пароль (хранятся в xkit.env, 600)
-  XKIT_DASH_AUTH="1"
-  if [ -z "${XKIT_DASH_USER:-}" ] || [ -z "${XKIT_DASH_PASS:-}" ]; then
-    XKIT_DASH_USER="$(dash_user_gen)"
-    XKIT_DASH_PASS="$(rand_str 20)"
-  fi
-  dash_htpasswd_write || { err "Не удалось создать htpasswd для дашборда"; return 1; }
-  local allow a ok_all _al _ka
-  if [ -n "${XKIT_DASH_ALLOW:-}" ]; then
-    log "Текущее ограничение IP: ${XKIT_DASH_ALLOW}"
-    confirm "Оставить ограничение IP как есть? [Y/n] " y || XKIT_DASH_ALLOW=""
-  fi
-  if [ -z "${XKIT_DASH_ALLOW:-}" ]; then
-    read -r -p "Ограничить доступ по IP/CIDR (несколько — через запятую; Enter — доступ с любого): " allow
-    if [ -n "$allow" ]; then
-      ok_all=1
-      IFS=',' read -ra _al <<<"$allow"
-      for a in "${_al[@]}"; do
-        a="${a// /}"; [ -n "$a" ] || continue
-        is_ip "$a" || is_cidr "$a" || { err "Не похоже на IP/CIDR: $a"; ok_all=0; }
-      done
-      [ "$ok_all" = "1" ] || return 1
-      XKIT_DASH_ALLOW="$allow"
-    else
-      XKIT_DASH_ALLOW=""
-    fi
-  fi
-  XKIT_DASH="1"
-  save_xkit_env
-
-  local mexp mexd
-  mexp="$(expiry_get master -)"
-  if [ -z "$mexp" ]; then
-    read -r -p "Срок аренды ЭТОГО сервера (DD.MM.YYYY или YYYY-MM-DD, Enter — пропустить): " mexd
-    [ -n "$mexd" ] && expiry_set master "-" "$mexd" ""
-  fi
-
-  log "Пересобираю конфиг nginx (секретный location дашборда)..."
-  regen_conf_and_apply || { err "Не удалось применить конфиг nginx — дашборд НЕ установлен"; XKIT_DASH="0"; save_xkit_env; return 1; }
-  dash_cron_install
-  log "Первое построение данных..."
-  dash_gen || warn "Первое построение не удалось — cron повторит через 5 минут"
-
-  echo ""
-  ok "Дашборд установлен: https://${XKIT_HOST}$(dash_path)"
-  ok "Логин: ${XKIT_DASH_USER}   Пароль: ${XKIT_DASH_PASS}   (Basic Auth; ротация: xkit dash rotate)"
-  [ -n "${XKIT_DASH_ALLOW:-}" ] && ok "Доступ ограничен IP/CIDR: ${XKIT_DASH_ALLOW}"
-  ok "Данные: cron каждые 5 минут; на странице автообновление каждые 30 сек"
-  ok "Реквизиты также в ${XKIT_INFO_FILE} и ${XKIT_ENV} (chmod 600)"
-  warn "Ссылку потеряли: xkit dash url. Выключить: xkit dash uninstall"
-  xkit_summary_save >/dev/null 2>&1 || true
-  return 0
-}
-
-dash_uninstall() {
-  require_root
-  load_xkit_env 2>/dev/null || true
-  XKIT_DASH="0"
-  save_xkit_env >/dev/null 2>&1 || true
-  rm -f "$XKIT_CRON_DASH"
-  if [ -f "$XKIT_CONF" ]; then
-    log "Убираю location дашборда из nginx..."
-    regen_conf_and_apply >/dev/null 2>&1 || warn "Не удалось пересобрать конфиг nginx — проверьте вручную"
-  fi
-  ok "Дашборд выключен (nginx + cron); файлы в ${XKIT_DASH_DIR} сохранены"
-  ok "Логин/пароль дашборда сохранены в ${XKIT_ENV} — повторный install их не меняет (сменить: xkit dash rotate)"
-  ok "Сроки аренды (expiry) не тронуты — вернуть дашборд: xkit dash install"
-  return 0
-}
-
-# ротация секрета дашборда: новый токен URL + новый логин/пароль Basic Auth
-# (если токен/пароль засветились — не надо переустанавливать дашборд целиком)
-dash_rotate() {
-  require_root
-  load_xkit_env || die "Сначала установка (пункт 1)"
-  [ "${XKIT_DASH:-0}" = "1" ] && [ -n "${XKIT_DASH_TOKEN:-}" ] \
-    || die "Дашборд не установлен (xkit dash install)"
-  local old_token="${XKIT_DASH_TOKEN}" old_user="${XKIT_DASH_USER}" old_pass="${XKIT_DASH_PASS}"
-  log "Старый URL (перестанет работать): https://${XKIT_HOST}$(dash_path)"
-  # бэкап htpasswd: откат — КОПИРОВАНИЕМ, а не пересчётом openssl (аудит №6:
-  # пересчёт мог упасть и оставить новый пароль в htpasswd при старом env)
-  local htbk; htbk="$(mktemp /tmp/.xkit-htbk.XXXXXX 2>/dev/null)" || htbk=""
-  if [ -n "$htbk" ]; then
-    # (мелочь №4, аудит v5.2.1): cp не удался — подчищаем созданный mktemp-файл
-    if cp -f "$XKIT_DASH_HTPASSWD" "$htbk" 2>/dev/null; then :; else rm -f "$htbk"; htbk=""; fi
-  fi
-  if [ -z "$htbk" ]; then
-    # №4 (аудит №1): без бэкапа откат невозможен — рассинхрон «nginx требует
-    # новый пароль, env — старый». Честно отменяем ДО генерации новых значений
-    err "Не удалось создать бэкап htpasswd — ротация отменена, ничего не изменено"
-    return 1
-  fi
-  XKIT_DASH_TOKEN="$(rand_str 24)"
-  XKIT_DASH_USER="$(dash_user_gen)"
-  XKIT_DASH_PASS="$(rand_str 20)"
-  # htpasswd перезаписывается НОВЫМ паролем — при сбое apply откатим и его
-  if ! dash_htpasswd_write; then
-    err "Не удалось записать htpasswd"
-    XKIT_DASH_TOKEN="$old_token"; XKIT_DASH_USER="$old_user"; XKIT_DASH_PASS="$old_pass"
-    [ -n "$htbk" ] && rm -f "$htbk"
-    return 1
-  fi
-  # ВАЖНО (аудит №4): env на диск — только ПОСЛЕ успешного apply. Иначе при
-  # падении regen_conf_and_apply nginx откатится на старый путь, а в xkit.env
-  # остался бы новый токен: «ротация прошла», а URL отдаёт 404 (рассинхрон)
-  if ! regen_conf_and_apply; then
-    XKIT_DASH_TOKEN="$old_token"; XKIT_DASH_USER="$old_user"; XKIT_DASH_PASS="$old_pass"
-    if [ -n "$htbk" ] && [ -f "$htbk" ]; then
-      if cp -f "$htbk" "$XKIT_DASH_HTPASSWD"; then
-        chown root:www-data "$XKIT_DASH_HTPASSWD" 2>/dev/null || true
-        chmod 640 "$XKIT_DASH_HTPASSWD" 2>/dev/null || true
-      else
-        err "ВНИМАНИЕ: старый htpasswd не восстановлен — выполните xkit dash rotate повторно"
-      fi
-      rm -f "$htbk"
-    else
-      dash_htpasswd_write 2>/dev/null || err "ВНИМАНИЕ: вернуть старый htpasswd не удалось — выполните xkit dash rotate повторно"
-    fi
-    err "Не удалось применить конфиг nginx — ротация ОТМЕНЕНА (старые реквизиты действуют)"
-    return 1
-  fi
-  [ -n "$htbk" ] && rm -f "$htbk" 2>/dev/null
-  # аудит №13: apply уже прошёл — при сбое записи env новые реквизиты остались
-  # бы только в этом выводе; кричим об этом явно
-  save_xkit_env || err "Не удалось сохранить xkit.env — НОВЫЕ реквизиты напечатаны выше, запишите их вручную"
-  echo ""
-  ok "Дашборд ротирован: https://${XKIT_HOST}$(dash_path)"
-  ok "Новый логин: ${XKIT_DASH_USER}   Пароль: ${XKIT_DASH_PASS}"
-  warn "Старая ссылка и старый пароль больше не работают"
-  xkit_summary_save >/dev/null 2>&1 || true
-  return 0
-}
-
-dash_url() {
-  load_xkit_env 2>/dev/null || return 1
-  [ "${XKIT_DASH:-0}" = "1" ] && [ -n "${XKIT_DASH_TOKEN:-}" ] \
-    || { err "Дашборд не установлен (xkit dash install)"; return 1; }
-  printf 'https://%s%s\n' "${XKIT_HOST}" "$(dash_path)"
-  [ -n "${XKIT_DASH_USER:-}" ] \
-    && printf 'Логин: %s   Пароль: %s\n' "${XKIT_DASH_USER}" "${XKIT_DASH_PASS}"
-  return 0
-}
-
-dash_menu() {
-  require_root
-  load_xkit_env 2>/dev/null || true
-  while true; do
-    echo ""
-    echo -e "${YELLOW}=== СТРАНИЦА СОСТОЯНИЯ (серверы / соединения / трафик / аренда) ===${NC}"
-    if [ "${XKIT_DASH:-0}" = "1" ] && [ -n "${XKIT_DASH_TOKEN:-}" ]; then
-      ok "Установлен: https://${XKIT_HOST:-?}$(dash_path)"
-      [ -n "${XKIT_DASH_ALLOW:-}" ] && log "Доступ ограничен IP: ${XKIT_DASH_ALLOW}"
-    else
-      warn "Не установлен"
-    fi
-    echo " 1) Установить / переустановить (адрес, автообновление и первые данные)"
-    echo " 2) Обновить данные сейчас"
-    echo " 3) Показать адрес страницы"
-    echo " 4) Сменить адрес страницы и логин/пароль"
-    echo " 5) Выключить страницу (данные и сроки аренды сохранятся)"
-    echo " 0) Назад"
-    local c
-    read -r -p "Выбор: " c || return 0
-    case "$c" in
-      1) dash_install; pause_enter ;;
-      2) dash_gen; pause_enter ;;
-      3) dash_url; pause_enter ;;
-      4) dash_rotate; pause_enter ;;
-      5) dash_uninstall; pause_enter ;;
-      0) return 0 ;;
-      *) warn "Нет такого пункта" ;;
-    esac
-  done
-}
 
 #=========================== v4.5: TELEGRAM-АЛЕРТЫ =============================
 # Принцип: шлём ТОЛЬКО то, чего 3X-UI не знает (ноды/аренда/сертификат/
@@ -8368,21 +7756,22 @@ dash_menu() {
 xkit_tg_send() { # $1 текст; 0 = доставлено или TG не настроен
   local msg="$1" token="${XKIT_TG_TOKEN:-}" chat="${XKIT_TG_CHAT:-}"
   [ -n "$token" ] && [ -n "$chat" ] || return 0   # TG не настроен — тихо
-  # №9 (аудит №1): токен из env уходит в curl-конфиг — убеждаемся в формате,
-  # иначе мусор/инъекция из xkit.env доедет до curl
   [[ "$token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,46}$ ]] \
     || { warn "TG-токен в env невалиден — уведомление пропущено (xkit 6 → 2 — перенастройте)"; return 1; }
   [ -n "$msg" ] || return 0
-  # urlencoded POST-body (chat_id и text кодируются @uri: переводы строк -> %0A,
-  # кавычек/бэкслэшей не остаётся — строка безопасна для curl-конфига)
+  # v8.0.0: единый транспорт tg_api (напрямую -> ssh-D ноды -> прокси, ротация).
+  # РФ-мастер: доставка через ноды (SOCKS5 поверх управляющего SSH, DPI не палит).
+  if declare -F tg_send_message >/dev/null 2>&1; then
+    tg_send_message "$chat" "$msg" && return 0
+    return 1
+  fi
+  # фолбэк (tg_transport не загружен): напрямую + SSH-curl ноды (старая схема)
   local data
   data="$(jq -rn --arg c "$chat" --arg t "$msg" '"chat_id=\($c|@uri)&text=\($t|@uri)"' 2>/dev/null)" || return 1
   local -a px=()
   [ -n "${XKIT_TG_PROXY:-}" ] && px=(--proxy "$XKIT_TG_PROXY")
-  # (1) напрямую с мастера
   { printf 'request = "POST"\nurl = "https://api.telegram.org/bot%s/sendMessage"\ndata = "%s"\n' "$token" "$data"; } \
     | curl -sf --max-time 8 ${px[@]+"${px[@]}"} -K - -o /dev/null 2>/dev/null && return 0
-  # (2) через ноды по SSH: curl на ноде, выход с её IP
   local rec
   while IFS= read -r rec; do
     [ -z "$rec" ] && continue
@@ -8519,20 +7908,21 @@ notify_check() {
     [ -n "$nmsg" ] && L+=("Нода ${name}: ${nmsg}")
   done < <(nodes_load | jq -c '.[]' 2>/dev/null)
 
-  # --- аренда: алерт при <=7 дн. и при истечении; дедуп по числу дней ---
+  # --- аренда: напоминания за 7/3/1 день + истечение; дедуп по числу дней ---
   local s i d note dl last
   if [ -s "$XKIT_EXPIRY" ]; then
     while IFS=$'\t' read -r s i d note; do
       [ -z "$s" ] && continue
       dl="$(days_left "$d")"
       [ -n "$dl" ] || continue
-      if [ "$dl" -le 7 ]; then
+      # v8.0.0: напоминания именно за 7, 3, 1 день (и истечение), не каждый день
+      if [ "$dl" = 7 ] || [ "$dl" = 3 ] || [ "$dl" = 1 ] || [ "$dl" -lt 0 ]; then
         last="$(notify_state_get "exp:${s}/${i}")"
         if [ "${last:-x}" != "$dl" ]; then
           if [ "$dl" -lt 0 ]; then
-            L+=("Аренда ИСТЕКЛА: ${s}/${i} (${d})${note:+ — ${note}}")
+            L+=("Аренда ИСТЕКЛА: ${s}/${i} (${d})${note:+ — ${note}}. Продлить: /expire ${i} <DD.MM.YYYY>")
           else
-            L+=("Осталось ${dl} дн. аренды: ${s}/${i} (${d})${note:+ — ${note}}")
+            L+=("Осталось ${dl} дн. аренды: ${s}/${i} (${d})${note:+ — ${note}}. Продлить: /expire ${i} <DD.MM.YYYY>")
           fi
           notify_state_set "exp:${s}/${i}" "$dl"
         fi
@@ -8557,25 +7947,6 @@ notify_check() {
   fi
 
   # --- дашборд: data.json не обновлялся >25 мин (5 пропусков cron) ---
-  if [ "${XKIT_DASH:-0}" = "1" ] && [ -r "${XKIT_DASH_DIR}/data.json" ]; then
-    local gen age
-    gen="$(jq -r '.generated // 0' "${XKIT_DASH_DIR}/data.json" 2>/dev/null || echo 0)"
-    case "$gen" in ''|*[!0-9]*) gen=0 ;; esac
-    if [ "$gen" -gt 0 ]; then
-      age=$(( $(date +%s) - gen ))
-      if [ "$age" -gt 1500 ]; then
-        if [ "$(notify_state_get "dash")" != "stale" ]; then
-          L+=("Дашборд не обновляется: данные от $(date -d "@$gen" '+%d.%m %H:%M' 2>/dev/null || echo '?')")
-          notify_state_set "dash" "stale"
-        fi
-      else
-        if [ "$(notify_state_get "dash")" = "stale" ]; then
-          notify_state_set "dash" ""
-          L+=("Дашборд снова обновляется")
-        fi
-      fi
-    fi
-  fi
 
   [ "${#L[@]}" -eq 0 ] && return 0
   local msg="[XKIT] ${XKIT_HOST:-сервер}" ln
@@ -8590,7 +7961,7 @@ notify_check() {
 
 notify_cron_install() {
   cat > "$XKIT_CRON_NOTIFY" <<EOF
-# XKIT: Telegram-алерты (ноды/аренда/сертификат/дашборд) каждые 10 минут
+# XKIT: Telegram-алерты (ноды/аренда/сертификат) каждые 10 минут
 */10 * * * * root ${XKIT_BIN} telegram check >/dev/null 2>&1
 EOF
   chmod 644 "$XKIT_CRON_NOTIFY"
@@ -8606,27 +7977,32 @@ telegram_setup() {
   if [ -n "${XKIT_TG_TOKEN:-}" ]; then
     ok "Уже настроено (чат ${XKIT_TG_CHAT}) — повторный запуск заменит реквизиты"
   fi
-  echo "Приходит только то, чего 3X-UI НЕ знает: нода упала/восстановилась,"
-  echo "аренда <=7 дн. или истекла, сертификат <=14 дн., дашборд stale."
-  echo "Бот-команды и уведомления о клиентах остаются у 3X-UI (не дублируем)."
-  echo "Доставка: с мастера напрямую; если не проходит — через ноды (их IP)."
+  echo "v8.0.0: полноценный бот управления (пользователи/ноды/сроки/транспорт)."
+  echo "Алерты: нода down, аренда за 7/3/1 день и истечение, сертификат."
+  echo "ВАЖНО (РФ-мастер): api.telegram.org заблокирован — бот ходит ЧЕРЕЗ НОДЫ"
+  echo "(ssh -D SOCKS5 поверх управляющего SSH, DPI не палит). Нужна хотя бы одна"
+  echo "нода или прокси. Транспорты: xkit telegram transport."
   local tok chat px admins
   read -r -p "Bot token (от @BotFather, вид 123456:ABC-...): " tok
   [[ "$tok" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,46}$ ]] || { err "Токен не похож на валидный"; return 1; }
   read -r -p "Chat ID (число от @userinfobot, или @имя_канала): " chat
   [[ "$chat" =~ ^-?[0-9]+$|^@[A-Za-z0-9_]{4,64}$ ]] || { err "Chat ID: число (личка/группа) или @имя_канала"; return 1; }
-  read -r -p "Прокси для api.telegram.org (http://... или socks5://...; Enter — без прокси): " px
-  admins="$chat"; [[ "$admins" =~ ^-?[0-9]+$ ]] || admins=""
+  read -r -p "Admin IDs (числовые Telegram ID админов через запятую; Enter = chat): " admins
+  admins="${admins:-$chat}"
+  # валидация: только числа/запятые/минус
+  [[ "$admins" =~ ^-?[0-9]+(,-?[0-9]+)*$ ]] || { err "Admin IDs: числа через запятую (от @userinfobot)"; return 1; }
+  read -r -p "Прокси для api.telegram.org (http://... или socks5://...; Enter — через ноды): " px
   XKIT_TG_TOKEN="$tok"; XKIT_TG_CHAT="$chat"; XKIT_TG_PROXY="$px"; XKIT_TG_ADMINS="$admins"
   save_xkit_env
   notify_cron_install
+  # синхронизировать транспорты нод (если ноды есть)
+  tg_transports_sync_nodes 2>/dev/null || true
   log "Отправляю тестовое сообщение..."
-  if xkit_tg_send "[XKIT] ${XKIT_HOST:-сервер}: Telegram настроен. Алерты: ноды, аренда, сертификат, дашборд."; then
+  if xkit_tg_send "[XKIT] ${XKIT_HOST:-сервер}: Telegram настроен (v8 бот). Админы: ${admins}. Включить бота: xkit telegram bot on"; then
     ok "Тестовое сообщение доставлено"
   else
-    warn "Прямая отправка не прошла. Если api.telegram.org недоступен с этого"
-    warn "сервера — сообщения пойдут через ноды (после их добавления)."
-    warn "Проверка вручную: xkit telegram check"
+    warn "Отправка не прошла. РФ-мастер: добавьте ноду (xkit nodes) или прокси"
+    warn "(xkit telegram transport add socks5 <url>), затем: xkit telegram check"
   fi
   xkit_summary_save >/dev/null 2>&1 || true
   return 0
@@ -8648,16 +8024,19 @@ telegram_menu() {
   load_xkit_env 2>/dev/null || true
   while true; do
     echo ""
-    echo -e "${YELLOW}=== УВЕДОМЛЕНИЯ В TELEGRAM (серверы/аренда/сертификаты) ===${NC}"
+    echo -e "${YELLOW}=== TELEGRAM: БОТ УПРАВЛЕНИЯ + УВЕДОМЛЕНИЯ (v8.0.0) ===${NC}"
     if [ -n "${XKIT_TG_TOKEN:-}" ] && [ -n "${XKIT_TG_CHAT:-}" ]; then
-      ok "Настроено: чат ${XKIT_TG_CHAT}${XKIT_TG_PROXY:+, прокси ${XKIT_TG_PROXY}}"
+      ok "Настроено: чат ${XKIT_TG_CHAT}, админы ${XKIT_TG_ADMINS:-—}"
+      if systemctl is-active xkit-telegram-bot >/dev/null 2>&1; then ok "Бот: запущен (systemd)"; else warn "Бот: не запущен (пункт 5)"; fi
     else
-      warn "Не настроено (xkit telegram setup)"
+      warn "Не настроено (пункт 1)"
     fi
-    echo " 1) Настроить / заменить (ключ бота + чат + тестовое сообщение)"
-    echo " 2) Проверить сейчас (те же проверки, что автоматически каждые 10 минут)"
+    echo " 1) Настроить / заменить (ключ бота + чат + Admin IDs)"
+    echo " 2) Проверить сейчас (ноды/аренда/сертификат)"
     echo " 3) Отправить тестовое сообщение"
-    echo " 4) Выключить (ключ удаляется, автоматические проверки отключаются)"
+    echo " 4) Выключить уведомления (ключ удаляется)"
+    echo " 5) Бот управления: включить / выключить / статус"
+    echo " 6) Транспорты TG (через ноды/прокси): список / проверка / добавить"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -8668,6 +8047,11 @@ telegram_menu() {
          if xkit_tg_send "[XKIT] тест: канал доставки работает"; then ok "Доставлено"; else err "Не доставлено (напрямую и через ноды)"; fi
          pause_enter ;;
       4) telegram_off; pause_enter ;;
+      5) echo " 1) Включить бота (systemd)  2) Выключить  3) Статус  0) Назад"
+         local b; read -r -p "Выбор: " b
+         case "$b" in 1) telegram_bot_service on ;; 2) telegram_bot_service off ;; 3) telegram_bot_service status ;; esac
+         pause_enter ;;
+      6) tg_transport_menu ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac
@@ -8711,18 +8095,6 @@ xkit_summary_text() { # stdout: plain-текст без цветов
     # v7.4.2: живой вопрос пользователя «где теперь логин/пароль панели» —
     # показываем хранилище-источник явно (сводка с паролем: cat ${XKIT_INFO_FILE})
     [ -n "${PANEL_USER:-}" ] && L+=("Источник пароля:   /etc/x-ui/install-result.env (обновляет установщик 3X-UI)")
-    if [ "${XKIT_DASH:-0}" = "1" ] && [ -n "${XKIT_DASH_TOKEN:-}" ]; then
-      L+=("Веб-дашборд:       https://${XKIT_HOST}$(dash_path)")
-      [ -n "${XKIT_DASH_USER:-}" ] && L+=("Логин дашборда:    ${XKIT_DASH_USER}")
-      if [ -n "${XKIT_DASH_PASS:-}" ]; then
-        if [ "$show_secrets" = "1" ]; then
-          L+=("Пароль дашборда:   ${XKIT_DASH_PASS}")
-        else
-          L+=("Пароль дашборда:   ********  (полные реквизиты: cat ${XKIT_INFO_FILE})")
-        fi
-      fi
-      [ -n "${XKIT_DASH_ALLOW:-}" ] && L+=("Дашборд: allow IP: ${XKIT_DASH_ALLOW}")
-    fi
     # v4.5: состояние Telegram-алертов (токен не показываем)
     if [ -n "${XKIT_TG_TOKEN:-}" ] && [ -n "${XKIT_TG_CHAT:-}" ]; then
       L+=("Telegram алерты:   включены (чат ${XKIT_TG_CHAT})")
@@ -8950,8 +8322,31 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
   # v5.2: после ядра/меню атомарно обновляем модуль протоколов и TUI.
   xkit_extras_install || warn "Дополнительные компоненты обновятся при следующем запуске"
   rm -f "${XKIT_DIR}/update-check.json"
+  # v8.0.0: миграция — снос веб-дашборда (заменён Telegram-ботом). Идемпотентно:
+  # cron, nginx-локация, файлы, htpasswd. Метрики нод (nodes_metrics_collect) целы.
+  xkit_dash_migrate_remove
   ok "Обновлено: v${XKIT_VERSION} -> v${nv} ($XKIT_BIN); резервная копия: ${XKIT_BIN}.bak"
   ok "Конфиг nginx, состояние и подписки не тронуты"
+  return 0
+}
+
+# v8.0.0: снос остатков веб-дашборда при обновлении/установке (идемпотентно).
+xkit_dash_migrate_remove() {
+  local changed=0
+  rm -f /etc/cron.d/xkit-dash 2>/dev/null && changed=1
+  rm -f /etc/nginx/.xkit-dash.htpasswd 2>/dev/null && changed=1
+  if [ -d /var/lib/xkit/dash ]; then rm -rf /var/lib/xkit/dash 2>/dev/null && changed=1; fi
+  # nginx-локация dash: удалить блок из xkit.conf если остался (generate_dash_block)
+  if [ -f "${XKIT_CONF:-/etc/nginx/sites-available/xkit.conf}" ] && grep -q "веб-дашборд xkit\|d-" "${XKIT_CONF:-/etc/nginx/sites-available/xkit.conf}" 2>/dev/null; then
+    python3 - "${XKIT_CONF:-/etc/nginx/sites-available/xkit.conf}" <<'PY' 2>/dev/null && changed=1
+import re,sys
+p=sys.argv[1]; s=open(p).read()
+s2=re.sub(r'\n?[ \t]*# --- веб-дашборд xkit[^\n]*\n.*?\n[ \t]*\}[ \t]*\n','\n',s,flags=re.S)
+if s2!=s: open(p,'w').write(s2)
+PY
+    nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+  fi
+  [ "$changed" = 1 ] && log "Веб-дашборд удалён (v8.0.0: заменён Telegram-ботом); метрики нод сохранены"
   return 0
 }
 
@@ -9158,7 +8553,18 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
   systemctl is-active --quiet nginx 2>/dev/null && nginx=true
   systemctl is-active --quiet x-ui 2>/dev/null && xui=true
   pgrep -x xray >/dev/null 2>&1 && xray=true
-  if [ -r "$XKIT_NODES" ]; then nodes="$(jq 'length' "$XKIT_NODES" 2>/dev/null || echo 0)"; fi
+  local node_names='[]' pool_link=""
+  if [ -r "$XKIT_NODES" ]; then
+    nodes="$(jq 'length' "$XKIT_NODES" 2>/dev/null || echo 0)"
+    node_names="$(jq -c '[.[].name]' "$XKIT_NODES" 2>/dev/null || echo '[]')"
+  fi
+  # v7.7.8: ссылка каскада в snapshot (TUI показывает «Ссылка каскада» без CLI)
+  if [ -n "${XKIT_POOL_INBOUND:-}" ] && kit_session >/dev/null 2>&1; then
+    local _pib _pcl
+    _pib="$(api_get_inbound "$XKIT_POOL_INBOUND" 2>/dev/null || true)"
+    _pcl="$(jq -c '.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[0] // empty' <<<"${_pib:-}" 2>/dev/null)"
+    [ -n "$_pcl" ] && pool_link="$(link_for_client "${_pib:-}" "$_pcl" 2>/dev/null || true)"
+  fi
   [[ "$nodes" =~ ^[0-9]+$ ]] || nodes=0
   [ "$nodes" -gt 0 ] && mode=master
   if [ -r "$XKIT_NODES_METRICS" ]; then
@@ -9169,8 +8575,6 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
     nodes_metrics="$(jq -c '[.nodes[]?|{name,status,panel,latency_ms,cpu_pct,ram_pct,load1,total,clients,resources,rate_bps,interval_total,interval_up,interval_down}]' "$XKIT_NODES_METRICS" 2>/dev/null || echo '[]')"
     metrics_generated="$(jq -r '.generated // 0' "$XKIT_NODES_METRICS" 2>/dev/null || echo 0)"
     nodes_ok="$(jq '[.nodes[]?|select(.status=="ok")]|length' "$XKIT_NODES_METRICS" 2>/dev/null || echo 0)"
-  elif [ -r "${XKIT_DASH_DIR}/data.json" ]; then
-    nodes_ok="$(jq '[.nodes[]?|select(.status=="ok")]|length' "${XKIT_DASH_DIR}/data.json" 2>/dev/null || echo 0)"
   fi
   [[ "$nodes_ok" =~ ^[0-9]+$ ]] || nodes_ok=0
   [[ "$metrics_generated" =~ ^[0-9]+$ ]] || metrics_generated=0
@@ -9206,7 +8610,8 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
     --argjson nginx "$nginx" --argjson xui "$xui" --argjson xray "$xray" \
     --argjson cert_days "$cert_days" --argjson backup_hours "$backup_hours" --argjson protocols "$protocols" \
     --argjson nodes_metrics "$nodes_metrics" --argjson metrics_generated "$metrics_generated" --argjson client_names "$client_names" \
-    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,client_names:$client_names,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,nodes_metrics:$nodes_metrics,metrics_generated:$metrics_generated,generated:$generated}'
+    --argjson node_names "$node_names" --arg pool_link "$pool_link" \
+    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,client_names:$client_names,node_names:$node_names,pool_link:$pool_link,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,nodes_metrics:$nodes_metrics,metrics_generated:$metrics_generated,generated:$generated}'
 }
 
 #=========================== ФАЙЛ ОТВЕТОВ (v7.2.0) ============================
@@ -9266,10 +8671,11 @@ xkit_menu_json() {
         {title:"Удалить сервер", desc:"Снять туннель и убрать из распределения", args:["nodes"], mode:"exec"}
       ]},
       {id:"monitoring", title:"Состояние и уведомления", items:[
-        {title:"Страница состояния", desc:"Серверы, соединения, трафик, срок аренды", args:["dash"], mode:"exec"},
         {title:"Проверка сервера и доступности", desc:"Службы, порты, nginx и панель", args:["health"], mode:"exec"},
         {title:"Проверить подключение как клиент", desc:"Реальный клиент по нашим ссылкам", args:["health","deep"], mode:"exec"},
-        {title:"Telegram-уведомления", desc:"Сертификаты, аренда, ошибки серверов", args:["telegram"], mode:"exec"},
+        {title:"Telegram: бот управления + уведомления", desc:"Бот v8 (inline-меню), транспорты через ноды, алерты", args:["telegram"], mode:"exec"},
+        {title:"Telegram-бот: включить / выключить", desc:"systemd-сервис бота управления", args:["telegram","bot","status"], mode:"exec"},
+        {title:"Транспорты Telegram", desc:"Через ноды (ssh -D) / прокси: список, проверка, добавить", args:["telegram","transport"], mode:"exec"},
         {title:"Сроки аренды серверов", desc:"Главный и дополнительные серверы", args:["expiry"], mode:"exec"},
         {title:"Данные для доступа", desc:"Пароли только в /root/xkit-info.txt", args:["info"], mode:"exec"}
       ]},
@@ -9342,6 +8748,7 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes panel-sync <имя|all> — добавить/обновить «Узлы» 3X-UI без импорта инбаундов
   xkit nodes hide <имя|all> — спрятать панель ноды за nginx 443 (loopback + секретный путь)
   xkit nodes ufw <имя|all> [on|status] — UFW ноды: статус / включить (SSH/80/443/туннель, остальное закрыть)
+  xkit nodes pool-link — ссылка каскада (вход мастера, балансировка по нодам)
   xkit nodes versions <имя|all> — версии 3X-UI/Xray на нодах (vs мастер и последний релиз)
   xkit nodes upgrade <имя|all> [vX.Y.Z] — обновить 3X-UI на нодах (бэкап + проверка панели)
   xkit nodes cert <имя|all> [self|ip|domain|wildcard] [домен] — сертификат панели ноды (wildcard выпускает мастер по dns-01)
@@ -9372,7 +8779,6 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit geodata update <tag> <sha256 geoip> <sha256 geosite> — pinned update
   xkit geodata auto — обновить до последнего релиза (SHA-256 издателя); timer — таймер 04:10
   xkit status          — сервисы, порты, что светится наружу
-  xkit dash [install|gen|url|rotate|uninstall] — веб-дашборд (статусы/трафик/аренда;
                          rotate — новый токен URL + новый логин/пароль)
   xkit expiry set <master|имя_ноды> ГГГГ-ММ-ДД [заметка]
   xkit expiry list|check|del <master|имя_ноды> — сроки аренды серверов
@@ -9405,7 +8811,6 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   $XKIT_CONF   — конфиг nginx (генерируется xkit, не правьте руками)
   $SUBS_DIR    — файлы подписок (base64, раздаются nginx по /s-<token>/)
   $XKIT_EXPIRY — сроки аренды серверов (мастер + ноды)
-  $XKIT_DASH_DIR — веб-дашборд (index.html + data.json)
   $XKIT_INFO_FILE — сводка-реквизиты (обновляется после установки и операций)
 EOF
 }
@@ -9463,6 +8868,7 @@ xkit_main_impl() {
                panel-sync) shift; node_panel_sync "${1:-}" ;;
                hide) shift; node_hide_one "${1:-}" ;;
                ufw) shift; node_ufw_one "${1:-}" "${2:-}" ;;
+               pool-link) shift; node_pool_link ;;
                versions) shift; nodes_versions "${1:-all}" ;;
                upgrade) shift; nodes_upgrade "${1:-}" "${2:-}" ;;
                cert) shift; node_cert_dispatch "$@" ;;
@@ -9518,15 +8924,8 @@ xkit_main_impl() {
                off) bbr_off ;;
                *) die "bbr: status | on | off" ;;
              esac ;;
-    dash)    shift; require_root
-             case "${1:-menu}" in
-               install|on) dash_install ;;
-               uninstall|off) dash_uninstall ;;
-               gen|build) dash_gen ;;
-               url) dash_url ;;
-               rotate|rekey) dash_rotate ;;
-               *) dash_menu ;;
-             esac ;;
+    dash)    err "Веб-дашборд удалён в 8.0.0 — управление через Telegram-бота (xkit telegram setup) или CLI/TUI."
+             echo "Метрики нод: xkit nodes health · Сроки аренды: xkit expiry · Статус: xkit status"; exit 1 ;;
     expiry)  shift; require_root
              case "${1:-menu}" in
                set) shift; expiry_cli_set "$@" ;;
@@ -9539,8 +8938,17 @@ xkit_main_impl() {
              case "${1:-menu}" in
                setup) telegram_setup ;;
                bot) shift
-                    case "${1:-status}" in once) telegram_bot_once ;; run) telegram_bot_run ;; on|off|status) telegram_bot_service "${1:-status}" ;; *) err "telegram bot once|run|on|off|status"; exit 1 ;; esac ;;
+                    case "${1:-status}" in once) telegram_bot_once ;; run) telegram_bot_run ;; on|off|status) telegram_bot_service "${1:-status}" ;; notify) shift; tg_bot_notify_result "${1:-}" "${2:-}" ;; *) err "telegram bot once|run|on|off|status|notify"; exit 1 ;; esac ;;
                check) load_xkit_env >/dev/null 2>&1 || true; notify_check ;;
+               transport) shift
+                    case "${1:-list}" in
+                      list) tg_transports_load | jq -r '.[]|"\(.type)  \(.node//.url//"direct")  статус=\(.status)"' ;;
+                      check) tg_transport_check_all ;;
+                      add) shift; tg_transport_add_proxy "${1:-}" "${2:-}" ;;
+                      remove) shift; tg_transport_remove "${1:-}" ;;
+                      sync) tg_transports_sync_nodes; ok "Транспорты нод синхронизированы" ;;
+                      *) tg_transport_menu ;;
+                    esac ;;
                test)  load_xkit_env >/dev/null 2>&1 || true
                       if xkit_tg_send "[XKIT] тест: канал доставки работает"; then ok "Доставлено"; else err "Не доставлено (напрямую и через ноды)"; exit 1; fi ;;
                off)   telegram_off ;;
@@ -11640,8 +11048,13 @@ PY
   ok "CSV сохранён: $out"
 }
 
-_tg_api_read() { # $1 method, $2 urlencoded data; token только в curl config stdin
-  local method="$1" data="${2:-}" token="${XKIT_TG_TOKEN:-}"
+_tg_api_read() { # $1 method, $2 urlencoded data — v8.0.0: через tg_api (транспорты/ноды)
+  local method="$1" data="${2:-}"
+  if declare -F tg_api >/dev/null 2>&1; then
+    tg_api "$method" "$data"
+    return $?
+  fi
+  local token="${XKIT_TG_TOKEN:-}"
   [[ "$token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,46}$ ]] || return 1
   { printf 'request = "POST"\nurl = "https://api.telegram.org/bot%s/%s"\ndata = "%s"\n' "$token" "$method" "$data"; } \
     | curl -sf --max-time 15 -K - 2>/dev/null
@@ -11655,48 +11068,6 @@ telegram_bot_allowed() { # $1 numeric sender/chat id
   return 1
 }
 
-telegram_bot_status_text() {
-  local nginx xui nodes_ok nodes_all
-  nginx="$(systemctl is-active nginx 2>/dev/null || true)"; xui="$(systemctl is-active x-ui 2>/dev/null || true)"
-  nodes_all="$(nodes_load 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
-  nodes_ok=0
-  if [ -r "$XKIT_NODES_METRICS" ]; then nodes_ok="$(jq '[.nodes[]?|select(.status=="ok")]|length' "$XKIT_NODES_METRICS" 2>/dev/null || echo 0)"; fi
-  printf '[XKIT] Read-only status\nnginx: %s\n3X-UI: %s\nnodes: %s/%s ok\nversion: %s\n' "$nginx" "$xui" "$nodes_ok" "$nodes_all" "$XKIT_VERSION"
-}
-
-telegram_bot_once() {
-  load_xkit_env >/dev/null 2>&1 || return 1
-  [ -n "${XKIT_TG_TOKEN:-}" ] || { err "Сначала xkit telegram setup"; return 1; }
-  local offset_file="${XKIT_DIR}/telegram-bot.offset" offset=0 updates row uid cid text msg key last now
-  [ -r "$offset_file" ] && offset="$(cat "$offset_file")"
-  [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
-  updates="$(_tg_api_read getUpdates "offset=${offset}&timeout=1&allowed_updates=%5B%22message%22%5D")" || return 1
-  jq -e '.ok==true' <<<"$updates" >/dev/null 2>&1 || return 1
-  while IFS= read -r row; do
-    [ -z "$row" ] && continue
-    offset=$(( $(jq -r '.update_id' <<<"$row") + 1 ))
-    uid="$(jq -r '.message.from.id//0' <<<"$row")"; cid="$(jq -r '.message.chat.id//0' <<<"$row")"
-    text="$(jq -r '.message.text//""' <<<"$row")"
-    if ! telegram_bot_allowed "$uid" || ! telegram_bot_allowed "$cid"; then continue; fi
-    now="$(date +%s)"; key="bot:${uid}"; last="$(notify_state_get "$key")"
-    [[ "$last" =~ ^[0-9]+$ ]] || last=0
-    [ $((now-last)) -ge 5 ] || continue
-    notify_state_set "$key" "$now"
-    case "$text" in
-      /status|/report) msg="$(telegram_bot_status_text)" ;;
-      /start|/help) msg='[XKIT] Read-only bot. Команды: /status, /report. Управление и резервные копии отключены.' ;;
-      *) msg='[XKIT] Только /status или /report.' ;;
-    esac
-    xkit_tg_send "$msg" >/dev/null 2>&1 || warn "Telegram bot: ответ не доставлен"
-  done < <(jq -c '.result[]?|select(.message.text!=null)' <<<"$updates")
-  printf '%s\n' "$offset" | _xkit_atomic_write "$offset_file"
-}
-
-telegram_bot_run() {
-  log "Read-only Telegram bot запущен; Ctrl-C — остановить"
-  while true; do telegram_bot_once || sleep 5; done
-}
-
 telegram_bot_service() {
   local action="${1:-status}" unit="${XKIT_TG_BOT_UNIT:-/etc/systemd/system/xkit-telegram-bot.service}"
   case "$action" in
@@ -11705,7 +11076,7 @@ telegram_bot_service() {
       [ -n "${XKIT_TG_TOKEN:-}" ] && [ -n "${XKIT_TG_CHAT:-}" ] || { err "Сначала telegram setup"; return 1; }
       cat > "$unit" <<EOF
 [Unit]
-Description=XKIT read-only Telegram bot
+Description=XKIT Telegram bot v8 (управление нодами/пользователями)
 After=network-online.target
 Wants=network-online.target
 
@@ -11721,10 +11092,10 @@ PrivateTmp=true
 WantedBy=multi-user.target
 EOF
       chmod 644 "$unit"; systemctl daemon-reload; systemctl enable --now xkit-telegram-bot.service
-      audit_event telegram.bot.on master ok; ok "Read-only bot включён" ;;
+      audit_event telegram.bot.on master ok; ok "Бот v8 включён (inline-меню управления)" ;;
     off)
       require_root; systemctl disable --now xkit-telegram-bot.service >/dev/null 2>&1 || true; rm -f "$unit"; systemctl daemon-reload
-      audit_event telegram.bot.off master ok; ok "Read-only bot выключен" ;;
+      audit_event telegram.bot.off master ok; ok "Бот v8 выключен" ;;
     status) systemctl status xkit-telegram-bot.service --no-pager 2>/dev/null || true ;;
     *) err "on|off|status"; return 1 ;;
   esac
@@ -13801,6 +13172,634 @@ nodes_upgrade() { # $1 имя|all, [$2 vX.Y.Z]
   done < <(jq -c '.[]' <<<"$arr")
   [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes upgrade <имя|all> [vX.Y.Z])"; return 1; }
   return "$rc"
+}
+#=========================== TELEGRAM ТРАНСПОРТ (v8.0.0) =====================
+# РФ-мастер: api.telegram.org заблокирован. Бот ходит через ноды:
+#   ssh -D SOCKS5 (ControlMaster persistent, loopback-only) — основной транспорт.
+# Снаружи виден только SSH (управляющий канал), SOCKS5/Telegram не палится DPI.
+# Реестр транспортов + проверка getMe + ротация/фолбэк. Внешние socks5/http — запасные.
+
+XKIT_TG_TRANSPORTS="${XKIT_TG_TRANSPORTS:-${XKIT_DIR}/telegram-transports.json}"
+XKIT_TG_SSH_DIR="${XKIT_TG_SSH_DIR:-${XKIT_DIR}/tg-ssh}"
+
+tg_transports_load() {
+  if [ -s "$XKIT_TG_TRANSPORTS" ] && jq -e 'type=="array"' "$XKIT_TG_TRANSPORTS" >/dev/null 2>&1; then
+    cat "$XKIT_TG_TRANSPORTS"
+  else
+    printf '[]'
+  fi
+}
+tg_transports_save() { _xkit_atomic_write "$XKIT_TG_TRANSPORTS"; }
+
+# --- ssh -D туннель к ноде (SOCKS5 на loopback мастера) ---
+# ControlMaster: один persistent SSH-коннект, авто-reconnect при следующем запросе.
+tg_ssh_tunnel_port() { # $1 имя ноды -> локальный порт SOCKS5 (детерминированно)
+  local n="$1" sum=0 i c
+  for ((i=0; i<${#n}; i++)); do c=$(printf '%d' "'${n:$i:1}"); sum=$(( (sum*31 + c) % 1000 )); done
+  printf '%s' "$((10800 + sum))"
+}
+
+tg_ssh_tunnel_up() { # $1 rec-ноды -> 0 = туннель поднят/жив, порт в stdout
+  local rec="$1" n host port user key lp ctrl
+  n="$(jq -r '.name' <<<"$rec")"
+  host="$(jq -r '.host' <<<"$rec")"
+  port="$(jq -r '.ssh_port // 22' <<<"$rec")"
+  user="$(jq -r '.ssh_user // "root"' <<<"$rec")"
+  key="$(jq -r '.key_path // ""' <<<"$rec")"
+  lp="$(tg_ssh_tunnel_port "$n")"
+  mkdir -p "$XKIT_TG_SSH_DIR" 2>/dev/null; chmod 700 "$XKIT_TG_SSH_DIR" 2>/dev/null
+  ctrl="${XKIT_TG_SSH_DIR}/ctrl-${n}"
+  # жив ли мастер-коннект?
+  if ssh -i "$key" -o ControlPath="$ctrl" -O check -p "$port" "${user}@${host}" >/dev/null 2>&1; then
+    printf '%s' "$lp"; return 0
+  fi
+  # поднять: -D SOCKS5 loopback, -N без команды, -f фон, ControlMaster persist
+  local kh="${XKIT_DIR}/known_hosts"
+  ssh -i "$key" -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$kh" \
+    -o ControlMaster=auto -o ControlPath="$ctrl" -o ControlPersist=600 \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+    -o ExitOnForwardFailure=yes -o ConnectTimeout=10 \
+    -D "127.0.0.1:${lp}" -N -f -p "$port" "${user}@${host}" >/dev/null 2>&1 || return 1
+  # проверить что SOCKS5 слушает
+  local i
+  for i in 1 2 3 4 5; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${lp}") 2>/dev/null; then exec 3>&- 3<&-; printf '%s' "$lp"; return 0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+tg_ssh_tunnel_down() { # $1 имя ноды
+  local n="$1" rec host port user key ctrl
+  rec="$(node_record "$n" 2>/dev/null)" || return 0
+  host="$(jq -r '.host' <<<"$rec")"; port="$(jq -r '.ssh_port // 22' <<<"$rec")"
+  user="$(jq -r '.ssh_user // "root"' <<<"$rec")"; key="$(jq -r '.key_path // ""' <<<"$rec")"
+  ctrl="${XKIT_TG_SSH_DIR}/ctrl-${n}"
+  ssh -i "$key" -o ControlPath="$ctrl" -O exit -p "$port" "${user}@${host}" >/dev/null 2>&1 || true
+  rm -f "$ctrl" 2>/dev/null
+  return 0
+}
+
+# --- регистрация транспорта ноды (авто при node_add) ---
+tg_transport_add_node() { # $1 rec-ноды
+  local rec="$1" n lp
+  n="$(jq -r '.name' <<<"$rec")"
+  lp="$(tg_ssh_tunnel_port "$n")"
+  # не дублировать
+  if tg_transports_load | jq -e --arg n "$n" 'any(.[]; .type=="ssh-socks" and .node==$n)' >/dev/null 2>&1; then
+    return 0
+  fi
+  tg_transports_load | jq -c --arg n "$n" --argjson p "$lp" \
+    '. + [{type:"ssh-socks",node:$n,port:$p,status:"unknown",checked:0}]' | tg_transports_save
+}
+
+tg_transport_add_proxy() { # $1 type(socks5|http) $2 url
+  local type="$1" url="$2"
+  case "$type" in socks5|http) ;; *) err "tg transport: тип socks5|http"; return 1 ;; esac
+  [[ "$url" =~ ^(socks5h?|http):// ]] || { err "tg transport: url вида socks5://host:port или http://host:port"; return 1; }
+  tg_transports_load | jq -e --arg u "$url" 'any(.[]; .url==$u)' >/dev/null 2>&1 && { warn "Транспорт уже в списке"; return 0; }
+  tg_transports_load | jq -c --arg t "$type" --arg u "$url" \
+    '. + [{type:$t,url:$u,status:"unknown",checked:0}]' | tg_transports_save
+  ok "Транспорт добавлен: $type $url"
+}
+
+tg_transport_remove() { # $1 node-имя или url
+  local key="$1"
+  tg_transports_load | jq -c --arg k "$key" 'map(select((.node//.url)!=$k))' | tg_transports_save
+}
+
+# --- проверка транспорта: getMe через него ---
+# curl-конфиг с токеном (stdin), прокси/туннель по типу. timeout 8с.
+_tg_curl_via() { # $1 transport-json, $2 method, $3 data -> stdout ответ; rc
+  local tr="$1" method="$2" data="${3:-}" token="${XKIT_TG_TOKEN:-}" type url node lp proxy
+  [[ "$token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,46}$ ]] || return 1
+  type="$(jq -r '.type' <<<"$tr")"
+  local -a px=()
+  case "$type" in
+    direct) ;;
+    socks5|http)
+      url="$(jq -r '.url' <<<"$tr")"; px=(--proxy "$url") ;;
+    ssh-socks)
+      node="$(jq -r '.node' <<<"$tr")"
+      local rec; rec="$(node_record "$node" 2>/dev/null)" || return 1
+      lp="$(tg_ssh_tunnel_up "$rec")" || return 1
+      px=(--proxy "socks5h://127.0.0.1:${lp}") ;;
+    *) return 1 ;;
+  esac
+  local out rc
+  out="$({ printf 'request = "POST"\nurl = "https://api.telegram.org/bot%s/%s"\n' "$token" "$method"
+    [ -n "$data" ] && printf 'data = "%s"\n' "$data"
+    true
+  } | curl -sf --max-time 8 ${px[@]+"${px[@]}"} -K - 2>/dev/null)"
+  rc=$?
+  printf '%s' "$out"
+  return $rc
+}
+
+tg_transport_check_one() { # $1 transport-json -> 0 рабочий
+  local tr="$1" resp
+  resp="$(_tg_curl_via "$tr" getMe "")" || return 1
+  jq -e '.ok==true' <<<"$resp" >/dev/null 2>&1
+}
+
+# проверить все транспорты, обновить status/checked, рабочие в начало
+tg_transport_check_all() {
+  local arr tr i n status now
+  arr="$(tg_transports_load)"; now="$(date +%s)"
+  n="$(jq 'length' <<<"$arr")"
+  [ "$n" -gt 0 ] || { warn "Транспортов нет (добавьте ноду или прокси)"; return 1; }
+  for ((i=0; i<n; i++)); do
+    tr="$(jq -c ".[$i]" <<<"$arr")"
+    if tg_transport_check_one "$tr"; then status="ok"; else status="dead"; fi
+    arr="$(jq -c --argjson i "$i" --arg s "$status" --argjson t "$now" '.[$i].status=$s | .[$i].checked=$t' <<<"$arr")"
+    printf '%-12s %-30s %s\n' "$(jq -r '.type' <<<"$tr")" "$(jq -r '.node//.url//"direct"' <<<"$tr")" "$status"
+  done
+  # рабочие в начало (ротация: первый рабочий используется)
+  arr="$(jq -c 'sort_by(if .status=="ok" then 0 else 1 end)' <<<"$arr")"
+  printf '%s' "$arr" | tg_transports_save
+}
+
+# --- единый tg_api: пробует транспорты по порядку (рабочие первыми) ---
+# $1 method, $2 data -> stdout ответ первой успешной попытки; rc1 если все упали
+tg_api() {
+  local method="$1" data="${2:-}" arr tr i n resp
+  # 1) напрямую (если не РФ — сработает)
+  resp="$(_tg_curl_via '{"type":"direct"}' "$method" "$data")" && { printf '%s' "$resp"; return 0; }
+  # 2) транспорты из реестра (рабочие первыми)
+  arr="$(tg_transports_load)"
+  arr="$(jq -c 'sort_by(if .status=="ok" then 0 elif .status=="unknown" then 1 else 2 end)' <<<"$arr")"
+  n="$(jq 'length' <<<"$arr")"
+  for ((i=0; i<n; i++)); do
+    tr="$(jq -c ".[$i]" <<<"$arr")"
+    resp="$(_tg_curl_via "$tr" "$method" "$data")" && { printf '%s' "$resp"; return 0; }
+  done
+  return 1
+}
+
+# отправка сообщения (замена xkit_tg_send на tg_api; совместимость обёрткой)
+tg_send_message() { # $1 chat, $2 text, [$3 extra-json: parse_mode/reply_markup]
+  local chat="$1" text="$2" extra="${3:-}" data
+  data="$(jq -rn --arg c "$chat" --arg t "$text" '"chat_id=\($c|@uri)&text=\($t|@uri)"')" || return 1
+  if [ -n "$extra" ]; then
+    local pm rm
+    pm="$(jq -r '.parse_mode // empty' <<<"$extra")"
+    rm="$(jq -c '.reply_markup // empty' <<<"$extra")"
+    [ -n "$pm" ] && data="${data}&parse_mode=${pm}"
+    [ -n "$rm" ] && data="${data}&reply_markup=$(jq -rn --arg m "$rm" '$m|@uri')"
+  fi
+  tg_api sendMessage "$data" >/dev/null 2>&1
+}
+
+# --- авто-поднятие транспортов нод при node_add / repair ---
+tg_transports_sync_nodes() {
+  local rec
+  while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    tg_transport_add_node "$rec"
+  done < <(nodes_load | jq -c '.[]' 2>/dev/null)
+}
+
+# --- меню/CLI транспортов ---
+tg_transport_menu() {
+  while true; do
+    echo ""
+    echo -e "${YELLOW}=== Telegram транспорты (доставка через ноды/прокси) ===${NC}"
+    echo " 1) Список транспортов и статус"
+    echo " 2) Проверить все (getMe через каждый)"
+    echo " 3) Добавить прокси (socks5/http)"
+    echo " 4) Удалить транспорт"
+    echo " 5) Синхронизировать ноды (ssh -D туннели)"
+    echo " 0) Назад"
+    local c; read -r -p "Выбор: " c || return 0
+    case "$c" in
+      1) tg_transports_load | jq -r '.[]|"\(.type)  \(.node//.url//"direct")  статус=\(.status)"' ;;
+      2) tg_transport_check_all ;;
+      3) local t u; read -r -p "Тип (socks5|http): " t; read -r -p "URL (socks5://host:port): " u; tg_transport_add_proxy "$t" "$u" ;;
+      4) local k; read -r -p "Имя ноды или URL: " k; tg_transport_remove "$k" ;;
+      5) tg_transports_sync_nodes; ok "Транспорты нод синхронизированы" ;;
+      0) return 0 ;;
+      *) warn "Нет такого пункта" ;;
+    esac
+  done
+}
+#=========================== TELEGRAM БОТ v8.0.0 (primary UI) ================
+# Интерактивное меню inline-кнопками. Админ (XKIT_TG_ADMINS) — полный доступ;
+# остальные — бот МОЛЧИТ. Роутер -> функции ядра (--fn whitelist не нужен: вызов
+# напрямую в том же процессе). Длинные операции — systemd-run transient.
+# Подтверждения inline Да/Нет для опасных. Аудит каждого действия.
+
+XKIT_TG_BOT_STATE="${XKIT_TG_BOT_STATE:-${XKIT_DIR}/tg-bot-state.json}"
+
+# --- состояние бота (ожидание подтверждения/ввода) ---
+tg_bot_state_get() { # $1 key -> value
+  [ -r "$XKIT_TG_BOT_STATE" ] && jq -r --arg k "$1" '.[$k] // empty' "$XKIT_TG_BOT_STATE" 2>/dev/null
+}
+tg_bot_state_set() { # $1 key, $2 value-json
+  local cur='{}'
+  [ -r "$XKIT_TG_BOT_STATE" ] && cur="$(cat "$XKIT_TG_BOT_STATE")"
+  jq -c --arg k "$1" --argjson v "$2" '.[$k]=$v' <<<"$cur" | _xkit_atomic_write "$XKIT_TG_BOT_STATE"
+}
+tg_bot_state_del() { # $1 key
+  local cur='{}'
+  [ -r "$XKIT_TG_BOT_STATE" ] && cur="$(cat "$XKIT_TG_BOT_STATE")"
+  jq -c --arg k "$1" 'del(.[$k])' <<<"$cur" | _xkit_atomic_write "$XKIT_TG_BOT_STATE"
+}
+
+# --- inline-клавиатуры ---
+# кнопка: {text, callback_data}
+_tg_btn() { jq -nc --arg t "$1" --arg d "$2" '{text:$t,callback_data:$d}'; }
+_tg_kb() { # stdin: массив рядов кнопок -> reply_markup json
+  jq -c '{inline_keyboard: .}'
+}
+
+tg_bot_main_menu() { # -> reply_markup json
+  jq -nc '[
+    [{text:"👥 Пользователи",callback_data:"m:users"},{text:"🖥 Ноды",callback_data:"m:nodes"}],
+    [{text:"⏰ Сроки аренды",callback_data:"m:expiry"},{text:"📊 Статус",callback_data:"m:status"}],
+    [{text:"🛠 Обслуживание",callback_data:"m:service"},{text:"🔀 Транспорт TG",callback_data:"m:transport"}]
+  ]' | _tg_kb
+}
+
+# --- отправка меню/сообщений с кнопками ---
+tg_bot_reply() { # $1 chat, $2 text, [$3 reply_markup-json]
+  local chat="$1" text="$2" kb="${3:-}"
+  if [ -n "$kb" ]; then
+    tg_send_message "$chat" "$text" "$(jq -nc --argjson m "$kb" '{reply_markup:$m}')"
+  else
+    tg_send_message "$chat" "$text"
+  fi
+}
+
+# --- главное меню ---
+tg_bot_show_main() { # $1 chat
+  tg_bot_reply "$1" "🏠 XKIT v${XKIT_VERSION} — главное меню" "$(tg_bot_main_menu)"
+}
+
+# --- пользователи ---
+tg_bot_users_list() { # $1 chat
+  load_xkit_env >/dev/null 2>&1 || true
+  kit_session >/dev/null 2>&1 || { tg_bot_reply "$1" "Нет сессии панели"; return; }
+  local inbounds names
+  inbounds="$(api_list 2>/dev/null || echo '[]')"
+  names="$(jq -r '[.[]?|(.settings|if type=="string" then fromjson? else . end|.clients[]?)|.email // empty]|unique|.[]' <<<"$inbounds" 2>/dev/null)"
+  [ -n "$names" ] || { tg_bot_reply "$1" "Пользователей нет. Создать: /adduser <email> [дней] [ГБ]" "$(tg_bot_main_menu)"; return; }
+  local rows='[]' n
+  while IFS= read -r n; do
+    [ -z "$n" ] && continue
+    rows="$(jq -c --arg n "$n" '. + [[{text:$n,callback_data:("u:"+$n)}]]' <<<"$rows")"
+  done <<<"$names"
+  rows="$(jq -c '. + [[{text:"➕ Создать",callback_data:"u:add"},{text:"🏠 Меню",callback_data:"m:main"}]]' <<<"$rows")"
+  tg_bot_reply "$1" "👥 Пользователи (выберите):" "$(jq -nc --argjson r "$rows" '{inline_keyboard:$r}')"
+}
+
+tg_bot_user_card() { # $1 chat, $2 email
+  load_xkit_env >/dev/null 2>&1 || true
+  kit_session >/dev/null 2>&1 || { tg_bot_reply "$1" "Нет сессии панели"; return; }
+  local email="$2" inbounds cl total exp sub link
+  inbounds="$(api_list 2>/dev/null || echo '[]')"
+  # агрегировать трафик по всем инбаундам клиента
+  cl="$(jq -c --arg e "$email" '[.[]?|(.settings|if type=="string" then fromjson? else . end|.clients[]?)|select(.email==$e)][0] // empty' <<<"$inbounds")"
+  [ -n "$cl" ] || { tg_bot_reply "$1" "Пользователь $email не найден" "$(tg_bot_main_menu)"; return; }
+  total="$(jq -r --arg e "$email" '[.[]?|(.settings|if type=="string" then fromjson? else . end|.clients[]?)|select(.email==$e)|((.up//0)+(.down//0))]|add // 0' <<<"$inbounds")"
+  exp="$(expiry_get user "$email" 2>/dev/null)"
+  local days=""
+  [ -n "$exp" ] && days="$(days_left "$exp" 2>/dev/null)"
+  local txt="👤 ${email}
+Трафик: $(numfmt --to=iec "$total" 2>/dev/null || echo "$total B")
+Срок: ${exp:-не задан}${days:+ (${days} дн.)}"
+  local kb
+  kb="$(jq -nc --arg e "$email" '[
+    [{text:"🔗 Подписка",callback_data:("sub:"+$e)},{text:"🔄 Сброс трафика",callback_data:("reset:"+$e)}],
+    [{text:"📅 Продлить",callback_data:("exp:"+$e)},{text:"🗑 Удалить",callback_data:("del:"+$e)}],
+    [{text:"👥 К списку",callback_data:"m:users"},{text:"🏠 Меню",callback_data:"m:main"}]
+  ]' | _tg_kb)"
+  tg_bot_reply "$1" "$txt" "$kb"
+}
+
+# --- ноды ---
+tg_bot_nodes_list() { # $1 chat
+  load_xkit_env >/dev/null 2>&1 || true
+  local arr names
+  arr="$(nodes_load 2>/dev/null || echo '[]')"
+  names="$(jq -r '.[].name' <<<"$arr")"
+  [ -n "$names" ] || { tg_bot_reply "$1" "Нод нет. Добавление: xkit nodes (CLI/TUI)." "$(tg_bot_main_menu)"; return; }
+  local rows='[]' n
+  while IFS= read -r n; do
+    [ -z "$n" ] && continue
+    rows="$(jq -c --arg n "$n" '. + [[{text:$n,callback_data:("n:"+$n)}]]' <<<"$rows")"
+  done <<<"$names"
+  rows="$(jq -c '. + [[{text:"🏠 Меню",callback_data:"m:main"}]]' <<<"$rows")"
+  tg_bot_reply "$1" "🖥 Ноды (выберите):" "$(jq -nc --argjson r "$rows" '{inline_keyboard:$r}')"
+}
+
+tg_bot_node_card() { # $1 chat, $2 name
+  load_xkit_env >/dev/null 2>&1 || true
+  local name="$2" rec host exp days status ping
+  rec="$(node_record "$name" 2>/dev/null)" || { tg_bot_reply "$1" "Нода $name не найдена" "$(tg_bot_main_menu)"; return; }
+  host="$(jq -r '.host' <<<"$rec")"
+  exp="$(expiry_get node "$name" 2>/dev/null)"
+  days=""; [ -n "$exp" ] && days="$(days_left "$exp" 2>/dev/null)"
+  # метрики из кэша
+  local m=""
+  [ -r "$XKIT_NODES_METRICS" ] && m="$(jq -c --arg n "$name" '.nodes[]?|select(.name==$n)' "$XKIT_NODES_METRICS" 2>/dev/null)"
+  status="$(jq -r '.status // "unknown"' <<<"${m:-{\}}")"
+  ping="$(jq -r '.latency_ms // "—"' <<<"${m:-{\}}")"
+  local txt="🖥 ${name} (${host})
+Статус: ${status} · ping: ${ping} ms
+Аренда: ${exp:-не задана}${days:+ (${days} дн.)}
+Профиль: $(jq -r '.tunnel.profile // .tunnel.proto // "vless"' <<<"$rec")"
+  local kb
+  kb="$(jq -nc --arg n "$name" '[
+    [{text:"🔀 Транспорт",callback_data:("nt:"+$n)},{text:"🧊 Freeze",callback_data:("nf:"+$n)}],
+    [{text:"🔐 Серт",callback_data:("nc:"+$n)},{text:"🛡 UFW",callback_data:("nu:"+$n)}],
+    [{text:"🎭 Camo",callback_data:("nm:"+$n)},{text:"🙈 Hide",callback_data:("nh:"+$n)}],
+    [{text:"📅 Продлить аренду",callback_data:("ne:"+$n)},{text:"⬆️ Обновить",callback_data:("nup:"+$n)}],
+    [{text:"🖥 К списку",callback_data:"m:nodes"},{text:"🏠 Меню",callback_data:"m:main"}]
+  ]' | _tg_kb)"
+  tg_bot_reply "$1" "$txt" "$kb"
+}
+
+# --- подтверждение опасного действия ---
+tg_bot_confirm() { # $1 chat, $2 action-key, $3 text
+  local kb
+  kb="$(jq -nc --arg k "$2" '[[{text:"✅ Да",callback_data:("yes:"+$k)},{text:"❌ Нет",callback_data:("no:"+$k)}]]' | _tg_kb)"
+  tg_bot_state_set "confirm:$2" "$(jq -nc --arg c "$1" '{chat:$c}')"
+  tg_bot_reply "$1" "⚠️ $3 — подтвердить?" "$kb"
+}
+
+# --- длинные операции через systemd-run ---
+tg_bot_run_long() { # $1 chat, $2 unit-name, $3 cmd..., $4 label
+  local chat="$1" unit="$2" label="$4"; shift 4
+  local cmd="$*" err rc
+  # уникальное имя юнита: повторное нажатие не падает из-за коллизии
+  unit="${unit}-$(date +%s)"
+  tg_bot_reply "$chat" "⏳ Запускаю: $label (результат по готовности)…"
+  local result_file="/run/xkit-tg-${unit}.out"
+  err="$(systemd-run --unit="xkit-tg-${unit}" --collect \
+    -p "ExecStartPost=/bin/bash -c '${XKIT_BIN} telegram bot-notify ${chat} ${result_file}'" \
+    /bin/bash -c "$cmd > ${result_file} 2>&1" 2>&1)"; rc=$?
+  if [ "$rc" != 0 ]; then
+    tg_bot_reply "$chat" "❌ Не удалось запустить $label:
+$(printf '%s' "$err" | tail -c 500)"
+    return 1
+  fi
+}
+
+# отправка результата длинной операции (вызывается ExecStartPost)
+tg_bot_notify_result() { # $1 chat, $2 result-file
+  local chat="$1" f="$2" out
+  out="$(tail -c 3500 "$f" 2>/dev/null || echo '(нет вывода)')"
+  tg_send_message "$chat" "📋 Результат:
+${out}"
+  rm -f "$f" 2>/dev/null
+}
+
+# --- статус мастера ---
+tg_bot_status() { # $1 chat
+  load_xkit_env >/dev/null 2>&1 || true
+  local nginx xui xray nodes_all nodes_ok cert
+  nginx="$(systemctl is-active nginx 2>/dev/null || true)"; nginx="${nginx:-unknown}"
+  xui="$(systemctl is-active x-ui 2>/dev/null || true)"; xui="${xui:-unknown}"
+  xray="$(pgrep -x xray >/dev/null 2>&1 && echo active || echo inactive)"
+  nodes_all="$(nodes_load 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+  nodes_ok=0
+  [ -r "$XKIT_NODES_METRICS" ] && nodes_ok="$(jq '[.nodes[]?|select(.status=="ok")]|length' "$XKIT_NODES_METRICS" 2>/dev/null || echo 0)"
+  tg_bot_reply "$1" "📊 XKIT v${XKIT_VERSION}
+nginx: $nginx · 3X-UI: $xui · xray: $xray
+Ноды: ${nodes_ok}/${nodes_all} ok
+Хост: ${XKIT_HOST:-?}" "$(tg_bot_main_menu)"
+}
+
+# --- сроки аренды ---
+tg_bot_expiry() { # $1 chat
+  load_xkit_env >/dev/null 2>&1 || true
+  local txt="⏰ Сроки аренды:\n"
+  local has=0
+  if [ -s "$XKIT_EXPIRY" ]; then
+    while IFS=$'\t' read -r scope item date note; do
+      [ -z "$scope" ] && continue
+      local d="$(days_left "$date" 2>/dev/null)"
+      txt+="${scope}/${item}: ${date}${d:+ (${d} дн.)}\n"
+      has=1
+    done < "$XKIT_EXPIRY"
+  fi
+  [ "$has" = 1 ] || txt="Сроки не заданы."
+  tg_bot_reply "$1" "$(printf '%b' "$txt")" "$(tg_bot_main_menu)"
+}
+
+# --- обслуживание (меню) ---
+tg_bot_service_menu() { # $1 chat
+  local kb
+  kb="$(jq -nc '[
+    [{text:"💾 Бэкап",callback_data:"s:backup"},{text:"📜 Аудит",callback_data:"s:audit"}],
+    [{text:"🩺 Health",callback_data:"s:health"},{text:"🔄 Обновить XKIT",callback_data:"s:update"}],
+    [{text:"⚖️ Стратегия",callback_data:"s:strategy"},{text:"🏠 Меню",callback_data:"m:main"}]
+  ]' | _tg_kb)"
+  tg_bot_reply "$1" "🛠 Обслуживание:" "$kb"
+}
+
+# --- обработчик callback_query (кнопки) ---
+tg_bot_handle_callback() { # $1 callback-json
+  local cb="$1" cid uid data mid
+  cid="$(jq -r '.message.chat.id' <<<"$cb")"
+  uid="$(jq -r '.from.id' <<<"$cb")"
+  data="$(jq -r '.data // ""' <<<"$cb")"
+  mid="$(jq -r '.id' <<<"$cb")"
+  # answerCallbackQuery (убрать часики)
+  tg_api answerCallbackQuery "callback_query_id=${mid}" >/dev/null 2>&1 || true
+  # не админ — молча
+  telegram_bot_allowed "$uid" || return 0
+  telegram_bot_allowed "$cid" || return 0
+  audit_event tg.bot "$data" ok 2>/dev/null || true
+  case "$data" in
+    m:main) tg_bot_show_main "$cid" ;;
+    m:users) tg_bot_users_list "$cid" ;;
+    m:nodes) tg_bot_nodes_list "$cid" ;;
+    m:status) tg_bot_status "$cid" ;;
+    m:expiry) tg_bot_expiry "$cid" ;;
+    m:service) tg_bot_service_menu "$cid" ;;
+    m:transport) tg_transport_check_all >/dev/null 2>&1; tg_bot_reply "$cid" "$(printf '🔀 TG транспорты:\n%s' "$(tg_transports_load | jq -r '.[]|"\(.type) \(.node//.url) — \(.status)"')")" "$(tg_bot_main_menu)" ;;
+    u:*) tg_bot_user_card "$cid" "${data#u:}" ;;
+    u:add) tg_bot_reply "$cid" "Создать: /adduser <email> [дней] [ГБ]" ;;
+    n:*) tg_bot_node_card "$cid" "${data#n:}" ;;
+    sub:*) tg_bot_user_sub "$cid" "${data#sub:}" ;;
+    reset:*) tg_bot_confirm "$cid" "reset:${data#reset:}" "Сбросить трафик ${data#reset:}" ;;
+    del:*) tg_bot_confirm "$cid" "del:${data#del:}" "Удалить пользователя ${data#del:}" ;;
+    exp:*) tg_bot_reply "$cid" "Продлить: /expire ${data#exp:} <DD.MM.YYYY>" ;;
+    ne:*) tg_bot_reply "$cid" "Продлить аренду ноды: /expire node ${data#ne:} <DD.MM.YYYY>" ;;
+    nt:*) tg_bot_node_transport "$cid" "${data#nt:}" ;;
+    nf:*) tg_bot_run_long "$cid" "freeze-${data#nf:}" "${XKIT_BIN} nodes freeze ${data#nf:}" "freeze ${data#nf:}" ;;
+    nc:*) tg_bot_node_cert_menu "$cid" "${data#nc:}" ;;
+    nu:*) tg_bot_node_ufw_menu "$cid" "${data#nu:}" ;;
+    nm:*) tg_bot_confirm "$cid" "camo:${data#nm:}" "Развернуть camo на ${data#nm:}" ;;
+    nh:*) tg_bot_confirm "$cid" "hide:${data#nh:}" "Спрятать панель ${data#nh:}" ;;
+    nup:*) tg_bot_confirm "$cid" "upgrade:${data#nup:}" "Обновить 3X-UI на ${data#nup:}" ;;
+    yes:*) tg_bot_do_confirm "$cid" "${data#yes:}" ;;
+    no:*) tg_bot_state_del "confirm:${data#no:}"; tg_bot_reply "$cid" "Отменено." "$(tg_bot_main_menu)" ;;
+    s:backup) tg_bot_confirm "$cid" "backup" "Создать бэкап сейчас" ;;
+    s:audit) tg_bot_reply "$cid" "$(audit_show 15 2>/dev/null | tail -c 3500)" "$(tg_bot_main_menu)" ;;
+    s:health) tg_bot_run_long "$cid" "health" "${XKIT_BIN} health" "health" ;;
+    s:update) tg_bot_confirm "$cid" "update" "Обновить XKIT" ;;
+    s:strategy) tg_bot_strategy_menu "$cid" ;;
+    sv:*) tg_bot_run_long "$cid" "survey-${data#sv:}" "${XKIT_BIN} nodes profile survey ${data#sv:}" "survey ${data#sv:}" ;;
+    sw:*) local _n="${data#sw:}" _prof="${_n#*:}" _node="${_n%%:*}"; tg_bot_confirm "$cid" "switch:${_node}:${_prof}" "Сменить транспорт ${_node} -> ${_prof}" ;;
+    cd:*) tg_bot_run_long "$cid" "cert-${data#cd:}" "${XKIT_BIN} nodes cert ${data#cd:} domain" "cert domain ${data#cd:}" ;;
+    ci:*) tg_bot_run_long "$cid" "cert-${data#ci:}" "${XKIT_BIN} nodes cert ${data#ci:} ip" "cert ip ${data#ci:}" ;;
+    cs:*) tg_bot_run_long "$cid" "cert-${data#cs:}" "${XKIT_BIN} nodes cert ${data#cs:} self" "cert self ${data#cs:}" ;;
+    csh:*) tg_bot_reply "$cid" "$(${XKIT_BIN} nodes cert show "${data#csh:}" 2>/dev/null | tail -c 3000)" "$(tg_bot_main_menu)" ;;
+    uo:*) tg_bot_confirm "$cid" "ufw:${data#uo:}" "Включить UFW на ${data#uo:}" ;;
+    us:*) tg_bot_reply "$cid" "$(${XKIT_BIN} nodes ufw "${data#us:}" status 2>/dev/null)" "$(tg_bot_main_menu)" ;;
+    st:*) tg_bot_set_strategy "$cid" "${data#st:}" ;;
+    *) tg_bot_reply "$cid" "Неизвестное действие" "$(tg_bot_main_menu)" ;;
+  esac
+}
+
+# выполнение подтверждённого действия
+tg_bot_do_confirm() { # $1 chat, $2 action-key
+  local chat="$1" key="$2"
+  tg_bot_state_del "confirm:$key"
+  case "$key" in
+    reset:*) client_reset "${key#reset:}" --yes >/dev/null 2>&1; tg_bot_reply "$chat" "Трафик ${key#reset:} сброшен." "$(tg_bot_main_menu)" ;;
+    del:*) client_del "${key#del:}" --yes >/dev/null 2>&1; tg_bot_reply "$chat" "Пользователь ${key#del:} удалён." "$(tg_bot_main_menu)" ;;
+    camo:*) tg_bot_run_long "$chat" "camo-${key#camo:}" "${XKIT_BIN} nodes camo ${key#camo:}" "camo ${key#camo:}" ;;
+    hide:*) tg_bot_run_long "$chat" "hide-${key#hide:}" "${XKIT_BIN} nodes hide ${key#hide:}" "hide ${key#hide:}" ;;
+    upgrade:*) tg_bot_run_long "$chat" "upgrade-${key#upgrade:}" "${XKIT_BIN} nodes upgrade ${key#upgrade:}" "upgrade ${key#upgrade:}" ;;
+    switch:*) local _rest="${key#switch:}" _node="${_rest%%:*}" _prof="${_rest#*:}"; tg_bot_run_long "$chat" "switch-${_node}" "${XKIT_BIN} nodes profile switch ${_node} ${_prof}" "switch ${_node} -> ${_prof}" ;;
+    ufw:*) tg_bot_run_long "$chat" "ufw-${key#ufw:}" "${XKIT_BIN} nodes ufw ${key#ufw:} on" "ufw on ${key#ufw:}" ;;
+    backup) tg_bot_run_long "$chat" "backup" "${XKIT_BIN} backup now" "бэкап" ;;
+    update) tg_bot_run_long "$chat" "update" "${XKIT_BIN} update" "обновление XKIT" ;;
+    *) tg_bot_reply "$chat" "Действие не распознано" "$(tg_bot_main_menu)" ;;
+  esac
+}
+
+# подписка пользователя (ссылка)
+tg_bot_user_sub() { # $1 chat, $2 email
+  load_xkit_env >/dev/null 2>&1 || true
+  kit_session >/dev/null 2>&1 || { tg_bot_reply "$1" "Нет сессии панели"; return; }
+  local subid sp out
+  subid="$(jq -r --arg email "$2" '[.[].settings|if type=="string" then fromjson? else . end|.clients[]?|select(.email==$email)|.subId // empty][0] // empty' <<<"${INBOUNDS:-[]}" 2>/dev/null)"
+  if [ -n "$subid" ]; then
+    sp="$(sub_path)"
+    out="https://${XKIT_HOST}${sp}${subid}
+Clash: https://${XKIT_HOST}${sp}${subid}.yaml
+sing-box: https://${XKIT_HOST}${sp}${subid}.json"
+  else
+    out="Подписка не найдена (создайте пользователя и обновите подписки: xkit sub)"
+  fi
+  tg_bot_reply "$1" "🔗 Подписка ${2}:
+${out}" "$(tg_bot_main_menu)"
+}
+
+# транспорт ноды (меню профилей)
+tg_bot_node_transport() { # $1 chat, $2 name
+  local kb
+  kb="$(jq -nc --arg n "$2" '[
+    [{text:"📊 Survey (все профили)",callback_data:("sv:"+$n)}],
+    [{text:"VLESS Reality Vision",callback_data:("sw:"+$n+":vless-reality-vision")},{text:"VLESS XHTTP",callback_data:("sw:"+$n+":vless-xhttp-reality")}],
+    [{text:"Hysteria2",callback_data:("sw:"+$n+":hysteria2")},{text:"🏠 Меню",callback_data:"m:main"}]
+  ]' | _tg_kb)"
+  tg_bot_reply "$1" "🔀 Транспорт ноды $2:" "$kb"
+}
+
+# серт ноды (меню режимов)
+tg_bot_node_cert_menu() { # $1 chat, $2 name
+  local kb
+  kb="$(jq -nc --arg n "$2" '[
+    [{text:"Домен (LE)",callback_data:("cd:"+$n)},{text:"IP (LE)",callback_data:("ci:"+$n)}],
+    [{text:"Самоподписанный",callback_data:("cs:"+$n)},{text:"Показать",callback_data:("csh:"+$n)}],
+    [{text:"🏠 Меню",callback_data:"m:main"}]
+  ]' | _tg_kb)"
+  tg_bot_reply "$1" "🔐 Сертификат ноды $2:" "$kb"
+}
+
+# ufw ноды
+tg_bot_node_ufw_menu() { # $1 chat, $2 name
+  local kb
+  kb="$(jq -nc --arg n "$2" '[[{text:"Включить UFW",callback_data:("uo:"+$n)},{text:"Статус",callback_data:("us:"+$n)}],[{text:"🏠 Меню",callback_data:"m:main"}]]' | _tg_kb)"
+  tg_bot_reply "$1" "🛡 UFW ноды $2:" "$kb"
+}
+
+# стратегия балансировки
+tg_bot_strategy_menu() { # $1 chat
+  local kb
+  kb="$(jq -nc '[
+    [{text:"leastLoad",callback_data:"st:leastLoad"},{text:"roundRobin",callback_data:"st:roundRobin"}],
+    [{text:"random",callback_data:"st:random"},{text:"🏠 Меню",callback_data:"m:main"}]
+  ]' | _tg_kb)"
+  tg_bot_reply "$1" "⚖️ Стратегия балансировки (текущая: ${XKIT_BAL_STRATEGY:-leastLoad}):" "$kb"
+}
+
+# --- обработчик текстовых команд (алиасы) ---
+tg_bot_handle_command() { # $1 message-json
+  local msg="$1" cid uid text
+  cid="$(jq -r '.chat.id' <<<"$msg")"
+  uid="$(jq -r '.from.id // .chat.id' <<<"$msg")"
+  text="$(jq -r '.text // ""' <<<"$msg")"
+  telegram_bot_allowed "$uid" || return 0
+  telegram_bot_allowed "$cid" || return 0
+  audit_event tg.bot "cmd:$text" ok 2>/dev/null || true
+  case "$text" in
+    /start|/help|/menu) tg_bot_show_main "$cid" ;;
+    /status) tg_bot_status "$cid" ;;
+    /users) tg_bot_users_list "$cid" ;;
+    /nodes) tg_bot_nodes_list "$cid" ;;
+    /expiry) tg_bot_expiry "$cid" ;;
+    /adduser\ *)
+      local args email days gb
+      args="${text#/adduser }"; email="$(awk '{print $1}' <<<"$args")"
+      days="$(awk '{print $2}' <<<"$args")"; gb="$(awk '{print $3}' <<<"$args")"
+      [ -n "$email" ] || { tg_bot_reply "$cid" "Формат: /adduser <email> [дней] [ГБ]"; return; }
+      client_add_all "$email" "${days:-0}" "${gb:-0}" >/dev/null 2>&1
+      tg_bot_reply "$cid" "Пользователь $email создан." "$(tg_bot_main_menu)" ;;
+    /expire\ *)
+      local args scope item date
+      args="${text#/expire }"
+      scope="$(awk '{print $1}' <<<"$args")"
+      if [ "$scope" = node ]; then
+        item="$(awk '{print $2}' <<<"$args")"; date="$(awk '{print $3}' <<<"$args")"
+        expiry_set node "$item" "$date" "" >/dev/null 2>&1
+      else
+        item="$scope"; date="$(awk '{print $2}' <<<"$args")"
+        expiry_set user "$item" "$date" "" >/dev/null 2>&1
+      fi
+      tg_bot_reply "$cid" "Срок обновлён: $item -> $date" "$(tg_bot_main_menu)" ;;
+    /transport) tg_transport_check_all >/dev/null 2>&1; tg_bot_reply "$cid" "$(tg_transports_load | jq -r '.[]|"\(.type) \(.node//.url) — \(.status)"')" "$(tg_bot_main_menu)" ;;
+    *) tg_bot_show_main "$cid" ;;
+  esac
+}
+
+# --- основной polling-цикл (v8: callback + message) ---
+telegram_bot_once() {
+  load_xkit_env >/dev/null 2>&1 || return 1
+  [ -n "${XKIT_TG_TOKEN:-}" ] || { err "Сначала xkit telegram setup"; return 1; }
+  local offset_file="${XKIT_DIR}/telegram-bot.offset" offset=0 updates row
+  [ -r "$offset_file" ] && offset="$(cat "$offset_file")"
+  [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+  updates="$(_tg_api_read getUpdates "offset=${offset}&timeout=5&allowed_updates=%5B%22message%22%2C%22callback_query%22%5D")" || return 1
+  jq -e '.ok==true' <<<"$updates" >/dev/null 2>&1 || return 1
+  while IFS= read -r row; do
+    [ -z "$row" ] && continue
+    offset=$(( $(jq -r '.update_id' <<<"$row") + 1 ))
+    if jq -e '.callback_query' <<<"$row" >/dev/null 2>&1; then
+      tg_bot_handle_callback "$(jq -c '.callback_query' <<<"$row")"
+    elif jq -e '.message.text' <<<"$row" >/dev/null 2>&1; then
+      tg_bot_handle_command "$(jq -c '.message' <<<"$row")"
+    fi
+  done < <(jq -c '.result[]?' <<<"$updates")
+  printf '%s\n' "$offset" | _xkit_atomic_write "$offset_file"
+}
+
+telegram_bot_run() {
+  log "XKIT bot v8 запущен (inline-меню); Ctrl-C — остановить"
+  while true; do telegram_bot_once || sleep 5; done
+}
+# стратегия балансировки (прямая установка + apply)
+tg_bot_set_strategy() { # $1 chat, $2 strategy
+  load_xkit_env >/dev/null 2>&1 || true
+  case "$2" in roundRobin|random|leastPing|leastLoad) ;; *) tg_bot_reply "$1" "Неизвестная стратегия"; return ;; esac
+  XKIT_BAL_STRATEGY="$2"; save_xkit_env
+  nodes_apply_template >/dev/null 2>&1
+  tg_bot_reply "$1" "⚖️ Стратегия балансировки: $2 (применена)" "$(tg_bot_main_menu)"
 }
 #=========================== ДИСПЕТЧЕР (v7.2.5) ================================
 # `main "$@"` — ПОСЛЕДНИЙ модуль сборки (build.sh склеивает src/[0-9][0-9]_*.sh
