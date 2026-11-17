@@ -1,9 +1,9 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v7.7.7
+#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v8.0.8
 #
 #  Меню вынесено из xkit.sh в отдельный файл: ядро (API, установка, nginx,
-#  подписки, ноды, дашборд) не раздувается, а правки меню не трогают xkit.sh.
+#  подписки, ноды) не раздувается, а правки меню не трогают xkit.sh.
 #  Подгружается через `source` из xkit.sh (xkit_load_menu). Сам по себе не
 #  запускается — только в составе xkit.
 #
@@ -182,6 +182,8 @@ menu_service() {
     echo "17) BBR: статус / включить (рекомендация для пропускной способности)"
     echo "18) Настройки TCP: TFO / TCP_NODELAY"
     echo "19) Проверить обновление XKIT"
+    echo "20) Перезапустить всё: 3X-UI / Xray / nginx (+чек в Telegram)"
+    echo "21) Перезагрузить сервер целиком (reboot, +чек после загрузки)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -205,6 +207,8 @@ menu_service() {
       17) menu_bbr; pause_enter ;;
       18) sockopt_cmd; pause_enter ;;
       19) xkit_update_check --force; pause_enter ;;
+      20) services_restart; pause_enter ;;
+      21) server_reboot; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac
@@ -269,22 +273,22 @@ menu_extra() {
   while true; do
     echo ""
     echo -e "${YELLOW}=== МОНИТОРИНГ И РЕКВИЗИТЫ ===${NC}"
-    echo " 1) СТРАНИЦА СОСТОЯНИЯ: серверы, соединения, трафик"
-    echo " 2) Telegram: уведомления о серверах, аренде и сертификатах"
-    echo " 3) СРОКИ АРЕНДЫ главного и дополнительных серверов"
-    echo " 4) Открывать меню XKIT автоматически при входе по SSH"
-    echo " 5) Данные для доступа (пароли — только в /root/xkit-info.txt)"
-    echo " 6) Прокси для Telegram: MTProto / веб-прокси"
+    echo " 1) Telegram: бот управления и уведомления"
+    echo " 2) СРОКИ АРЕНДЫ главного и дополнительных серверов"
+    echo " 3) Открывать меню XKIT автоматически при входе по SSH"
+    echo " 4) Данные для доступа (пароли — только в /root/xkit-info.txt)"
+    echo " 5) Прокси для Telegram: MTProto / веб-прокси (для клиентов)"
+    echo " 6) Веб-дашборд (удалён в 8.0.0 — пояснение)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
     case "$c" in
-      1) dash_menu ;;
-      2) telegram_menu ;;
-      3) expiry_menu ;;
-      4) ssh_hook_toggle; pause_enter ;;
-      5) xkit_info; pause_enter ;;
-      6) tgproxy_menu; pause_enter ;;
+      1) telegram_menu ;;
+      2) expiry_menu ;;
+      3) ssh_hook_toggle; pause_enter ;;
+      4) xkit_info; pause_enter ;;
+      5) tgproxy_menu; pause_enter ;;
+      6) echo "Веб-дашборд удалён в 8.0.0. Управление: Telegram-бот (пункт 1), CLI/TUI."; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac

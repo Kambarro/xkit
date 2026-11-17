@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v7.7.7 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v8.0.8 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -188,6 +188,7 @@ proto_xhttp_create() {
   xkit_fw_add xhttp "$p" tcp || { api_del_inbound "$ibid" >/dev/null 2>&1 || true; err 'Не удалось открыть TCP-порт XHTTP — inbound удалён'; return 1; }
   ok "XHTTP + REALITY создан: ${XKIT_HOST}:${p}${path}"
   sub_regen_quiet || true
+  nodes_cascade_sync   # v8.0.8: новый вход сразу в каскад (не-RU -> ноды)
   ok "Автоматических пользователей нет — добавьте своего через «Пользователи»"
 }
 
@@ -216,7 +217,7 @@ proto_hy2_download() { # $1 destination
   [ -n "$tag" ] && [ -n "$base" ] || { rm -f "$meta"; err "Не найден официальный бинарник $asset"; return 1; }
   sums="$(mktemp /tmp/.xkit-hy2-sums.XXXXXX)" || { rm -f "$meta"; return 1; }
   curl -fsSL "${base%/*}/hashes.txt" -o "$sums" || { rm -f "$meta" "$sums"; return 1; }
-  want="$(awk -v n="$asset" '$2==n || $2=="*"n {print $1;exit}' "$sums")"
+  want="$(awk -v n="$asset" '$2==n || $2=="*"n || $2=="build/"n || $2=="*/"n {print $1;exit}' "$sums")"
   [ -n "$want" ] || { rm -f "$meta" "$sums"; err "В hashes.txt нет $asset — установка отменена"; return 1; }
   curl -fsSL "$base" -o "$1" || { rm -f "$meta" "$sums"; return 1; }
   got="$(sha256sum "$1" | awk '{print $1}')"
@@ -724,4 +725,44 @@ protocols_main() {
     panel) case "${2:-menu}" in menu) proto_panel_menu ;; install|on) proto_panel_install "${3:-all}" ;; uninstall|off) proto_panel_uninstall ;; status) proto_panel_status ;; camo-check) proto_hy2_camo_check "${3:-}" ;; *) return 1 ;; esac ;;
     *) err 'xkit protocols [list|status|reality|xhttp|awg|hysteria2|panel]'; return 1 ;;
   esac
+}
+
+# v8.0.8: выбор протоколов сразу после установки (через запятую). Каждый мастер
+# интерактивен (порты/профили) — запускаем по очереди. Ошибка одного не срывает
+# остальные. В конце — подсказка про пользователей (без них сервер пустой).
+install_protocols_prompt() {
+  load_xkit_env 2>/dev/null || return 0
+  kit_session >/dev/null 2>&1 || { warn "Панель недоступна — протоколы позже: xkit protocols"; return 0; }
+  echo ""
+  log "Какие протоколы включить? (номера через запятую, Enter = 1)"
+  echo "  1) VLESS + REALITY + Vision  (основной, TCP 443, маскировка под сайт)"
+  echo "  2) VLESS + XHTTP + REALITY   (отдельный путь через nginx)"
+  echo "  3) AmneziaWG                 (UDP, обфускация WireGuard)"
+  echo "  4) Hysteria 2                (UDP, быстрый на потерях)"
+  echo "  0) Пропустить — настрою позже (xkit protocols)"
+  local sel
+  read -r -p "Протоколы [1]: " sel || sel=""
+  sel="${sel:-1}"
+  [ "$sel" = "0" ] && { log "Пропущено — позже: xkit protocols"; return 0; }
+  local n done_any=0
+  # нормализация: запятые/пробелы -> список номеров
+  for n in $(printf '%s' "$sel" | tr ',' ' '); do
+    case "$n" in
+      1) reality_wizard && done_any=1 || warn "REALITY не создан — позже: xkit protocols reality" ;;
+      2) proto_xhttp_create && done_any=1 || warn "XHTTP не создан — позже: xkit protocols xhttp" ;;
+      3) proto_panel_install awg && done_any=1 || warn "AmneziaWG не создан — позже: xkit protocols awg" ;;
+      4) proto_panel_install hy2 && done_any=1 || warn "Hysteria 2 не создан — позже: xkit protocols hysteria2" ;;
+      *) warn "Неизвестный номер '$n' — пропущен (доступны 1-4)" ;;
+    esac
+  done
+  echo ""
+  if [ "$done_any" = "1" ]; then
+    ok "Протоколы настроены. ТЕПЕРЬ ДОБАВЬТЕ ПОЛЬЗОВАТЕЛЕЙ — без них подключаться некому:"
+    log "  xkit client all <email> [дней] [ГБ]  — пользователь во все протоколы сразу"
+    log "  или меню: Пользователи -> Создать; в Telegram-боте: /adduser <email>"
+    log "  Подписки обновятся автоматически; ссылки: xkit sub"
+  else
+    warn "Ни один протокол не создан — позже: xkit protocols, затем xkit client all <email>"
+  fi
+  return 0
 }
