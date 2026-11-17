@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.1.4"
+XKIT_VERSION="8.1.5"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -4638,6 +4638,10 @@ xkit_install_body() {
   xkit_install_traps_on
   xkit_log_capture_on   # v7.2.5: с этого места весь вывод — и в терминал, и в лог
   STEP=0
+  # v8.1.5: /etc/xkit нужен ДО шага 3 (versions_install пишет versions.env через
+  # mktemp в XKIT_DIR). На чистом сервере каталога ещё нет — создаём заранее,
+  # иначе установка падает на шаге 3 после скачивания панели/xray.
+  mkdir -p "$XKIT_DIR"; chmod 700 "$XKIT_DIR"
 
   step "Пакеты (nginx, jq, sqlite3, openssl, ufw, python3) + certbot"
   with_spinner "apt-get update..." apt-get update -qq || warn "apt-get update вернул ошибку — продолжаю"
@@ -10368,6 +10372,9 @@ versions_state_load() { [ -r "$XKIT_VERSION_STATE" ] && . "$XKIT_VERSION_STATE" 
 versions_state_save() { # xui xray snapshot
   (
     umask 077
+    # v8.1.5: /etc/xkit может ещё не существовать (versions_install вызывается на
+    # шаге 3 установки, до mkdir на шаге 5) — создаём каталог перед mktemp.
+    mkdir -p "$XKIT_DIR" || exit 1
     local t; t="$(mktemp "${XKIT_VERSION_STATE}.new.XXXXXX")" || exit 1
     { printf 'XKIT_XUI_VERSION=%q\n' "$1"; printf 'XKIT_XRAY_VERSION=%q\n' "$2"; printf 'XKIT_VERSION_SNAPSHOT=%q\n' "$3"; } >"$t"
     mv "$t" "$XKIT_VERSION_STATE"

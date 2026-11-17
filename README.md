@@ -4,7 +4,7 @@
 
 **Ваш VPN-сервер под ключ: панель 3X-UI за nginx, все протоколы, одна подписка на пользователя — и управление из Telegram.**
 
-![Version](https://img.shields.io/badge/version-8.1.4-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.1.5-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -314,7 +314,7 @@ xkit audit | doctor export | info | status
 
 **Чем update отличается от reinstall?** `update` сохраняет всё состояние; `reinstall` — бэкап и установка с нуля.
 
-**Обновил из TUI — меню старое?** Начиная с 8.1.4 TUI сам предложит перезапуск после обновления. На более старых версиях — выйдите и запустите `xkit` заново.
+**Обновил из TUI — меню старое?** Начиная с 8.1.5 TUI сам предложит перезапуск после обновления. На более старых версиях — выйдите и запустите `xkit` заново.
 
 **Telegram заблокирован на сервере — бот будет работать?** Да, через SSH-туннель на зарубежную ноду. Нужна хотя бы одна нода; каналы восстанавливаются автоматически.
 
