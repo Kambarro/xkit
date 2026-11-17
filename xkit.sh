@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.0.11"
+XKIT_VERSION="8.0.12"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -3177,6 +3177,11 @@ client_list() {
 # Модель 3X-UI_KIT: один пользователь = записи во ВСЕХ инбаундах (REALITY,
 # XHTTP, Hysteria2, AmneziaWG...), один subId — одна подписка на всё.
 # Свежий секрет на каждый инбаунд (uuid/пароль/ключи), общий лимит и срок.
+# v8.0.12: единый UUID пользователя во всех инбаундах (панель 3.11 дедуплицирует по email)
+client_existing_uuid() { # $1 email -> UUID из первого инбаунда где он есть (или пусто)
+  jq -r --arg e "$1" '[.[] | (.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?) | select(.email==$e) | .id // empty][0] // empty' <<<"$INBOUNDS" 2>/dev/null
+}
+
 client_add_all() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   kit_session || return 1
@@ -3212,6 +3217,7 @@ client_add_all() {
   [ "$total" -gt 0 ] 2>/dev/null && gb=$(( total * 1073741824 ))
 
   local added=0 existing=0 failed=0 ib id settings cj link
+  local have_uuid; have_uuid="$(client_existing_uuid "$email")"
   echo ""
   while IFS= read -r ib; do
     [ -z "$ib" ] && continue
@@ -3223,7 +3229,7 @@ client_add_all() {
       existing=$((existing+1)); ok "#$id (${proto}): уже добавлен — сохраняю существующую запись"; continue
     fi
     # PAYLOAD/EXTRA_* через глобалы: вызов в $(...) — субшелл, EXTRA_* терялись бы
-    if ! client_payload_for "$ib" "$email" "$subid" "$gb" "$expiry"; then
+    if ! client_payload_for "$ib" "$email" "$subid" "$gb" "$expiry" "$have_uuid"; then
       warn "#$id (${proto}): протокол не поддержан — пропущен"; failed=$((failed+1)); continue
     fi
     cj="${PAYLOAD:-}"
@@ -3231,6 +3237,8 @@ client_add_all() {
     settings="$(jq -r '.settings' <<<"$ib")"
     if api_add_client "$id" "$cj" "$settings"; then
       added=$((added+1))
+      # v8.0.12: единый UUID — запоминаем из первого успешного payload для остальных инбаундов
+      [ -n "$have_uuid" ] || have_uuid="$(jq -r '.id // empty' <<<"$cj" 2>/dev/null)"
       [ -n "$EXTRA_LINK" ] && printf '  %s\n' "$EXTRA_LINK"
       link="$(link_for_client "$ib" "$cj")"
       [ -n "$link" ] && printf '  %s\n' "$link"
@@ -3274,6 +3282,7 @@ clients_bind_all() {
     [ -z "$u" ] && continue
     email="$(jq -r '.email' <<<"$u")"; subid="$(jq -r '.subId' <<<"$u")"
     gb="$(jq -r '.totalGB' <<<"$u")"; exp="$(jq -r '.expiryTime' <<<"$u")"
+    local have_uuid; have_uuid="$(client_existing_uuid "$email")"
     [ -n "$subid" ] || subid="$(rand_str 16)"
     while IFS= read -r ib; do
       [ -z "$ib" ] && continue
@@ -3283,13 +3292,14 @@ clients_bind_all() {
       if jq -e --arg e "$email" '(.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?)|select(.email==$e)' <<<"$ib" >/dev/null 2>&1; then
         skipped=$((skipped+1)); continue
       fi
-      if ! client_payload_for "$ib" "$email" "$subid" "$gb" "$exp"; then
+      if ! client_payload_for "$ib" "$email" "$subid" "$gb" "$exp" "$have_uuid"; then
         warn "$email -> #$id ($proto): протокол не поддержан"; failed=$((failed+1)); continue
       fi
       cj="${PAYLOAD:-}"; [ -n "$cj" ] || { failed=$((failed+1)); continue; }
       settings="$(jq -r '.settings' <<<"$ib")"
       if api_add_client "$id" "$cj" "$settings"; then
         added=$((added+1)); ok "$email -> #$id ($proto): привязан"
+        [ -n "$have_uuid" ] || have_uuid="$(jq -r '.id // empty' <<<"$cj" 2>/dev/null)"
       else
         failed=$((failed+1)); warn "$email -> #$id ($proto): панель отклонила"
       fi
@@ -9877,14 +9887,17 @@ proto_panel_awg_ib() { # $1 порт, $2 clientJSON, $3 профиль: 31|class
 # Результат — в глобальной PAYLOAD (JSON клиента); EXTRA_LINK/EXTRA_NOTE —
 # подсказки. Возвращать payload через stdout нельзя: вызов в $(...) — субшелл,
 # и установленные им глобальные EXTRA_* терялись бы (нашёл test_v600).
-client_payload_for() { # $1 ib, $2 email, $3 subid, $4 totalGB, $5 expiry
-  local ib="$1" email="$2" subid="$3" gb="${4:-0}" exp="${5:-0}" cj=""
+client_payload_for() { # $1 ib, $2 email, $3 subid, $4 totalGB, $5 expiry, [$6 existing uuid]
+  local ib="$1" email="$2" subid="$3" gb="${4:-0}" exp="${5:-0}" want_uuid="${6:-}" cj=""
   local proto uuid auth priv pub ipn used ips
   proto="$(jq -r '.protocol' <<<"$ib")"
   EXTRA_LINK=""; EXTRA_NOTE=""; PAYLOAD=""
+  # v8.0.12: единый UUID пользователя во всех инбаундах. Панель 3.11 дедуплицирует
+  # клиентов по email при генерации config.json — разные UUID в разных инбаундах
+  # приводят к подмене UUID и auth fail (подписка не совпадает с сервером).
   case "$proto" in
     vless)
-      uuid="$(new_uuid)"
+      uuid="${want_uuid:-$(new_uuid)}"
       local flow="" sec
       sec="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else . end | .security // "none"' <<<"$ib")"
       local vnet
@@ -9897,21 +9910,21 @@ client_payload_for() { # $1 ib, $2 email, $3 subid, $4 totalGB, $5 expiry
          expiryTime:$exp, enable:true, tgId:"", subId:$sub, reset:0}')"
       PAYLOAD="$cj" ;;
     vmess)
-      uuid="$(new_uuid)"
+      uuid="${want_uuid:-$(new_uuid)}"
       cj="$(jq -nc --arg id "$uuid" --arg email "$email" --arg sub "$subid" \
         --argjson total "$gb" --argjson exp "$exp" '
         {id:$id, email:$email, limitIp:0, totalGB:$total, security:"auto", alterId:0,
          expiryTime:$exp, enable:true, tgId:"", subId:$sub, reset:0}')"
       PAYLOAD="$cj" ;;
     trojan)
-      uuid="$(new_uuid)"
+      uuid="${want_uuid:-$(new_uuid)}"
       cj="$(jq -nc --arg id "$uuid" --arg pass "$uuid" --arg email "$email" --arg sub "$subid" \
         --argjson total "$gb" --argjson exp "$exp" '
         {id:$id, password:$pass, flow:"", email:$email, limitIp:0, totalGB:$total,
          expiryTime:$exp, enable:true, tgId:"", subId:$sub, reset:0}')"
       PAYLOAD="$cj" ;;
     shadowsocks)
-      uuid="$(new_uuid)"
+      uuid="${want_uuid:-$(new_uuid)}"
       cj="$(jq -nc --arg id "$uuid" --arg pass "$uuid" --arg email "$email" --arg sub "$subid" \
         --argjson total "$gb" --argjson exp "$exp" '
         {id:$id, method:"", password:$pass, email:$email, limitIp:0, totalGB:$total,
