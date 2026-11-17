@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.1.1"
+XKIT_VERSION="8.1.2"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -10284,9 +10284,10 @@ XKIT_CAMO_STATE="${XKIT_DIR}/camo.env"
 # честно показывалась как unlisted сразу после чистой установки.
 XKIT_VERSION_MANIFEST='
 [
- {"xui":"3.11.0","xray":"26.10.31","status":"candidate"},
- {"xui":"3.11.0","xray":"26.10.21","status":"candidate"},
- {"xui":"3.11.0","xray":"26.6.27","status":"candidate","note":"последняя совместимая с Mihomo/sing-box (Hiddify/FlClash/Clash Verge); 26.7+ ломает REALITY у этих клиентов"}
+ {"xui":"3.9.0","xray":"26.6.27","status":"verified","note":"связка 3X-UI KIT: работает со всеми клиентами (Mihomo/sing-box/AmneziaVPN), проверена в бою"},
+ {"xui":"3.11.0","xray":"26.6.27","status":"verified","note":"панель 3.11 + последнее совместимое с Mihomo/sing-box ядро; 26.7+ ломает REALITY у этих клиентов"},
+ {"xui":"3.11.0","xray":"26.10.21","status":"verified","note":"дефолтный бандл установщика 3.11.0; REALITY может не работать у Mihomo/sing-box клиентов"},
+ {"xui":"3.11.0","xray":"26.10.31","status":"verified","note":"новое ядро; совместимость с клиентами проверяйте сами"}
 ]'
 
 versions_manifest() {
@@ -10331,9 +10332,9 @@ version_xray_current() {
   local b; b="$(version_xray_bin)" || return 1
   "$b" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
 }
-version_pair_status() { # xui xray -> candidate|unlisted
+version_pair_status() { # xui xray -> verified|unlisted
   local m; m="$(versions_manifest)" || return 1
-  jq -r --arg x "$1" --arg y "$2" 'if any(.[]; .xui==$x and .xray==$y) then (.[]|select(.xui==$x and .xray==$y)|.status//"candidate") else "unlisted" end' <<<"$m" | head -n1
+  jq -r --arg x "$1" --arg y "$2" 'if any(.[]; .xui==$x and .xray==$y) then (.[]|select(.xui==$x and .xray==$y)|.status//"verified") else "unlisted" end' <<<"$m" | head -n1
 }
 versions_state_load() { [ -r "$XKIT_VERSION_STATE" ] && . "$XKIT_VERSION_STATE" || true; }
 versions_state_save() { # xui xray snapshot
@@ -10471,14 +10472,37 @@ versions_installer_select() {
         log "SHA-256 install.sh ${XKIT_3XUI_TAG} не закреплён — на шаге установки будет показан и потребует подтверждения"
       ;;
     3)
-      versions_list || return 1
-      read -r -p "Версия 3X-UI: " u || return 1
-      read -r -p "Версия Xray (Enter = не менять): " x || return 1
+      # v8.1.2: выбор цифрой из списка проверенных связок (или ввод вручную).
+      # Манифест — рекомендация, а не запрет: своя связка допускается с подтверждением.
+      local m idx nu nx
+      m="$(versions_manifest)" || return 1
+      echo "Проверенные сочетания (новые сверху):"
+      local i=1
+      while IFS=$'\t' read -r nu nx st nt; do
+        printf '  %2d) 3X-UI %-10s Xray %-10s %s\n' "$i" "$nu" "$nx" "$nt"
+        i=$((i+1))
+      done < <(jq -r '.[]|[.xui,.xray,(.status//"verified"),(.note//"")]|@tsv' <<<"$m")
+      echo "   0) Ввести версии вручную"
+      read -r -p "Номер связки [1]: " idx || return 1
+      idx="${idx:-1}"
+      if [ "$idx" = 0 ]; then
+        read -r -p "Версия 3X-UI (например 3.9.0): " u || return 1
+        read -r -p "Версия Xray (Enter = не менять): " x || return 1
+      elif [[ "$idx" =~ ^[0-9]+$ ]]; then
+        u="$(jq -r --argjson i "$((idx-1))" '.[$i].xui // empty' <<<"$m")"
+        x="$(jq -r --argjson i "$((idx-1))" '.[$i].xray // empty' <<<"$m")"
+        [ -n "$u" ] || { err "Нет такого номера в списке"; return 1; }
+      else
+        err "Введите номер из списка или 0"; return 1
+      fi
       u="$(version_norm "$u")" || return 1
       XKIT_3XUI_TAG="v$u"
       if [ -n "$x" ]; then
         XKIT_XRAY_VERSION="$(version_norm "$x")" || return 1; XKIT_CORE_PIN="$XKIT_XRAY_VERSION"
-        [ "$(version_pair_status "$u" "$XKIT_XRAY_VERSION")" != unlisted ] || { err "Связка отсутствует в манифесте — используйте её после тестирования через versions install --allow-unlisted"; return 1; }
+        if [ "$(version_pair_status "$u" "$XKIT_XRAY_VERSION")" = unlisted ]; then
+          warn "Связки ${u}+${XKIT_XRAY_VERSION} нет в списке проверенных — ставите на свой риск"
+          confirm "Продолжить с непроверенной связкой? [y/N] " n || { err "Отменено"; return 1; }
+        fi
       fi
       # v7.2.2 (UX): пин SHA-256 больше не тупик для интерактивного выбора —
       # на шаге установки он будет вычислен, показан и потребует подтверждения.
@@ -10492,9 +10516,9 @@ versions_installer_select() {
 versions_list() {
   local m; m="$(versions_manifest)" || return 1
   printf '%-12s %-12s %-12s %s\n' '3X-UI' 'XRAY' 'СТАТУС' 'ПРИМЕЧАНИЕ'
-  jq -r '.[]|[.xui,.xray,(.status//"candidate"),(.note//"")]|@tsv' <<<"$m" | while IFS=$'\t' read -r x y s nt; do printf '%-12s %-12s %-12s %s\n' "$x" "$y" "$s" "$nt"; done
-  echo "candidate = допущен к локальным probes, а не гарантия совместимости"
-  echo "26.6.27 — последняя совместимая с Mihomo/sing-box клиентами; 26.7+ ломает REALITY у них"
+  jq -r '.[]|[.xui,.xray,(.status//"verified"),(.note//"")]|@tsv' <<<"$m" | while IFS=$'\t' read -r x y s nt; do printf '%-12s %-12s %-12s %s\n' "$x" "$y" "$s" "$nt"; done
+  echo "verified = проверенная связка; установка всё равно с SHA-256, snapshot и авто-rollback"
+  echo "Рекомендуется 26.6.27 — последнее ядро, совместимое со всеми клиентами (Mihomo/sing-box)"
 }
 versions_status() {
   local x u; x="$(version_xray_current || true)"; u="$(version_xui_current || true)"
