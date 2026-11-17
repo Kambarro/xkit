@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.0.8"
+XKIT_VERSION="8.0.9"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -2059,6 +2059,40 @@ api_del_client() { # $1 id инбаунда, $2 email, $3 clientId (uuid; нуж
   return 0
 }
 
+# v8.0.9: обновить клиента (enable/disable и др.) без удаления. v3: clients/update
+# по email; v2: updateClient/<id> с полной settings (замена записи клиента).
+api_update_client() { # $1 id инбаунда, $2 email, $3 полный JSON клиента
+  local id="$1" email="$2" cj="$3" resp
+  cj="$(api_normalize_tgid <<<"$cj")" || { err "updateClient: tgId невалиден"; return 1; }
+  if [ "$API_V3" = "1" ]; then
+    local body
+    body="$(jq -nc --argjson c "$cj" --arg e "$email" '{client:$c, email:$e}')"
+    resp="$(api_post_json "panel/api/clients/update" "$body")" || return 1
+  else
+    # v2: достать текущую settings, заменить запись клиента по email, записать обратно
+    local cur settings new_settings
+    cur="$(api_get_inbound "$id")" || return 1
+    settings="$(jq -r '.settings' <<<"$cur")"
+    new_settings="$(jq -c --arg e "$email" --argjson c "$cj" \
+      '.clients = ([.clients[]? | if .email==$e then $c else . end])' <<<"$settings")" || return 1
+    resp="$(api_post "updateClient/$id" "$(jq -nc --arg s "$new_settings" '{settings:$s}')")" || return 1
+  fi
+  if ! jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then
+    err "updateClient: $(api_err_msg "$resp" | head -c 200)"
+    return 1
+  fi
+  return 0
+}
+
+# v8.0.9: включить/выключить инбаунд (ползунок enable в панели). Инбаунд и его
+# клиенты остаются; выключенный не слушает порт и пропадает из подписок.
+api_set_inbound_enable() { # $1 id, $2 true|false
+  local id="$1" en="$2" cur resp
+  cur="$(api_get_inbound "$id")" || return 1
+  cur="$(jq -c --argjson e "$en" '.enable=$e' <<<"$cur")" || return 1
+  api_update_inbound "$id" "$cur"
+}
+
 # единая точка входа: залогиниться и получить список инбаундов
 # результат в глобальной INBOUNDS (JSON-массив)
 kit_session() {
@@ -2169,7 +2203,7 @@ auto_route() {
     port="$(jq -r '.port' <<<"$ib")"
     tag="$(jq -r '.tag // "inbound"' <<<"$ib")"
     proto="$(jq -r '.protocol' <<<"$ib")"
-    enable="$(jq -r '.enable // true' <<<"$ib")"
+    enable="$(jq -r '(.enable != false)' <<<"$ib")"
     total=$((total+1))
 
     if [ "$enable" != "true" ]; then
@@ -2808,7 +2842,7 @@ sub_regen_impl() {
   : > "$sub_headers_new"; chmod 600 "$sub_headers_new"
   while IFS= read -r ib; do
     [ -z "$ib" ] && continue
-    [ "$(jq -r '.enable // true' <<<"$ib")" = "true" ] || continue
+    [ "$(jq -r '(.enable != false)' <<<"$ib")" = "true" ] || continue
     is_pool_inbound "$ib" && continue   # v8.0.7: технический pool — не в подписки
     local id port proto tag
     id="$(jq -r '.id' <<<"$ib")"; port="$(jq -r '.port' <<<"$ib")"
@@ -2825,6 +2859,8 @@ sub_regen_impl() {
     local cl
     for cl in "${clients[@]}"; do
       local email subid link
+      # v8.0.9: выключенный клиент (enable=false) не попадает в подписку
+      [ "$(jq -r '(.enable != false)' <<<"$cl")" = "true" ] || continue
       email="$(jq -r '.email // "user"' <<<"$cl")"
       subid="$(jq -r '.subId // ""' <<<"$cl")"
       # subId приходит из существующей панели и является именем файла.
@@ -2961,7 +2997,7 @@ list_inbounds_menu() { # показывает нумерованный спис�
   echo "------------------------------------------------------------------------"
   while IFS= read -r ib; do
     [ -z "$ib" ] && continue
-    [ "$(jq -r '.enable // true' <<<"$ib")" = "true" ] || continue
+    [ "$(jq -r '(.enable != false)' <<<"$ib")" = "true" ] || continue
     local rid rmode
     IFS='|' read -r rmode _ _ <<<"$(route_info "$(jq -r '.id' <<<"$ib")")"
     i=$((i+1))
@@ -3129,7 +3165,7 @@ client_list() {
       used="$(human_bytes $((up+down)))"
       printf '   %-26s %-12s %-10s %-11s %s\n' "${email:0:26}" \
         "$([ "${totalgb:-0}" -gt 0 ] 2>/dev/null && human_bytes "$totalgb" || echo "∞")" \
-        "$(human_expiry "${exp:-0}")" "$(jq -r 'if (.enable // true) then "да" else "нет" end' <<<"$cl")" "$used"
+        "$(human_expiry "${exp:-0}")" "$(jq -r 'if (.enable != false) then "да" else "нет" end' <<<"$cl")" "$used"
     done
   done < <(jq -c '.[]' <<<"$INBOUNDS")
   echo ""
@@ -3146,7 +3182,7 @@ client_add_all() {
   kit_session || return 1
   routes_load
   local total_ibs
-  total_ibs="$(jq -r '[.[]|select(.enable // true)]|length' <<<"$INBOUNDS" 2>/dev/null || echo 0)"
+  total_ibs="$(jq -r '[.[]|select(.enable != false)]|length' <<<"$INBOUNDS" 2>/dev/null || echo 0)"
   [ "${total_ibs:-0}" -gt 0 ] || { err "Активных инбаундов нет — создайте протоколы (xkit protocols)"; return 1; }
 
   local email total=0 days=0
@@ -3179,7 +3215,7 @@ client_add_all() {
   echo ""
   while IFS= read -r ib; do
     [ -z "$ib" ] && continue
-    [ "$(jq -r '.enable // true' <<<"$ib")" = "true" ] || continue
+    [ "$(jq -r '(.enable != false)' <<<"$ib")" = "true" ] || continue
     is_pool_inbound "$ib" && continue   # v8.0.7: технический pool — не клиентский вход
     id="$(jq -r '.id' <<<"$ib")"
     local proto; proto="$(jq -r '.protocol' <<<"$ib")"
@@ -3216,6 +3252,106 @@ client_add_all() {
   printf '  base64:       https://%s%s%s\n' "$XKIT_HOST" "$sp" "$subid"
   printf '  Clash/Mihomo: https://%s%s%s.yaml\n' "$XKIT_HOST" "$sp" "$subid"
   [ "$failed" -eq 0 ]
+}
+
+# v8.0.9: привязать ВСЕХ существующих пользователей ко ВСЕМ включённым инбаундам
+# (кроме pool), где их ещё нет — единый набор протоколов в каждой подписке.
+# Сохраняет subId/лимит/срок существующей записи. Затем пересборка подписок.
+clients_bind_all() {
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  kit_session || return 1
+  # уникальные пользователи: email -> subId/totalGB/expiry из первой найденной записи
+  local users
+  users="$(jq -c '[.[] | select(.enable != false)
+                  | (.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?)
+                  | select(.email != null and (.email|test("^pool-[0-9a-f]+$")|not))]
+                 | group_by(.email) | map({email:.[0].email, subId:(.[0].subId // ""),
+                                           totalGB:(.[0].totalGB // 0), expiryTime:(.[0].expiryTime // 0)})' <<<"$INBOUNDS")"
+  local nusers; nusers="$(jq 'length' <<<"$users")"
+  [ "${nusers:-0}" -gt 0 ] || { warn "Пользователей нет — создайте: xkit client all <email>"; return 0; }
+  local added=0 skipped=0 failed=0 u email subid gb exp ib id proto cj settings
+  while IFS= read -r u; do
+    [ -z "$u" ] && continue
+    email="$(jq -r '.email' <<<"$u")"; subid="$(jq -r '.subId' <<<"$u")"
+    gb="$(jq -r '.totalGB' <<<"$u")"; exp="$(jq -r '.expiryTime' <<<"$u")"
+    [ -n "$subid" ] || subid="$(rand_str 16)"
+    while IFS= read -r ib; do
+      [ -z "$ib" ] && continue
+      [ "$(jq -r '(.enable != false)' <<<"$ib")" = "true" ] || continue
+      is_pool_inbound "$ib" && continue
+      id="$(jq -r '.id' <<<"$ib")"; proto="$(jq -r '.protocol' <<<"$ib")"
+      if jq -e --arg e "$email" '(.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?)|select(.email==$e)' <<<"$ib" >/dev/null 2>&1; then
+        skipped=$((skipped+1)); continue
+      fi
+      if ! client_payload_for "$ib" "$email" "$subid" "$gb" "$exp"; then
+        warn "$email -> #$id ($proto): протокол не поддержан"; failed=$((failed+1)); continue
+      fi
+      cj="${PAYLOAD:-}"; [ -n "$cj" ] || { failed=$((failed+1)); continue; }
+      settings="$(jq -r '.settings' <<<"$ib")"
+      if api_add_client "$id" "$cj" "$settings"; then
+        added=$((added+1)); ok "$email -> #$id ($proto): привязан"
+      else
+        failed=$((failed+1)); warn "$email -> #$id ($proto): панель отклонила"
+      fi
+    done < <(jq -c '.[]' <<<"$INBOUNDS")
+  done < <(jq -c '.[]' <<<"$users")
+  echo ""
+  ok "Привязка: добавлено ${added}, уже было ${skipped}, ошибок ${failed}"
+  sub_regen_quiet || warn "Подписки не пересобраны — выполните xkit sub"
+  return 0
+}
+
+# v8.0.9: выключить/включить пользователя ВО ВСЕХ инбаундах сразу (единая учётка).
+# Выключенный клиент не подключается и пропадает из подписок, но остаётся в панели.
+client_set_enable() { # $1 email, $2 true|false
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  kit_session || return 1
+  local email="$1" en="$2" found=0 ok_n=0 fail_n=0 ib id cl cj
+  [[ "$email" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]] || { err "Некорректный email"; return 1; }
+  case "$en" in true|false) ;; *) err "enable: true|false"; return 1 ;; esac
+  while IFS= read -r ib; do
+    [ -z "$ib" ] && continue
+    is_pool_inbound "$ib" && continue
+    id="$(jq -r '.id' <<<"$ib")"
+    cl="$(jq -c --arg e "$email" '(.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?)|select(.email==$e)' <<<"$ib" | head -n1)"
+    [ -n "$cl" ] || continue
+    found=$((found+1))
+    cj="$(jq -c --argjson e "$en" '.enable=$e' <<<"$cl")"
+    if api_update_client "$id" "$email" "$cj"; then
+      ok_n=$((ok_n+1))
+    else
+      fail_n=$((fail_n+1)); warn "#$id: не удалось переключить $email"
+    fi
+  done < <(jq -c '.[]' <<<"$INBOUNDS")
+  [ "$found" -gt 0 ] || { err "Пользователь '$email' не найден ни в одном инбаунде"; return 1; }
+  sub_regen_quiet || true
+  if [ "$en" = "true" ]; then ok "Пользователь $email ВКЛЮЧЁН в $ok_n инбаундах (ошибок: $fail_n)"
+  else ok "Пользователь $email ВЫКЛЮЧЕН в $ok_n инбаундах (ошибок: $fail_n); из подписок убран, в панели остался"; fi
+  [ "$fail_n" -eq 0 ]
+}
+
+# интерактив: выбор пользователя и переключение enable
+client_toggle_menu() {
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  kit_session || return 1
+  local names n email cur en
+  names="$(jq -r '[.[] | (.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?)
+                  | .email // empty | select(test("^pool-[0-9a-f]+$")|not)]|unique|.[]' <<<"$INBOUNDS")"
+  [ -n "$names" ] || { warn "Пользователей нет"; return 0; }
+  echo "Пользователи (статус):"
+  while IFS= read -r n; do
+    [ -z "$n" ] && continue
+    cur="$(jq -r --arg e "$n" '[.[] | (.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?)|select(.email==$e)|(.enable != false)]|if all then "вкл" else "выкл/частично" end' <<<"$INBOUNDS")"
+    printf '  %-26s %s\n' "$n" "$cur"
+  done <<<"$names"
+  read -r -p "Email пользователя: " email
+  [ -n "$email" ] || { warn "Отменено"; return 0; }
+  read -r -p "Действие: 1) выключить  2) включить [1]: " en
+  case "${en:-1}" in
+    1) client_set_enable "$email" false ;;
+    2) client_set_enable "$email" true ;;
+    *) warn "Нет такого пункта" ;;
+  esac
 }
 
 #=========================== РУЧНОЙ РЕЛЕЙ-МАРШРУТ =============================
@@ -3393,7 +3529,7 @@ health_deep() {
     local ib cl
     while IFS= read -r ib; do
       [ -z "$ib" ] && continue
-      [ "$(jq -r '.enable // true' <<<"$ib")" = "true" ] || continue
+      [ "$(jq -r '(.enable != false)' <<<"$ib")" = "true" ] || continue
       local sec proto
       proto="$(jq -r '.protocol' <<<"$ib")"
       sec="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else . end | .security // "none"' <<<"$ib")"
@@ -3405,7 +3541,7 @@ health_deep() {
     done < <(jq -c '.[]' <<<"$INBOUNDS")
     # панельный Hysteria2: первая ссылка из клиентских auth
     local hyib hycl hauth
-    hyib="$(jq -c '[.[]|select(.protocol=="hysteria" and (.enable // true))][0] // empty' <<<"$INBOUNDS")"
+    hyib="$(jq -c '[.[]|select(.protocol=="hysteria" and (.enable != false))][0] // empty' <<<"$INBOUNDS")"
     if [ -n "$hyib" ] && [ "$hyib" != "null" ]; then
       hycl="$(jq -c '.settings|if type=="string" then (fromjson? // {clients:[]}) else . end | [.clients[]? | select((.auth // "") != "")][0] // empty' <<<"$hyib")"
       [ -n "$hycl" ] && deep_hy2_link="$(link_for_client "$hyib" "$hycl")"
@@ -3523,7 +3659,7 @@ PY
   # панельный AWG: слушает ли ядро порт (реальное рукопожатие снаружи проверит только клиент)
   if [ "$have_session" = "1" ]; then
     local awgib aport
-    awgib="$(jq -r '[.[]|select(.protocol=="amneziawg" and (.enable // true))][0].port // empty' <<<"$INBOUNDS" 2>/dev/null)"
+    awgib="$(jq -r '[.[]|select(.protocol=="amneziawg" and (.enable != false))][0].port // empty' <<<"$INBOUNDS" 2>/dev/null)"
     if [ -n "$awgib" ]; then
       if ss -lunH "sport = :$awgib" 2>/dev/null | grep -q .; then
         okln "AmneziaWG (панель): ядро слушает UDP ${awgib} (рукопожатия увидите в панели: Online/трафик)"
@@ -8748,7 +8884,8 @@ xkit_menu_json() {
       {id:"users", title:"Пользователи и подписки", items:[
         {title:"Создать пользователя (все протоколы)", desc:"Одна подписка: VLESS/VMess/Trojan/AWG/Hysteria2", args:["client","add"], mode:"form"},
         {title:"Пользователи: подписка, трафик, удаление", desc:"Выбор из списка, затем доступное действие", args:["client","list"], mode:"navigate"},
-        {title:"Обновить подписки и показать адреса", desc:"Base64, Clash и sing-box", args:["sub"], mode:"exec"},
+        {title:"Обновить подписки: привязать всех ко всем протоколам", desc:"Каждый пользователь во все включённые инбаунды + пересборка", args:["client","bind"], mode:"exec"},
+        {title:"Выключить / включить пользователя", desc:"Во всех протоколах сразу; остаётся в панели, уходит из подписок", args:["client","toggle"], mode:"exec"},
         {title:"QR-код подписки (SVG/PNG/AmneziaVPN)", desc:"Выберите пользователя и формат", args:["sub","qr"], mode:"exec"}
       ]},
       {id:"protocols", title:"Протоколы и маскировка", items:[
@@ -8757,6 +8894,7 @@ xkit_menu_json() {
         {title:"AmneziaWG 3.1 (AWG 2.0)", desc:"Панель или служба, UDP 51820", args:["protocols","awg"], mode:"exec"},
         {title:"Hysteria 2", desc:"QUIC/UDP 443, TLS и ссылка", args:["protocols","hy2"], mode:"exec"},
         {title:"Добавить AWG/Hysteria2 в панель", desc:"Инбаунды для единой подписки", args:["protocols","panel"], mode:"exec"},
+        {title:"Выключить / включить протокол", desc:"Инбаунд остаётся в панели, уходит из подписок (как ползунок)", args:["protocols","toggle"], mode:"exec"},
         {title:"REALITY: ключи и ссылки", desc:"Показать параметры существующего inbound", args:[], fn:"reality_show_keys", mode:"exec"}
       ]},
       {id:"nodes", title:"Дополнительные серверы", items:[
@@ -8948,7 +9086,11 @@ xkit_main_impl() {
                add) shift; client_add_all "$@" ;; del) shift; client_del "$@" ;; list) client_list ;;
                reset) shift; client_reset "$@" ;; show) shift; client_show "$@" ;;
                all) client_add_all ;;
-               *) err "xkit client add|all|del|list|reset|show"; exit 1 ;;
+               bind) clients_bind_all ;;
+               disable) shift; client_set_enable "${1:-}" false ;;
+               enable) shift; client_set_enable "${1:-}" true ;;
+               toggle) client_toggle_menu ;;
+               *) err "xkit client add|all|del|list|reset|show|bind|disable|enable|toggle"; exit 1 ;;
              esac ;;
     reality) shift; require_root; load_xkit_env || true
              if [ "${1:-}" = scan-csv ]; then reality_scan_csv "${2:-${XKIT_DIR}/reality-scan.tsv}" "${3:-${XKIT_DIR}/reality-scan.csv}"; else reality_wizard; fi ;;
@@ -10025,6 +10167,45 @@ protocol_remove() {
   regen_conf_and_apply || { err "Inbound удалён, но nginx не обновлён — выполните xkit route --yes"; return 1; }
   sub_regen_quiet || { warn "Inbound удалён; подписки обновите командой xkit sub"; return 1; }
   ok "Протокол #$id удалён; остальные inbound, пользователи и маршруты не затронуты"
+}
+
+# v8.0.9: выключить/включить протокол (инбаунд) — как ползунок enable в панели.
+# Инбаунд и клиенты остаются; выключенный не слушает порт и пропадает из подписок.
+protocol_toggle() {
+  load_xkit_env || die "Сначала установка XKIT"; kit_session || return 1
+  # список ВСЕХ инбаундов (включая выключенные) с пометкой статуса
+  local i=0 ib id proto port en
+  local -a rows=()
+  echo ""
+  printf '%-3s %-4s %-22s %-9s %-6s %s\n' "#" "ID" "TAG" "PROTO" "PORT" "СТАТУС"
+  echo "------------------------------------------------------------------------"
+  while IFS= read -r ib; do
+    [ -z "$ib" ] && continue
+    is_pool_inbound "$ib" && continue
+    i=$((i+1)); rows+=("$ib")
+    id="$(jq -r '.id' <<<"$ib")"; proto="$(jq -r '.protocol' <<<"$ib")"
+    port="$(jq -r '.port' <<<"$ib")"; en="$(jq -r '(.enable != false)' <<<"$ib")"
+    printf '%-3s %-4s %-22s %-9s %-6s %s\n' "$i" "$id" \
+      "$(jq -r '.tag // "inbound"' <<<"$ib" | cut -c1-22)" "$proto" "$port" \
+      "$([ "$en" = "true" ] && echo "включён" || echo "ВЫКЛЮЧЕН")"
+  done < <(jq -c '.[]' <<<"$INBOUNDS")
+  [ "$i" -eq 0 ] && { warn "Инбаундов нет"; return 1; }
+  local n
+  read -r -p "Номер инбаунда [1-$i]: " n
+  [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { err "Нет такого номера"; return 1; }
+  ib="${rows[$((n-1))]}"; id="$(jq -r '.id' <<<"$ib")"; en="$(jq -r '(.enable != false)' <<<"$ib")"
+  local target
+  if [ "$en" = "true" ]; then
+    confirm "Выключить inbound #$id? Клиенты останутся, но подключения и подписки прекратятся. [y/N] " n || { warn "Отменено"; return 0; }
+    target=false
+  else
+    target=true
+  fi
+  api_set_inbound_enable "$id" "$target" || return 1
+  regen_conf_and_apply || warn "nginx не обновлён — выполните xkit route --yes"
+  sub_regen_quiet || warn "Подписки обновите: xkit sub"
+  if [ "$target" = "true" ]; then ok "Протокол #$id ВКЛЮЧЁН (снова в подписках)"
+  else ok "Протокол #$id ВЫКЛЮЧЕН (в панели остался, из подписок убран)"; fi
 }
 
 proto_panel_status() {
@@ -11236,7 +11417,9 @@ PY
 _tg_api_read() { # $1 method, $2 urlencoded data — v8.0.0: через tg_api (транспорты/ноды)
   local method="$1" data="${2:-}"
   if declare -F tg_api >/dev/null 2>&1; then
-    tg_api "$method" "$data"
+    # v8.0.9: single-pass для polling — без цикла ожидания (бот не зависает);
+    # dead-транспорты перепроверяются фоном (tg_transport_check_all в bot run)
+    tg_api "$method" "$data" 1
     return $?
   fi
   local token="${XKIT_TG_TOKEN:-}"
@@ -13514,6 +13697,28 @@ tg_transport_check_all() {
   ) 9>"${XKIT_TG_TRANSPORTS}.lock"
 }
 
+# v8.0.9: перепроверить ТОЛЬКО dead-транспорты (фон бота, каждые retry_wait).
+# Оживший помечается ok — следующий же запрос бота пойдёт через него. ok не
+# трогаем (лишний getMe ни к чему). Если все dead и ни один не ожил — ничего
+# страшного: бот продолжит polling single-pass и перепроверит снова через 20с.
+tg_transport_recheck_dead() {
+  local arr tr i n st key
+  arr="$(tg_transports_load)"
+  n="$(jq 'length' <<<"$arr")"
+  [ "$n" -gt 0 ] || return 0
+  for ((i=0; i<n; i++)); do
+    tr="$(jq -c ".[$i]" <<<"$arr")"
+    st="$(jq -r '.status' <<<"$tr")"
+    [ "$st" = "dead" ] || continue
+    key="$(jq -r '.node//.url' <<<"$tr")"
+    if tg_transport_check_one "$tr"; then
+      tg_transport_mark "$key" ok
+    fi
+    # dead остаётся dead (checked не сбрасываем — перепроверка по расписанию бота)
+  done
+  return 0
+}
+
 # --- единый tg_api: рабочие транспорты ПЕРВЫМИ (РФ-мастер: direct заблокирован,
 # не тратим таймаут на каждый запрос), direct — запасной, статусы запоминаются ---
 # $1 method, $2 data -> stdout ответ первой успешной попытки; rc1 если все упали
@@ -13526,24 +13731,44 @@ tg_transport_mark() { # $1 key (node|url), $2 status — атомарно под
       'map(if (.node//.url)==$k then .status=$s | .checked=$t else . end)' | tg_transports_save
   ) 9>"${XKIT_TG_TRANSPORTS}.lock"
 }
-tg_api() {
-  local method="$1" data="${2:-}" arr tr i n st key resp
-  arr="$(tg_transports_load)"
-  arr="$(jq -c 'sort_by(if .status=="ok" then 0 elif .status=="unknown" then 1 else 2 end)' <<<"$arr")"
-  n="$(jq 'length' <<<"$arr")"
-  # 1) ok + unknown транспорты (ноды/прокси) — ДО direct: на РФ-мастере direct
-  # заблокирован и каждый запрос к нему = таймаут; unknown пробуем как кандидатов
-  for ((i=0; i<n; i++)); do
-    tr="$(jq -c ".[$i]" <<<"$arr")"
-    st="$(jq -r '.status' <<<"$tr")"; [ "$st" = "dead" ] && continue
-    resp="$(_tg_curl_via "$tr" "$method" "$data")" && {
-      if [ "$st" != "ok" ]; then key="$(jq -r '.node//.url' <<<"$tr")"; tg_transport_mark "$key" ok; fi
-      printf '%s' "$resp"; return 0; }
-    key="$(jq -r '.node//.url' <<<"$tr")"; tg_transport_mark "$key" dead
+tg_api() { # $1 method, $2 data, [$3 single-pass=1: без цикла ожидания, для polling]
+  local method="$1" data="${2:-}" single="${3:-0}" arr tr i n st key resp now checked any_alive
+  local retry_wait="${XKIT_TG_RETRY_WAIT:-20}" deadline
+  # v8.0.9: dead — не приговор. Транспорт перепроверяется, если с последней
+  # попытки прошло >= retry_wait (20с). Если ВСЕ dead и ни один не ожил —
+  # цикл повторных попыток каждые retry_wait, пока не поднимется рабочий.
+  # single=1 (polling getUpdates): один проход без долгого ожидания — иначе
+  # бот зависал бы на цикле и не реагировал на команды; фон перепроверит dead.
+  deadline=$(( $(date +%s) + ${XKIT_TG_MAX_WAIT:-120} ))
+  while :; do
+    arr="$(tg_transports_load)"
+    arr="$(jq -c 'sort_by(if .status=="ok" then 0 elif .status=="unknown" then 1 else 2 end)' <<<"$arr")"
+    n="$(jq 'length' <<<"$arr")"
+    now="$(date +%s)"; any_alive=0
+    # 1) ok + unknown — сразу; dead — только если «остыл» (>= retry_wait с checked)
+    for ((i=0; i<n; i++)); do
+      tr="$(jq -c ".[$i]" <<<"$arr")"
+      st="$(jq -r '.status' <<<"$tr")"
+      key="$(jq -r '.node//.url' <<<"$tr")"
+      if [ "$st" = "dead" ]; then
+        checked="$(jq -r '.checked // 0' <<<"$tr")"
+        [ $((now - checked)) -ge "$retry_wait" ] || continue   # ещё не время перепроверки
+      fi
+      resp="$(_tg_curl_via "$tr" "$method" "$data")" && {
+        [ "$st" != "ok" ] && tg_transport_mark "$key" ok
+        printf '%s' "$resp"; return 0; }
+      tg_transport_mark "$key" dead
+    done
+    # 2) direct — только если транспортов нет вообще (не-РФ мастер)
+    if [ "$n" -eq 0 ]; then
+      resp="$(_tg_curl_via '{"type":"direct"}' "$method" "$data")" && { printf '%s' "$resp"; return 0; }
+      return 1
+    fi
+    # 3) все транспорты dead и ни один не ожил в этом проходе
+    [ "$single" = "1" ] && return 1            # polling: не ждём, вернёмся в цикл
+    [ "$(date +%s)" -ge "$deadline" ] && return 1   # предохранитель от вечного цикла
+    sleep "$retry_wait"                        # цикл: перепроверим dead через retry_wait
   done
-  # 2) direct — только если транспортов нет или все dead (не-РФ мастер)
-  resp="$(_tg_curl_via '{"type":"direct"}' "$method" "$data")" && { printf '%s' "$resp"; return 0; }
-  return 1
 }
 
 # отправка сообщения (замена xkit_tg_send на tg_api; совместимость обёрткой)
@@ -14024,7 +14249,19 @@ telegram_bot_run() {
   tg_transport_check_all >/dev/null 2>&1 || true
   # v8.0.3: после ребута сервера / рестарта сервиса — короткий чек «мастер активен»
   tg_bot_check_notify >/dev/null 2>&1 || true
-  while true; do telegram_bot_once || sleep 5; done
+  # v8.0.9: фон перепроверки dead-транспортов (каждые 20с). Если все dead —
+  # бот сам оживает, как только поднимется туннель; polling при этом не зависает
+  # (single-pass). Раз в 20с лёгкая проверка getMe через dead-кандидатов.
+  local _last_tr_check=0 _now
+  while true; do
+    telegram_bot_once || sleep 5
+    _now="$(date +%s)"
+    if [ $((_now - _last_tr_check)) -ge "${XKIT_TG_RETRY_WAIT:-20}" ]; then
+      _last_tr_check="$_now"
+      # перепроверить только dead (ok не трогаем — лишний getMe ни к чему)
+      tg_transport_recheck_dead >/dev/null 2>&1 || true
+    fi
+  done
 }
 # стратегия балансировки (прямая установка + apply)
 tg_bot_set_strategy() { # $1 chat, $2 strategy

@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v8.0.8
+#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v8.0.9
 #
 #  Меню вынесено из xkit.sh в отдельный файл: ядро (API, установка, nginx,
 #  подписки, ноды) не раздувается, а правки меню не трогают xkit.sh.
@@ -97,9 +97,10 @@ menu_users() {
     echo " 2) Удалить пользователя"
     echo " 3) Сбросить трафик пользователю"
     echo " 4) Список пользователей + ссылки"
-    echo " 5) Обновить подписки и показать адреса"
+    echo " 5) Обновить подписки: привязать всех ко всем протоколам + пересборка"
     echo " 6) Добавить пользователя во все протоколы (одна подписка)"
     echo " 7) QR-код подписки (SVG/PNG; awg — AmneziaVPN HTML)"
+    echo " 8) Выключить / включить пользователя (во всех протоколах)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -108,9 +109,10 @@ menu_users() {
       2) client_del; pause_enter ;;
       3) client_reset; pause_enter ;;
       4) client_list; pause_enter ;;
-      5) sub_regen; pause_enter ;;
+      5) clients_bind_all; pause_enter ;;
       6) client_add_all; pause_enter ;;
       7) local sid fmt; read -r -p "subId: " sid; read -r -p "Формат [svg] (awg для AmneziaVPN): " fmt; sub_qr "$sid" "${fmt:-svg}"; pause_enter ;;
+      8) client_toggle_menu; pause_enter ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
     esac
