@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.1.3"
+XKIT_VERSION="8.1.4"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -10403,10 +10403,21 @@ version_snapshot_restore() {
 }
 
 version_download_verified() { # url sha-url output; SHA обязателен, без интерактивного bypass
-  local url="$1" sumurl="$2" out="$3" sum got want
+  local url="$1" sumurl="$2" out="$3" sum got want attempt
   sum="${out}.sha256"
-  curl -fsSL --max-time 120 -o "$out" "$url" || { err "Не удалось скачать $url"; return 1; }
-  curl -fsSL --max-time 30 -o "$sum" "$sumurl" || { err "Нет официальной SHA-256: $sumurl — установка запрещена"; return 1; }
+  # v8.1.4: retry + resume + длинный timeout. GitHub releases с РФ-хостов часто
+  # отдаёт медленно/обрывает (curl 28 timeout на 21MB Xray). 3 попытки, --continue-at -
+  # (докачка), --retry на сетевые сбои, --max-time 600 (большие архивы на медленном канале).
+  for attempt in 1 2 3; do
+    if curl -fL --retry 3 --retry-delay 3 --retry-all-errors \
+         --connect-timeout 30 --max-time 600 --continue-at - \
+         -o "$out" "$url"; then
+      break
+    fi
+    [ "$attempt" -lt 3 ] && { warn "Скачивание не удалось (попытка $attempt/3), повторяю..."; sleep 3; }
+  done
+  [ -s "$out" ] || { err "Не удалось скачать $url (3 попытки)"; return 1; }
+  curl -fsSL --retry 3 --retry-delay 2 --max-time 60 -o "$sum" "$sumurl" || { err "Нет официальной SHA-256: $sumurl — установка запрещена"; return 1; }
   want="$(grep -oE '[0-9a-fA-F]{64}' "$sum" | head -n1 | tr 'A-F' 'a-f')"
   got="$(sha256sum "$out" | awk '{print $1}')"
   [ -n "$want" ] && [ "$want" = "$got" ] || { err "SHA-256 не совпал — установка запрещена"; return 1; }
@@ -10576,6 +10587,14 @@ versions_install() { # xui xray [--allow-unlisted] [--allow-downgrade]
     err "PostgreSQL не входит в файловый snapshot. Сделайте Backup в панели и явно задайте XKIT_ALLOW_POSTGRES_VERSION_CHANGE=1"; return 1
   fi
   [ -f /etc/x-ui/x-ui.db ] || [ -n "$uv" ] || warn "Установленная БД не найдена; проверьте тип БД панели"
+  # v8.1.4: если обе версии УЖЕ установлены — не качаем/не переустанавливаем зря.
+  # Переустановка xkit поверх готовой панели не должна заново тянуть 21MB Xray
+  # (GitHub с РФ-хостов медленный/обрывается) — просто подтверждаем и идём дальше.
+  local xcur; xcur="$(version_xray_current || true)"
+  if [ "$uv" = "$u" ] && [ "$xcur" = "$x" ]; then
+    ok "Связка 3X-UI $u + Xray $x уже установлена — пропускаю скачивание/переустановку"
+    return 0
+  fi
   confirm "Установить связку 3X-UI $u + Xray $x с backup и автоматическим rollback? [y/N]" || return 1
   version_arch || return 1
   work="$(mktemp -d)" || return 1; stage="$work/stage"; mkdir -p "$stage"
