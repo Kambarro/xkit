@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v8.0.12 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v8.1.1 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -188,7 +188,7 @@ proto_xhttp_create() {
   xkit_fw_add xhttp "$p" tcp || { api_del_inbound "$ibid" >/dev/null 2>&1 || true; err 'Не удалось открыть TCP-порт XHTTP — inbound удалён'; return 1; }
   ok "XHTTP + REALITY создан: ${XKIT_HOST}:${p}${path}"
   sub_regen_quiet || true
-  nodes_cascade_sync   # v8.0.12: новый вход сразу в каскад (не-RU -> ноды)
+  nodes_cascade_sync   # v8.1.1: новый вход сразу в каскад (не-RU -> ноды)
   ok "Автоматических пользователей нет — добавьте своего через «Пользователи»"
 }
 
@@ -710,16 +710,17 @@ protocols_menu() {
     echo '6) Профили UDP-портов и совместимость'
     echo '7) Удалить протокол (конкретный inbound, с подтверждением)'
     echo '8) Выключить / включить протокол (остаётся в панели, уходит из подписок)'
+    echo '9) VLESS + WebSocket + TLS (за nginx, порт 443 — совместим с ТСПУ)'
     echo '0) Назад'
     read -r -p 'Протоколы: ' c || return
-    case "$c" in 1) reality_wizard ;; 2) proto_xhttp_create ;; 3) proto_awg_menu ;; 4) proto_hy2_menu ;; 5) proto_panel_menu ;; 6) proto_ports_list ;; 7) protocol_remove ;; 8) protocol_toggle ;; 0) return ;; *) warn 'Нет такого пункта' ;; esac
+    case "$c" in 1) reality_wizard ;; 2) proto_xhttp_create ;; 3) proto_awg_menu ;; 4) proto_hy2_menu ;; 5) proto_panel_menu ;; 6) proto_ports_list ;; 7) protocol_remove ;; 8) protocol_toggle ;; 9) proto_ws_create ;; 0) return ;; *) warn 'Нет такого пункта' ;; esac
   done
 }
 
 protocols_main() {
   case "${1:-menu}" in
     menu) protocols_menu ;; list) protocols_list "${2:-}" ;; status) protocols_list ;; remove) protocol_remove ;; toggle) protocol_toggle ;;
-    reality) reality_wizard ;; xhttp) proto_xhttp_create ;;
+    reality) reality_wizard ;; xhttp) proto_xhttp_create ;; ws|ws-tls) proto_ws_create ;;
     awg) case "${2:-menu}" in menu) proto_awg_menu ;; install) proto_awg_install ;; add) proto_awg_add ;; list) proto_awg_list ;; show) proto_awg_show ;; upgrade31) proto_awg_upgrade31 ;; status) systemctl status awg-quick@awg0 --no-pager ;; uninstall) proto_awg_uninstall ;; *) return 1 ;; esac ;;
     hysteria2|hy2) case "${2:-menu}" in menu) proto_hy2_menu ;; install) proto_hy2_install ;; link) proto_hy2_link ;; camo-check) proto_hy2_camo_check "${3:-}" ;; status) systemctl status xkit-hysteria2 --no-pager ;; uninstall) proto_hy2_uninstall ;; *) return 1 ;; esac ;;
     ports) proto_ports_list ;;
@@ -728,7 +729,7 @@ protocols_main() {
   esac
 }
 
-# v8.0.12: выбор протоколов сразу после установки (через запятую). Каждый мастер
+# v8.1.1: выбор протоколов сразу после установки (через запятую). Каждый мастер
 # интерактивен (порты/профили) — запускаем по очереди. Ошибка одного не срывает
 # остальные. В конце — подсказка про пользователей (без них сервер пустой).
 install_protocols_prompt() {

@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.0.12"
+XKIT_VERSION="8.1.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -3091,7 +3091,7 @@ client_del() {
   routes_load
 
   local -a users=()
-  mapfile -t users < <(jq -r '[.[].settings|fromjson?|.clients[]?|.email // empty]|unique[]' <<<"$INBOUNDS")
+  mapfile -t users < <(jq -r '[.[].settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?|.email // empty]|unique[]' <<<"$INBOUNDS")
   [ "${#users[@]}" -gt 0 ] || { warn "Пользователей нет"; return 0; }
   local requested="${1:-}" assume_yes="${2:-}" i=0 email n
   [ -z "$assume_yes" ] || [ "$assume_yes" = "--yes" ] || { err "xkit client del [email] [--yes]"; return 1; }
@@ -3110,14 +3110,21 @@ client_del() {
   fi
 
   local ib id cid deleted=0 failed=0
-  while IFS= read -r ib; do
-    [ -n "$ib" ] || continue
-    id="$(jq -r '.id' <<<"$ib")"
-    cid="$(jq -r --arg email "$email" '.settings|fromjson?|.clients[]?|select(.email==$email)|.id // .password // empty' <<<"$ib" | head -n1)"
-    [ -n "$cid" ] || continue
-    if api_del_client "$id" "$email" "$cid"; then deleted=$((deleted+1))
-    else failed=$((failed+1)); warn "Не удалось удалить '$email' из инбаунда #$id"; fi
-  done < <(jq -c '.[]' <<<"$INBOUNDS")
+  # v8.0.13: API v3 clients/del/<email> удаляет клиента ГЛОБАЛЬНО из всех инбаундов
+  # сразу — один вызов, иначе остальные инбаунды отвечают "not found" (ложные ошибки).
+  if [ "$API_V3" = "1" ]; then
+    if api_del_client "" "$email" ""; then deleted=1
+    else failed=1; warn "Не удалось удалить '$email'"; fi
+  else
+    while IFS= read -r ib; do
+      [ -n "$ib" ] || continue
+      id="$(jq -r '.id' <<<"$ib")"
+      cid="$(jq -r --arg email "$email" '.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?|select(.email==$email)|.id // .password // empty' <<<"$ib" | head -n1)"
+      [ -n "$cid" ] || continue
+      if api_del_client "$id" "$email" "$cid"; then deleted=$((deleted+1))
+      else failed=$((failed+1)); warn "Не удалось удалить '$email' из инбаунда #$id"; fi
+    done < <(jq -c '.[]' <<<"$INBOUNDS")
+  fi
   [ "$deleted" -gt 0 ] && sub_regen_quiet || true
   [ "$failed" -eq 0 ] || { err "Удалено записей: $deleted; ошибок: $failed — проверьте пользователя повторно"; return 1; }
   ok "Пользователь '$email' удалён из всех протоколов ($deleted)"
@@ -5889,19 +5896,34 @@ for n in nodes:
         ob = dict(t["outbound"]); ob["tag"] = tag; generated.append(ob)
     else:
         net = t.get("net", "tcp")
-        stream = {"network": net, "security": "reality",
-                  "realitySettings": {"serverName": t.get("sni", ""),
-                                      "fingerprint": "chrome", "publicKey": t.get("pbk", ""),
-                                      "shortId": t.get("sid", ""), "spiderX": ""}}
-        if net in ("xhttp", "splithttp"):
-            stream["xhttpSettings"] = {"path": t.get("path", "/"), "mode": "auto"}
-        generated.append({
-            "tag": tag, "protocol": "vless",
-            "settings": {"vnext": [{"address": n.get("host"), "port": int(t.get("port", 443)),
-                                    "users": [{"id": t.get("uuid"), "encryption": "none",
-                                               "flow": t.get("flow", "") if net != "tcp" else t.get("flow", "xtls-rprx-vision"),
-                                               "level": 0}]}]},
-            "streamSettings": stream, "mux": {"enabled": False, "concurrency": -1}})
+        sec = t.get("sec", "reality")
+        if sec == "tls" and net == "ws":
+            # v8.1.0: WS TLS транспорт — обычный HTTPS+WebSocket за nginx ноды (443).
+            # Спрятан за сайтом; REALITY-ключи не нужны. flow пустой (WS не Vision).
+            stream = {"network": "ws", "security": "tls",
+                      "tlsSettings": {"serverName": t.get("sni") or n.get("host"),
+                                      "fingerprint": "chrome", "alpn": ["http/1.1"]},
+                      "wsSettings": {"path": t.get("ws_path", t.get("path", "/")), "headers": {}}}
+            generated.append({
+                "tag": tag, "protocol": "vless",
+                "settings": {"vnext": [{"address": n.get("host"), "port": int(t.get("port", 443)),
+                                        "users": [{"id": t.get("uuid"), "encryption": "none",
+                                                   "flow": "", "level": 0}]}]},
+                "streamSettings": stream, "mux": {"enabled": False, "concurrency": -1}})
+        else:
+            stream = {"network": net, "security": "reality",
+                      "realitySettings": {"serverName": t.get("sni", ""),
+                                          "fingerprint": "chrome", "publicKey": t.get("pbk", ""),
+                                          "shortId": t.get("sid", ""), "spiderX": ""}}
+            if net in ("xhttp", "splithttp"):
+                stream["xhttpSettings"] = {"path": t.get("path", "/"), "mode": "auto"}
+            generated.append({
+                "tag": tag, "protocol": "vless",
+                "settings": {"vnext": [{"address": n.get("host"), "port": int(t.get("port", 443)),
+                                        "users": [{"id": t.get("uuid"), "encryption": "none",
+                                                   "flow": t.get("flow", "") if net != "tcp" else t.get("flow", "xtls-rprx-vision"),
+                                                   "level": 0}]}]},
+                "streamSettings": stream, "mux": {"enabled": False, "concurrency": -1}})
 tpl["outbounds"] = generated + outb
 
 r = tpl.setdefault("routing", {})
@@ -8901,6 +8923,7 @@ xkit_menu_json() {
       {id:"protocols", title:"Протоколы и маскировка", items:[
         {title:"VLESS + REALITY + Vision", desc:"TCP 443, маскировка под настоящий сайт", args:["reality"], mode:"exec"},
         {title:"VLESS + XHTTP + REALITY", desc:"Отдельный путь через nginx", args:["protocols","xhttp"], mode:"exec"},
+        {title:"VLESS + WebSocket + TLS", desc:"За nginx на 443 — совместим с ТСПУ (классический WS TLS)", args:["protocols","ws"], mode:"exec"},
         {title:"AmneziaWG 3.1 (AWG 2.0)", desc:"Панель или служба, UDP 51820", args:["protocols","awg"], mode:"exec"},
         {title:"Hysteria 2", desc:"QUIC/UDP 443, TLS и ссылка", args:["protocols","hy2"], mode:"exec"},
         {title:"Добавить AWG/Hysteria2 в панель", desc:"Инбаунды для единой подписки", args:["protocols","panel"], mode:"exec"},
@@ -10263,7 +10286,7 @@ XKIT_VERSION_MANIFEST='
 [
  {"xui":"3.11.0","xray":"26.10.31","status":"candidate"},
  {"xui":"3.11.0","xray":"26.10.21","status":"candidate"},
- {"xui":"3.11.0","xray":"26.6.27","status":"candidate"}
+ {"xui":"3.11.0","xray":"26.6.27","status":"candidate","note":"последняя совместимая с Mihomo/sing-box (Hiddify/FlClash/Clash Verge); 26.7+ ломает REALITY у этих клиентов"}
 ]'
 
 versions_manifest() {
@@ -10468,9 +10491,10 @@ versions_installer_select() {
 }
 versions_list() {
   local m; m="$(versions_manifest)" || return 1
-  printf '%-12s %-12s %s\n' '3X-UI' 'XRAY' 'СТАТУС'
-  jq -r '.[]|[.xui,.xray,(.status//"candidate")]|@tsv' <<<"$m" | while IFS=$'\t' read -r x y s; do printf '%-12s %-12s %s\n' "$x" "$y" "$s"; done
+  printf '%-12s %-12s %-12s %s\n' '3X-UI' 'XRAY' 'СТАТУС' 'ПРИМЕЧАНИЕ'
+  jq -r '.[]|[.xui,.xray,(.status//"candidate"),(.note//"")]|@tsv' <<<"$m" | while IFS=$'\t' read -r x y s nt; do printf '%-12s %-12s %-12s %s\n' "$x" "$y" "$s" "$nt"; done
   echo "candidate = допущен к локальным probes, а не гарантия совместимости"
+  echo "26.6.27 — последняя совместимая с Mihomo/sing-box клиентами; 26.7+ ломает REALITY у них"
 }
 versions_status() {
   local x u; x="$(version_xray_current || true)"; u="$(version_xui_current || true)"
@@ -11622,7 +11646,7 @@ XKIT_PROFILE_STATE="${XKIT_PROFILE_STATE:-${XKIT_DIR}/node-profile-state.json}"
 
 node_record() { nodes_load | jq -c --arg n "$1" '[.[]|select(.name==$n)][0]//empty'; }
 node_profile_name() { jq -r '.tunnel.profile // (.tunnel.proto // "vless-reality-vision")' <<<"$1"; }
-node_profile_valid() { [[ "$1" =~ ^(vless-reality-vision|vless-xhttp-reality|hysteria2|amneziawg-external)$ ]]; }
+node_profile_valid() { [[ "$1" =~ ^(vless-reality-vision|vless-xhttp-reality|vless-ws-tls|hysteria2|amneziawg-external)$ ]]; }
 
 node_readdress_host_key() { # старый record, новый IP; никаких новых TOFU при readdress
   local rec="$1" new="$2" old port kh oldkeys scan common
@@ -11710,7 +11734,7 @@ node_profile_hysteria_ib() { # rec port auth cert key -> inbound
 node_profile_list() {
   local want="${1:-all}" arr; arr="$(nodes_load)"
   jq -r --arg n "$want" '.[]|select($n=="all" or .name==$n)|[.name,(.tunnel.profile//.tunnel.proto//"vless-reality-vision"),(.host),(.tunnel.port|tostring)]|@tsv' <<<"$arr"
-  printf '%s\n' 'Доступно: vless-reality-vision, vless-xhttp-reality, hysteria2'
+  printf '%s\n' 'Доступно: vless-reality-vision, vless-xhttp-reality, vless-ws-tls, hysteria2'
   printf '%s\n' 'amneziawg-external: только host-level туннель + явно проверенный outbound; Xray AWG outbound не существует'
 }
 
@@ -11760,6 +11784,12 @@ node_profile_switch() {
   port="$(node_profile_remote_port "$rec" "$proto" 443)" || { rm -f "$ck"; return 1; }
   is_port "$port" || { rm -f "$ck"; err "Не удалось выделить candidate port"; return 1; }
   case "$profile" in
+    vless-ws-tls)
+      # WS TLS транспорт: инбаунд ws на 127.0.0.1:port + nginx location на ноде (443).
+      # Снаружи — обычный HTTPS за сайтом ноды; REALITY-ключи не нужны.
+      local wspath="/xkn-ws-$(rand_hex 6)/"
+      ib="$(node_ws_inbound "$rec" "$port" "$wspath")"
+      rec="$(jq -c --arg p "$wspath" '.tunnel.ws_path=$p' <<<"$rec")" ;;
     vless-*)
       priv="$(jq -r '.tunnel.reality_private//""' <<<"$rec")"
       [ -n "$priv" ] || priv="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else (. // {}) end|.realitySettings.privateKey//""' <<<"$oldib")"
@@ -11779,9 +11809,20 @@ node_profile_switch() {
   esac
   out="$(node_api "$rec" panel/api/inbounds/add POST "$ib" "$ck")"
   jq -e '.success==true' <<<"$out" >/dev/null || { rm -f "$ck"; err "Candidate inbound не создан"; return 1; }
-  node_profile_fw "$rec" add "$port" "$proto" || { newid="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck" | jq -r --argjson p "$port" '[.obj[]|select(.port==$p)][0].id//empty')"; [ -z "$newid" ] || node_api "$rec" "panel/api/inbounds/del/$newid" POST "" "$ck" >/dev/null 2>&1 || true; rm -f "$ck"; return 1; }
+  if [ "$profile" = vless-ws-tls ]; then
+    # WS TLS: nginx location на ноде (443), порт инбаунда наружу НЕ открываем (за nginx)
+    node_ws_nginx_add "$rec" "$(jq -r '.tunnel.ws_path' <<<"$rec")" "$port" >/dev/null || {
+      newid="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck" | jq -r --argjson p "$port" '[.obj[]|select(.port==$p)][0].id//empty')"
+      [ -z "$newid" ] || node_api "$rec" "panel/api/inbounds/del/$newid" POST "" "$ck" >/dev/null 2>&1 || true
+      rm -f "$ck"; err "WS nginx location на ноде не создан"; return 1; }
+  else
+    node_profile_fw "$rec" add "$port" "$proto" || { newid="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck" | jq -r --argjson p "$port" '[.obj[]|select(.port==$p)][0].id//empty')"; [ -z "$newid" ] || node_api "$rec" "panel/api/inbounds/del/$newid" POST "" "$ck" >/dev/null 2>&1 || true; rm -f "$ck"; return 1; }
+  fi
   if [ "$profile" = hysteria2 ]; then
     newrec="$(jq -c --argjson p "$port" --arg profile "$profile" '.tunnel.port=$p|.tunnel.proto="hysteria2"|.tunnel.profile=$profile|.tunnel.net="hysteria"|.tunnel.sec="tls"|.tunnel.sni=.host|.tunnel.insecure=true' <<<"$rec")"
+  elif [ "$profile" = vless-ws-tls ]; then
+    # наружу — 443 ноды (nginx TLS), внутренний порт инбаунда сохраняем для очистки
+    newrec="$(jq -c --argjson p "$port" --arg profile "$profile" '.tunnel.inner_port=$p|.tunnel.port=443|.tunnel.proto="vless"|.tunnel.profile=$profile|.tunnel.net="ws"|.tunnel.sec="tls"|.tunnel.sni=.host|.tunnel.flow=""' <<<"$rec")"
   else newrec="$(node_profile_tunnel_vless "$rec" "$profile" "$port" "$priv" "$ib")"; fi
   rf="$(mktemp "${XKIT_DIR}/.profile.XXXXXX")"; chmod 600 "$rf"; printf '%s' "$newrec" >"$rf"
   jq -c --arg n "$want" --slurpfile r "$rf" 'map(if .name==$n then $r[0] else . end)' <<<"$arr" | _xkit_atomic_write "$XKIT_NODES" || rc=$?
@@ -11797,6 +11838,7 @@ node_profile_switch() {
     newid="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck" | jq -r --argjson p "$port" '[.obj[]|select(.port==$p)][0].id//empty')"
     [ -z "$newid" ] || node_api "$rec" "panel/api/inbounds/del/$newid" POST "" "$ck" >/dev/null 2>&1 || true
     node_profile_fw "$rec" del "$port" "$proto" >/dev/null 2>&1 || true
+    [ "$profile" != vless-ws-tls ] || node_ws_nginx_del "$rec" "$(jq -r '.tunnel.ws_path' <<<"$rec")" >/dev/null 2>&1 || true
     if [ "$certmade" = 1 ]; then node_ssh "$oldrec" "rm -f $(jq -r '.tunnel.cert' <<<"$rec") $(jq -r '.tunnel.key' <<<"$rec")" >/dev/null 2>&1 || true; fi
     rm -f "$ck"; audit_event nodes.profile.switch "$want" error rollback; return 1
   fi
@@ -11805,11 +11847,17 @@ node_profile_switch() {
     newid="$(node_api "$rec" panel/api/inbounds/list GET "" "$ck" | jq -r --argjson p "$port" '[.obj[]|select(.port==$p)][0].id//empty')"
     [ -z "$newid" ] || node_api "$rec" "panel/api/inbounds/del/$newid" POST "" "$ck" >/dev/null 2>&1 || true
     node_profile_fw "$rec" del "$port" "$proto" >/dev/null 2>&1 || true
+    [ "$profile" != vless-ws-tls ] || node_ws_nginx_del "$rec" "$(jq -r '.tunnel.ws_path' <<<"$rec")" >/dev/null 2>&1 || true
     if [ "$certmade" = 1 ]; then node_ssh "$oldrec" "rm -f $(jq -r '.tunnel.cert' <<<"$rec") $(jq -r '.tunnel.key' <<<"$rec")" >/dev/null 2>&1 || true; fi
     rm -f "$ck"; audit_event nodes.profile.probe "$want" ok "$profile"; return 0
   fi
   oldid="$(jq -r '.id' <<<"$oldib")"; node_api "$rec" "panel/api/inbounds/del/$oldid" POST "" "$ck" >/dev/null || warn "Старый inbound #${oldid} не удалён — удалите после проверки"
-  node_profile_fw "$oldrec" del "$oldport" "$([ "$(jq -r '.tunnel.proto' <<<"$oldrec")" = hysteria2 ] && printf udp || printf tcp)" >/dev/null 2>&1 || true
+  # старый профиль ws-tls: снять его nginx location (внутренний порт, не 443)
+  if [ "$(jq -r '.tunnel.profile // ""' <<<"$oldrec")" = vless-ws-tls ]; then
+    node_ws_nginx_del "$oldrec" "$(jq -r '.tunnel.ws_path // ""' <<<"$oldrec")" >/dev/null 2>&1 || true
+  else
+    node_profile_fw "$oldrec" del "$oldport" "$([ "$(jq -r '.tunnel.proto' <<<"$oldrec")" = hysteria2 ] && printf udp || printf tcp)" >/dev/null 2>&1 || true
+  fi
   rm -f "$ck"; audit_event nodes.profile.switch "$want" ok "$profile"
   ok "Активный профиль $want: $profile; постоянных candidate-инбаундов не осталось"
 }
@@ -11918,7 +11966,7 @@ node_profile_survey() {
   rec="$(node_record "$want")"; [ -n "$rec" ] || { err "Нода не найдена"; return 1; }
   current="$(node_profile_name "$rec")"
   warn "Проверка временно применяет candidate и возвращает исходный канал после каждого замера"
-  for p in vless-reality-vision vless-xhttp-reality hysteria2; do
+  for p in vless-reality-vision vless-xhttp-reality vless-ws-tls hysteria2; do
     log "Проверка $p"
     if [ "$p" = "$current" ]; then node_profile_benchmark "$want" --quiet; else node_profile_switch "$want" "$p" --probe; fi
     rc=$?
@@ -14005,6 +14053,24 @@ tg_bot_main_menu() { # -> reply_markup json
 }
 
 # --- отправка меню/сообщений с кнопками ---
+# v8.1.1: ссылки в моноширинных <pre> блоках — кнопка «копировать» в Telegram.
+tg_html_escape() { # экранирование текста вне блоков (& < >)
+  local s="$1"
+  s="${s//'&'/'&amp;'}"; s="${s//'<'/'&lt;'}"; s="${s//'>'/'&gt;'}"
+  printf '%s' "$s"
+}
+tg_link_block() { # $1 подпись, $2 url -> "подпись:\n<pre>url</pre>"
+  printf '%s:\n<pre>%s</pre>' "$(tg_html_escape "$1")" "$(tg_html_escape "$2")"
+}
+tg_bot_reply_html() { # $1 chat, $2 html-text, [$3 kb] — parse_mode HTML
+  local chat="$1" text="$2" kb="${3:-}"
+  if [ -n "$kb" ]; then
+    tg_send_message "$chat" "$text" "$(jq -nc --argjson m "$kb" '{parse_mode:"HTML",reply_markup:$m}')"
+  else
+    tg_send_message "$chat" "$text" '{"parse_mode":"HTML"}'
+  fi
+}
+
 tg_bot_reply() { # $1 chat, $2 text, [$3 reply_markup-json]
   local chat="$1" text="$2" kb="${3:-}"
   if [ -n "$kb" ]; then
@@ -14274,17 +14340,19 @@ tg_bot_user_sub() { # $1 chat, $2 email
   if [ -n "$subid" ]; then
     sp="$(sub_path)"
     out=""
-    # v8.0.5: главная ссылка — страница 3X-UI (QR/ссылки/импорт в браузере)
+    # v8.1.1: каждая ссылка в <pre> — кнопка «копировать» в один тап
     if [ -n "${XKIT_PANEL_SUB_PATH:-}" ] && [ -n "${XKIT_PANEL_SUB_PORT:-}" ]; then
       out="🌐 Страница подписки (браузер: QR, ссылки, импорт):
-https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}${subid}
+<pre>https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}${subid}</pre>
 
 "
     fi
     out="${out}Прямой импорт в приложение:
-https://${XKIT_HOST}${sp}${subid}
-Clash: https://${XKIT_HOST}${sp}${subid}.yaml
-sing-box: https://${XKIT_HOST}${sp}${subid}.json"
+<pre>https://${XKIT_HOST}${sp}${subid}</pre>
+Clash:
+<pre>https://${XKIT_HOST}${sp}${subid}.yaml</pre>
+sing-box:
+<pre>https://${XKIT_HOST}${sp}${subid}.json</pre>"
   else
     out="Подписка не найдена (создайте пользователя и обновите подписки: xkit sub)"
   fi
@@ -14303,7 +14371,7 @@ sing-box: https://${XKIT_HOST}${sp}${subid}.json"
   else
     kb="$(tg_bot_main_menu)"
   fi
-  tg_bot_reply "$1" "🔗 Подписка ${2}:
+  tg_bot_reply_html "$1" "🔗 Подписка $(tg_html_escape "$2"):
 ${out}" "$kb"
 }
 
@@ -14316,17 +14384,17 @@ tg_bot_user_awg_qr() { # $1 chat, $2 email — GIF из QR-фрагментов 
   tg_bot_reply "$1" "Генерирую QR Amnezia..." >/dev/null 2>&1 || true
   f="$(sub_qr_awg_gif "$subid" "$XKIT_DIR" 2>/dev/null)" || f=""
   if [ -z "$f" ]; then
-    tg_bot_reply "$1" "Не удалось собрать QR Amnezia. Запасной путь — страница:
-https://${XKIT_HOST}$(sub_path)${subid}/amnezia" "$(tg_bot_main_menu)"
+    tg_bot_reply_html "$1" "Не удалось собрать QR Amnezia. Запасной путь — страница:
+<pre>https://${XKIT_HOST}$(sub_path)${subid}/amnezia</pre>" "$(tg_bot_main_menu)"
     return
   fi
   case "$f" in *.gif) method=sendAnimation ;; *) method=sendPhoto ;; esac
   if tg_api_file "$method" "$1" "$f" "📱 AmneziaWG ${2}: сканируйте через AmneziaVPN до завершения импорта" >/dev/null 2>&1; then
-    tg_bot_reply "$1" "Если анимация не читается — страница с QR и конфигом:
-https://${XKIT_HOST}$(sub_path)${subid}/amnezia" "$(tg_bot_main_menu)"
+    tg_bot_reply_html "$1" "Если анимация не читается — страница с QR и конфигом:
+<pre>https://${XKIT_HOST}$(sub_path)${subid}/amnezia</pre>" "$(tg_bot_main_menu)"
   else
-    tg_bot_reply "$1" "Отправка QR не удалась. Страница с QR и конфигом:
-https://${XKIT_HOST}$(sub_path)${subid}/amnezia" "$(tg_bot_main_menu)"
+    tg_bot_reply_html "$1" "Отправка QR не удалась. Страница с QR и конфигом:
+<pre>https://${XKIT_HOST}$(sub_path)${subid}/amnezia</pre>" "$(tg_bot_main_menu)"
   fi
   rm -f "$f"
 }
@@ -14485,6 +14553,110 @@ tg_bot_check_notify() { # $1 chat (необязательно — берётся
 nginx: ${nginx:-unknown} · 3X-UI: ${xui:-unknown} · Xray: ${xray:-unknown}
 Ноды: ${nodes_ok}/${nodes_all} ok (по последним метрикам)
 XKIT v${XKIT_VERSION} — бот активен"
+}
+#================= v8.1.0: VLESS + WebSocket + TLS (клиентский профиль) ================
+# Классический vless ws tls за nginx на 443 — самый совместимый с ТСПУ профиль
+# (проверено: работает там, где REALITY/XHTTP/Hysteria2 режутся). TLS терминируется
+# nginx, снаружи — обычный HTTPS + WebSocket по секретному пути. Сайт-прикрытие на /.
+# Инбаунд: vless ws на 127.0.0.1:<случайный порт>, security none (TLS на nginx).
+# Клиентская ссылка: vless://uuid@HOST:443?type=ws&security=tls&path=/xk-ws-PORT/&sni=HOST&fp=chrome
+
+proto_ws_create() { # клиентский VLESS WS TLS за nginx (443)
+  require_root; load_xkit_env || die "Сначала установка XKIT"; kit_session || return 1
+  [ -n "${XKIT_CRT:-}" ] && [ -n "${XKIT_KEY:-}" ] || { err "Нет сертификата — WS TLS требует TLS на nginx (xkit install)"; return 1; }
+  local p path ib ibid settings stream
+  p="$(rand_free_port 10000 60000)" || return 1
+  path="/xk-ws-${p}/"
+  settings='{"clients":[],"decryption":"none","fallbacks":[]}'
+  stream="$(jq -nc --arg path "$path" '{network:"ws",security:"none",wsSettings:{path:$path,headers:{}}}')"
+  ib="$(jq -nc --argjson port "$p" --arg tag "inbound-${p}" --arg remark "ws-tls-${XKIT_HOST}" --arg s "$settings" --arg st "$stream" '
+    {up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,listen:"127.0.0.1",port:$port,protocol:"vless",settings:$s,streamSettings:$st,
+     sniffing:"{\"enabled\":true,\"destOverride\":[\"http\",\"tls\",\"quic\"]}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:$tag}')"
+  api_add_inbound "$ib" || return 1
+  ibid="$(jq -r --arg t "inbound-${p}" '[.[]|select(.tag==$t)][0].id // empty' <<<"$(api_list 2>/dev/null)")"
+  [ -n "$ibid" ] || { err "WS inbound создан, но не найден"; return 1; }
+  # маршрут за nginx: local ws path -> 127.0.0.1:port (TLS на 443)
+  routes_upsert "$ibid" local ws "$path" "127.0.0.1:${p}" "inbound-${p}"
+  regen_conf_and_apply || { api_del_inbound "$ibid" >/dev/null 2>&1 || true; routes_del "$ibid"; err "nginx не применил WS location — inbound удалён"; return 1; }
+  ok "VLESS WS TLS создан: ${XKIT_HOST}:443${path} (за nginx, сайт-прикрытие на /)"
+  sub_regen_quiet || true
+  nodes_cascade_sync   # новый клиентский вход сразу в каскад (не-RU -> ноды)
+  ok "Добавьте пользователей: xkit client add <email> (WS включится автоматически)"
+}
+
+# Транспорт мастер->нода vless-ws-tls: инбаунд на ноде (ws 127.0.0.1:port) +
+# nginx location на ноде (443, TLS panel-cert) + outbound мастера (ws tls -> нода:443).
+# Спрятан за сайтом ноды: снаружи обычный HTTPS, WS по секретному пути.
+node_ws_inbound() { # rec port path -> JSON инбаунда (ws, security none, listen 127.0.0.1)
+  local rec="$1" port="$2" path="$3" settings stream
+  settings="$(jq -nc --arg id "$(jq -r '.tunnel.uuid' <<<"$rec")" --arg n "$(jq -r '.name' <<<"$rec")" --arg s "$(rand_hex 3)" \
+    '{clients:[{id:$id,flow:"",email:("tunnel-"+$n+"-"+$s),enable:true,limitIp:0,totalGB:0,expiryTime:0,reset:0}],decryption:"none",fallbacks:[]}')"
+  stream="$(jq -nc --arg path "$path" '{network:"ws",security:"none",wsSettings:{path:$path,headers:{}}}')"
+  jq -nc --argjson port "$port" --arg remark "xkit-tunnel-$(jq -r '.name' <<<"$rec")" --arg s "$settings" --arg st "$stream" \
+    '{up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,listen:"127.0.0.1",port:$port,protocol:"vless",settings:$s,streamSettings:$st,sniffing:"{\"enabled\":false}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:("inbound-"+($port|tostring))}'
+}
+
+node_ws_nginx_add() { # rec path port -> вставляет WS location в 443 server блок xkit.conf ноды
+  local rec="$1" path="$2" port="$3"
+  node_ssh "$rec" "bash -s" <<EOF
+set -e
+CONF=/etc/nginx/sites-available/xkit.conf
+[ -f "\$CONF" ] || { echo 'ERR: на ноде нет xkit.conf (сначала xkit nodes camo/hide)'; exit 1; }
+grep -q 'listen 443' "\$CONF" || { echo 'ERR: нет 443 server блока'; exit 1; }
+cp -a "\$CONF" "\$CONF.bak-ws"
+python3 - "\$CONF" '$path' '$port' <<'PY'
+import sys, re
+conf, path, port = sys.argv[1:4]
+s = open(conf).read()
+# удалить прежний WS location этого пути (идемпотентно)
+s = re.sub(r'\n?[ \t]*# --- XKIT WS tunnel[^\n]*\n.*?\n[ \t]*\}[ \t]*\n', '\n', s, flags=re.S)
+loc = '''    # --- XKIT WS tunnel (%s) ---
+    location %s {
+        if (\$http_upgrade != "websocket") { return 404; }
+        access_log off;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_buffering off;
+        proxy_read_timeout 1h;
+        proxy_send_timeout 1h;
+        proxy_pass http://127.0.0.1:%s;
+        proxy_set_header Host \$host;
+    }''' % (path, path, port)
+# вставка в server-блок listen 443 (по глубине скобок, как node_hide)
+pos = s.find('listen 443')
+if pos < 0: raise SystemExit('ERR: listen 443 не найден')
+start = s.rfind('server', 0, pos); brace = s.find('{', start)
+depth = 0; end = -1
+for i in range(brace, len(s)):
+    if s[i] == '{': depth += 1
+    elif s[i] == '}':
+        depth -= 1
+        if depth == 0: end = i; break
+if end < 0: raise SystemExit('ERR: закрывающая скобка 443 не найдена')
+s = s[:end] + '\n' + loc + '\n' + s[end:]
+open(conf, 'w').write(s)
+PY
+nginx -t 2>/dev/null || { cp -a "\$CONF.bak-ws" "\$CONF"; echo 'ERR: nginx -t не прошёл, откат'; exit 1; }
+systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1
+echo ok
+EOF
+}
+
+node_ws_nginx_del() { # rec path -> удаляет WS location с ноды
+  local rec="$1" path="$2"
+  node_ssh "$rec" "bash -s" <<EOF
+CONF=/etc/nginx/sites-available/xkit.conf
+[ -f "\$CONF" ] || exit 0
+python3 - "\$CONF" '$path' <<'PY'
+import sys, re
+conf, path = sys.argv[1:3]
+s = open(conf).read()
+s = re.sub(r'\n?[ \t]*# --- XKIT WS tunnel[^\n]*\n.*?\n[ \t]*\}[ \t]*\n', '\n', s, flags=re.S)
+open(conf, 'w').write(s)
+PY
+nginx -t 2>/dev/null && systemctl reload nginx >/dev/null 2>&1 || true
+EOF
 }
 #=========================== ДИСПЕТЧЕР (v7.2.5) ================================
 # `main "$@"` — ПОСЛЕДНИЙ модуль сборки (build.sh склеивает src/[0-9][0-9]_*.sh
