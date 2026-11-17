@@ -4,7 +4,7 @@
 
 **Your turnkey VPN server: 3X-UI panel behind nginx, all protocols, one subscription per user — managed from Telegram.**
 
-![Version](https://img.shields.io/badge/version-8.1.2-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.1.3-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -314,7 +314,7 @@ xkit audit | doctor export | info | status
 
 **update vs reinstall?** `update` preserves all state; `reinstall` backs up and installs from scratch.
 
-**Updated from the TUI but the menu is old?** Since 8.1.2 the TUI offers a restart after updating. On older versions, quit and run `xkit` again.
+**Updated from the TUI but the menu is old?** Since 8.1.3 the TUI offers a restart after updating. On older versions, quit and run `xkit` again.
 
 **Telegram is blocked on the server — will the bot work?** Yes, via an SSH tunnel to a foreign node. At least one node is required; channels self-heal.
 

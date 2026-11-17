@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.1.2"
+XKIT_VERSION="8.1.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -542,7 +542,11 @@ normalize_panel_path() {
 read_host() {
   local prompt="$1" v
   while true; do
-    read -r -p "$prompt" v || die "Ввод прерван"
+    if ! read -r -p "$prompt" v; then
+      # EOF/прерванный ввод: не роняем установку — пустой результат, вызывающий
+      # (choose_host) сделает fallback на IP. В интерактиве пустая строка = переспрос.
+      echo; return 1
+    fi
     if is_domain "$v" || is_ip "$v"; then printf '%s' "$v"; return 0; fi
     err "Некорректно: '$v'. Нужен домен или IP — без http://, путей и портов"
   done
@@ -568,7 +572,12 @@ choose_host() {
     read -r -p "Ваш выбор [1]: " a || { echo; a="1"; }
     case "${a:-1}" in
       1) CHOSEN_HOST="$myip"; return 0 ;;
-      2) CHOSEN_HOST="$(read_host "Домен или IP -> ")"; return 0 ;;
+      2) CHOSEN_HOST="$(read_host "Домен или IP -> " || true)"
+         if [ -z "$CHOSEN_HOST" ]; then
+           warn "Домен не введён — использую IP этого сервера: $myip"
+           CHOSEN_HOST="$myip"
+         fi
+         return 0 ;;
       *) err "Пункт 1 или 2" ;;
     esac
   done
@@ -8353,6 +8362,24 @@ xkit_summary_text() { # stdout: plain-текст без цветов
     fi
   else
     L+=("(xkit ещё не установлен — запустите: xkit install)")
+    # v8.1.3: установка могла прерваться до сохранения xkit.env, но панель уже
+    # стоит (install-result.env есть). Показываем реквизиты панели, чтобы пароль
+    # не потерялся — пользователь может завершить установку или взять доступ.
+    if [ -n "${PANEL_PORT:-}" ] && [ -n "${PANEL_USER:-}" ]; then
+      L+=("")
+      L+=("Панель 3X-UI уже установлена (install-result.env):")
+      L+=("  Порт:            ${PANEL_PORT}")
+      [ -n "${PANEL_WBP:-}" ] && L+=("  Путь:            ${PANEL_WBP}")
+      L+=("  Логин:           ${PANEL_USER}")
+      if [ -n "${PANEL_PASS:-}" ]; then
+        if [ "$show_secrets" = "1" ]; then
+          L+=("  Пароль:          ${PANEL_PASS}")
+        else
+          L+=("  Пароль:          ********  (полные: cat ${XKIT_INFO_FILE})")
+        fi
+      fi
+      L+=("  Завершите установку: xkit install (панель подхватится, не переустановится)")
+    fi
   fi
   # ноды
   local arr; arr="$(nodes_load 2>/dev/null || printf '[]')"
@@ -9170,6 +9197,7 @@ xkit_main_impl() {
              if [ "${1:-}" = "deep" ]; then require_root; health_deep; else health_check; fi ;;
     core-pin) shift; require_root; core_pin_install "${1:-}" ;;
     versions)
+      shift
       case "${1:-status}" in
         list) versions_list ;;
         status) versions_status ;;
