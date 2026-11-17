@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.0.9"
+XKIT_VERSION="8.0.11"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -8886,7 +8886,7 @@ xkit_menu_json() {
         {title:"Пользователи: подписка, трафик, удаление", desc:"Выбор из списка, затем доступное действие", args:["client","list"], mode:"navigate"},
         {title:"Обновить подписки: привязать всех ко всем протоколам", desc:"Каждый пользователь во все включённые инбаунды + пересборка", args:["client","bind"], mode:"exec"},
         {title:"Выключить / включить пользователя", desc:"Во всех протоколах сразу; остаётся в панели, уходит из подписок", args:["client","toggle"], mode:"exec"},
-        {title:"QR-код подписки (SVG/PNG/AmneziaVPN)", desc:"Выберите пользователя и формат", args:["sub","qr"], mode:"exec"}
+        {title:"QR-код подписки (SVG/PNG/AmneziaVPN)", desc:"Выберите пользователя и формат", args:["sub","qr"], mode:"navigate-qr"}
       ]},
       {id:"protocols", title:"Протоколы и маскировка", items:[
         {title:"VLESS + REALITY + Vision", desc:"TCP 443, маскировка под настоящий сайт", args:["reality"], mode:"exec"},
@@ -11243,9 +11243,126 @@ print(f'Amnezia QR: {len(frames)} фрагмент(а)')
 PY
 }
 
+# v8.0.11: QR-файлы для Telegram-бота. PNG подписки; Amnezia — GIF из тех же
+# фрагментов, что и amnezia_qr_html (тот же qCompress+чанки по 850), кадр 700мс.
+# $1 subId, $2 каталог -> печатает путь к файлу; rc!=0 если не вышло.
+sub_qr_png() {
+  local sub="$1" dir="$2" url out
+  [[ "$sub" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  load_xkit_env >/dev/null 2>&1 || return 1
+  url="https://${XKIT_HOST}$(sub_path)${sub}"
+  out="${dir}/qr-${sub}.png"
+  _qr_ensure_tool || return 1
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t PNG -s 8 -m 2 -o "$out" "$url" || return 1
+  else
+    QR_URL="$url" QR_OUT="$out" python3 -c 'import os,qrcode; qrcode.make(os.environ["QR_URL"]).save(os.environ["QR_OUT"])' || return 1
+  fi
+  chmod 600 "$out"; printf '%s' "$out"
+}
+
+sub_qr_awg_gif() { # $1 subId, $2 каталог -> путь к GIF (или PNG если 1 фрагмент)
+  local sub="$1" dir="$2" pair ib cl link
+  [[ "$sub" =~ ^[A-Za-z0-9_-]+$ ]] || return 1
+  load_xkit_env >/dev/null 2>&1 || return 1
+  kit_session || return 1
+  pair="$(api_list | jq -c --arg sub "$sub" '[.[] as $ib | select($ib.protocol=="amneziawg") | ($ib.settings|if type=="string" then fromjson else . end|.clients//[])[] | select(.subId==$sub) | {ib:$ib,cl:.}][0] // empty')"
+  [ -n "$pair" ] || return 1
+  ib="$(jq -c '.ib' <<<"$pair")"; cl="$(jq -c '.cl' <<<"$pair")"
+  link="$(link_for_client "$ib" "$cl")"; [ -n "$link" ] || return 1
+  _qr_ensure_tool || return 1
+  AWG_QR_LINK="$link" AWG_QR_DIR="$dir" AWG_QR_SUB="$sub" python3 - <<'AWGQR'
+import base64,configparser,io,json,os,struct,subprocess,sys,zlib
+link=os.environ['AWG_QR_LINK']; d=os.environ['AWG_QR_DIR']; sub=os.environ['AWG_QR_SUB']
+try: conf=base64.b64decode(link[6:],validate=True).decode()
+except Exception: sys.exit(1)
+# ТОТ ЖЕ pipeline, что в amnezia_qr_html: conf -> containers JSON -> qCompress -> чанки 850
+p=configparser.ConfigParser(interpolation=None); p.optionxform=str; p.read_string(conf)
+if not p.has_section('Interface') or not p.has_section('Peer'): sys.exit(1)
+i=p['Interface']; peer=p['Peer']; endpoint=peer.get('Endpoint','')
+try: host,port=endpoint.rsplit(':',1); port=int(port)
+except ValueError: sys.exit(1)
+host=host.strip('[]'); dns=[x.strip() for x in i.get('DNS','').split(',') if x.strip()]
+fields={'Jc':'junkPacketCount','Jmin':'junkPacketMinSize','Jmax':'junkPacketMaxSize',
+ 'S1':'initPacketJunkSize','S2':'responsePacketJunkSize','S3':'cookieReplyPacketJunkSize',
+ 'S4':'transportPacketJunkSize','H1':'initPacketMagicHeader','H2':'responsePacketMagicHeader',
+ 'H3':'underloadPacketMagicHeader','H4':'transportPacketMagicHeader',
+ 'I1':'specialJunk1','I2':'specialJunk2','I3':'specialJunk3','I4':'specialJunk4','I5':'specialJunk5',
+ 'HeaderProtectionKey':'headerProtectionKey','ContentPaddingAddition':'contentPaddingAddition',
+ 'RekeyAfterTime':'rekeyAfterTime','RekeyTimeout':'rekeyTimeout','RejectAfterTime':'rejectAfterTime',
+ 'KeepaliveTimeout':'keepaliveTimeout','MaxHandshakeAttempts':'maxHandshakeAttempts',
+ 'RandomTrailers':'randomTrailers','DisableCookies':'disableCookies'}
+extra={dst:i[src] for src,dst in fields.items() if i.get(src,'')!=''}
+last={'config':conf,'hostName':host,'port':port,'client_ip':i.get('Address',''),
+ 'client_priv_key':i.get('PrivateKey',''),'client_pub_key':'0',
+ 'server_pub_key':peer.get('PublicKey',''),'psk_key':peer.get('PresharedKey',''),
+ 'allowedIps':[x.strip() for x in peer.get('AllowedIPs','').split(',') if x.strip()],
+ 'persistentKeepAlive':i.get('PersistentKeepalive',peer.get('PersistentKeepalive','')),
+ 'mtu':i.get('MTU',''),**extra}
+server={'isThirdPartyConfig':True,'transport_proto':'udp','port':str(port),
+ 'last_config':json.dumps(last,ensure_ascii=False,separators=(',',':')),**extra}
+data={'containers':[{'container':'amnezia-awg','awg':server}],
+ 'defaultContainer':'amnezia-awg','description':'XKIT AmneziaWG','hostName':host,
+ 'dns1':dns[0] if dns else '','dns2':dns[1] if len(dns)>1 else ''}
+plain=json.dumps(data,ensure_ascii=False,separators=(',',':')).encode()
+packed=struct.pack('>I',len(plain))+zlib.compress(plain,8)
+chunks=[packed[n:n+850] for n in range(0,len(packed),850)]
+payloads=[base64.urlsafe_b64encode(struct.pack('>hBBI',1984,len(chunks),n,len(c))+c).rstrip(b'=').decode() for n,c in enumerate(chunks)]
+def png(payload):
+ r=subprocess.run(['qrencode','-t','PNG','-l','L','-s','8','-m','2','-o','-',payload],capture_output=True)
+ if r.returncode==0 and r.stdout: return r.stdout
+ import qrcode
+ im=qrcode.make(payload,error_correction=qrcode.constants.ERROR_CORRECT_L)
+ buf=io.BytesIO(); im.save(buf,format='PNG'); return buf.getvalue()
+frames=[png(x) for x in payloads]
+if len(frames)==1:
+ out=os.path.join(d,f'qr-{sub}-awg.png')
+ open(out,'wb').write(frames[0]); os.chmod(out,0o600); print(out); sys.exit(0)
+try:
+ from PIL import Image
+except ImportError:
+ subprocess.run([sys.executable,'-m','pip','install','--quiet','--break-system-packages','Pillow'],capture_output=True)
+ from PIL import Image
+imgs=[]
+for b in frames:
+ im=Image.open(io.BytesIO(b)).convert('L').point(lambda x:0 if x<128 else 255,'1')
+ im=im.convert('RGB'); im.info.pop('transparency',None)
+ imgs.append(im.quantize(colors=2,method=Image.MEDIANCUT))
+out=os.path.join(d,f'qr-{sub}-awg.gif')
+imgs[0].save(out,save_all=True,append_images=imgs[1:],duration=700,loop=0,optimize=False)
+os.chmod(out,0o600); print(out)
+AWGQR
+}
+
+_qr_ensure_tool() { # qrencode или python3-qrcode; автоустановка как в sub_qr
+  command -v qrencode >/dev/null 2>&1 && return 0
+  python3 -c 'import qrcode' >/dev/null 2>&1 && return 0
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get -o DPkg::Lock::Timeout=300 install -y -qq qrencode >/dev/null 2>&1 && return 0
+    apt-get update -qq >/dev/null 2>&1 || true
+    apt-get -o DPkg::Lock::Timeout=300 install -y -qq qrencode >/dev/null 2>&1 && return 0
+  fi
+  return 1
+}
+
 sub_qr() { # локальный SVG/PNG или родной animated HTML для AmneziaVPN
-  local sub="${1:-}" fmt="${2:-svg}" url out
-  [[ "$sub" =~ ^[A-Za-z0-9_-]+$ ]] || { err "xkit sub qr <subId> [svg|png|awg]"; return 1; }
+  local sub="${1:-}" fmt="${2:-}" url out
+  [[ "$sub" =~ ^[A-Za-z0-9_-]+$ ]] || { err "xkit sub qr <subId|email> [svg|png|awg]"; return 1; }
+  # v8.0.11: аргументом может быть email (TUI/бот передают имя) — резолвим в subId
+  if kit_session >/dev/null 2>&1; then
+    local _sid
+    _sid="$(api_list 2>/dev/null | jq -r --arg s "$sub" '[.[].settings|if type=="string" then fromjson? else . end|.clients[]?|select(.subId==$s or .email==$s)|.subId // empty][0] // empty' 2>/dev/null)"
+    [ -n "$_sid" ] && sub="$_sid"
+  fi
+  if [ -z "$fmt" ]; then
+    if [ -t 0 ]; then
+      printf 'Формат QR: 1) SVG  2) PNG  3) AmneziaVPN (animated HTML)\n'
+      local c; read -r -p "Выбор [1]: " c
+      case "${c:-1}" in 2) fmt=png ;; 3) fmt=awg ;; *) fmt=svg ;; esac
+    else
+      fmt=svg
+    fi
+  fi
   load_xkit_env >/dev/null 2>&1 || return 1
   if [ "$fmt" = awg ]; then
     kit_session || return 1
@@ -13645,8 +13762,8 @@ tg_transport_remove() { # $1 node-имя или url
 
 # --- проверка транспорта: getMe через него ---
 # curl-конфиг с токеном (stdin), прокси/туннель по типу. timeout 8с.
-_tg_curl_via() { # $1 transport-json, $2 method, $3 data -> stdout ответ; rc
-  local tr="$1" method="$2" data="${3:-}" token="${XKIT_TG_TOKEN:-}" type url node lp proxy
+_tg_curl_via() { # $1 transport-json, $2 method, $3 data, [$4 extra-curl-args \x1f-separated] -> stdout ответ; rc
+  local tr="$1" method="$2" data="${3:-}" extra="${4:-}" token="${XKIT_TG_TOKEN:-}" type url node lp proxy
   [[ "$token" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,46}$ ]] || return 1
   type="$(jq -r '.type' <<<"$tr")"
   local -a px=()
@@ -13662,10 +13779,12 @@ _tg_curl_via() { # $1 transport-json, $2 method, $3 data -> stdout ответ; r
     *) return 1 ;;
   esac
   local out rc
+  local -a ex=()
+  [ -n "$extra" ] && IFS=$'\x1f' read -r -a ex <<<"$extra"
   out="$({ printf 'request = "POST"\nurl = "https://api.telegram.org/bot%s/%s"\n' "$token" "$method"
     [ -n "$data" ] && printf 'data = "%s"\n' "$data"
     true
-  } | curl -sf --connect-timeout 3 --max-time 8 ${px[@]+"${px[@]}"} -K - 2>/dev/null)"
+  } | curl -sf --connect-timeout 3 --max-time 30 ${px[@]+"${px[@]}"} ${ex[@]+"${ex[@]}"} -K - 2>/dev/null)"
   rc=$?
   printf '%s' "$out"
   return $rc
@@ -13731,8 +13850,8 @@ tg_transport_mark() { # $1 key (node|url), $2 status — атомарно под
       'map(if (.node//.url)==$k then .status=$s | .checked=$t else . end)' | tg_transports_save
   ) 9>"${XKIT_TG_TRANSPORTS}.lock"
 }
-tg_api() { # $1 method, $2 data, [$3 single-pass=1: без цикла ожидания, для polling]
-  local method="$1" data="${2:-}" single="${3:-0}" arr tr i n st key resp now checked any_alive
+tg_api() { # $1 method, $2 data, [$3 single-pass=1], [$4 extra-curl-args \x1f-separated (multipart)]
+  local method="$1" data="${2:-}" single="${3:-0}" extra="${4:-}" arr tr i n st key resp now checked any_alive
   local retry_wait="${XKIT_TG_RETRY_WAIT:-20}" deadline
   # v8.0.9: dead — не приговор. Транспорт перепроверяется, если с последней
   # попытки прошло >= retry_wait (20с). Если ВСЕ dead и ни один не ожил —
@@ -13754,14 +13873,14 @@ tg_api() { # $1 method, $2 data, [$3 single-pass=1: без цикла ожида
         checked="$(jq -r '.checked // 0' <<<"$tr")"
         [ $((now - checked)) -ge "$retry_wait" ] || continue   # ещё не время перепроверки
       fi
-      resp="$(_tg_curl_via "$tr" "$method" "$data")" && {
+      resp="$(_tg_curl_via "$tr" "$method" "$data" "$extra")" && {
         [ "$st" != "ok" ] && tg_transport_mark "$key" ok
         printf '%s' "$resp"; return 0; }
       tg_transport_mark "$key" dead
     done
     # 2) direct — только если транспортов нет вообще (не-РФ мастер)
     if [ "$n" -eq 0 ]; then
-      resp="$(_tg_curl_via '{"type":"direct"}' "$method" "$data")" && { printf '%s' "$resp"; return 0; }
+      resp="$(_tg_curl_via '{"type":"direct"}' "$method" "$data" "$extra")" && { printf '%s' "$resp"; return 0; }
       return 1
     fi
     # 3) все транспорты dead и ни один не ожил в этом проходе
@@ -13816,6 +13935,23 @@ tg_transport_menu() {
       *) warn "Нет такого пункта" ;;
     esac
   done
+}
+
+# v8.0.11: отправка файла (QR-картинка/анимация) через самовосстанавливающийся транспорт.
+# $1 method (sendPhoto|sendAnimation|sendDocument), $2 chat_id, $3 путь к файлу, [$4 caption]
+tg_api_file() {
+  local method="$1" chat="$2" file="$3" caption="${4:-}" field extra resp
+  [ -r "$file" ] || return 1
+  case "$method" in
+    sendPhoto) field=photo ;;
+    sendAnimation) field=animation ;;
+    *) field=document ;;
+  esac
+  # multipart: chat_id/caption — form-поля, файл — -F field=@path (токен только в URL через -K -)
+  extra="$(printf -- '-F\x1fchat_id=%s\x1f-F\x1f%s=@%s' "$chat" "$field" "$file")"
+  [ -n "$caption" ] && extra="${extra}$(printf '\x1f-F\x1fcaption=%s' "$caption")"
+  resp="$(tg_api "$method" "" 0 "$extra")" || return 1
+  printf '%s' "$resp"
 }
 #=========================== TELEGRAM БОТ v8.0.0 (primary UI) ================
 # Интерактивное меню inline-кнопками. Админ (XKIT_TG_ADMINS) — полный доступ;
@@ -14062,6 +14198,7 @@ tg_bot_handle_callback() { # $1 callback-json
     u:*) tg_bot_user_card "$cid" "${data#u:}" ;;
     n:*) tg_bot_node_card "$cid" "${data#n:}" ;;
     sub:*) tg_bot_user_sub "$cid" "${data#sub:}" ;;
+    aqr:*) tg_bot_user_awg_qr "$cid" "${data#aqr:}" ;;
     reset:*) tg_bot_confirm "$cid" "reset:${data#reset:}" "Сбросить трафик ${data#reset:}" ;;
     del:*) tg_bot_confirm "$cid" "del:${data#del:}" "Удалить пользователя ${data#del:}" ;;
     exp:*) tg_bot_reply "$cid" "Продлить: /expire ${data#exp:} <DD.MM.YYYY>" ;;
@@ -14138,8 +14275,47 @@ sing-box: https://${XKIT_HOST}${sp}${subid}.json"
   else
     out="Подписка не найдена (создайте пользователя и обновите подписки: xkit sub)"
   fi
+  # v8.0.11: QR-картинкой прямо в чат + кнопка QR Amnezia (если есть AWG)
+  local qrf kb has_awg=0
+  if [ -n "$subid" ]; then
+    has_awg="$(jq -r --arg sub "$subid" '[.[] | select(.protocol=="amneziawg") | (.settings|if type=="string" then fromjson? else . end|.clients[]?|select(.subId==$sub))]|length' <<<"${INBOUNDS:-[]}" 2>/dev/null || echo 0)"
+    qrf="$(sub_qr_png "$subid" "$XKIT_DIR" 2>/dev/null)" || qrf=""
+    if [ -n "$qrf" ]; then
+      tg_api_file sendPhoto "$1" "$qrf" "🔗 Подписка ${2} — сканируйте в приложении" >/dev/null 2>&1 || true
+      rm -f "$qrf"
+    fi
+  fi
+  if [ "$has_awg" != "0" ] && [ -n "$has_awg" ]; then
+    kb="$(jq -nc --arg e "$2" '[[{text:"📱 QR Amnezia",callback_data:("aqr:"+$e)}],[{text:"🏠 Меню",callback_data:"m:main"}]]' | _tg_kb)"
+  else
+    kb="$(tg_bot_main_menu)"
+  fi
   tg_bot_reply "$1" "🔗 Подписка ${2}:
-${out}" "$(tg_bot_main_menu)"
+${out}" "$kb"
+}
+
+tg_bot_user_awg_qr() { # $1 chat, $2 email — GIF из QR-фрагментов Amnezia (или PNG)
+  load_xkit_env >/dev/null 2>&1 || true
+  kit_session >/dev/null 2>&1 || { tg_bot_reply "$1" "Нет сессии панели"; return; }
+  local subid f method
+  subid="$(jq -r --arg email "$2" '[.[].settings|if type=="string" then fromjson? else . end|.clients[]?|select(.email==$email)|.subId // empty][0] // empty' <<<"${INBOUNDS:-[]}" 2>/dev/null)"
+  [ -n "$subid" ] || { tg_bot_reply "$1" "Подписка не найдена"; return; }
+  tg_bot_reply "$1" "Генерирую QR Amnezia..." >/dev/null 2>&1 || true
+  f="$(sub_qr_awg_gif "$subid" "$XKIT_DIR" 2>/dev/null)" || f=""
+  if [ -z "$f" ]; then
+    tg_bot_reply "$1" "Не удалось собрать QR Amnezia. Запасной путь — страница:
+https://${XKIT_HOST}$(sub_path)${subid}/amnezia" "$(tg_bot_main_menu)"
+    return
+  fi
+  case "$f" in *.gif) method=sendAnimation ;; *) method=sendPhoto ;; esac
+  if tg_api_file "$method" "$1" "$f" "📱 AmneziaWG ${2}: сканируйте через AmneziaVPN до завершения импорта" >/dev/null 2>&1; then
+    tg_bot_reply "$1" "Если анимация не читается — страница с QR и конфигом:
+https://${XKIT_HOST}$(sub_path)${subid}/amnezia" "$(tg_bot_main_menu)"
+  else
+    tg_bot_reply "$1" "Отправка QR не удалась. Страница с QR и конфигом:
+https://${XKIT_HOST}$(sub_path)${subid}/amnezia" "$(tg_bot_main_menu)"
+  fi
+  rm -f "$f"
 }
 
 # транспорт ноды (меню профилей)
