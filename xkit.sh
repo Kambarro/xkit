@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.2.1"
+XKIT_VERSION="8.2.2"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -4809,6 +4809,10 @@ xkit_install_body() {
   # Вариант «мастер» = автопроброс + добавление нод (node_add требует
   # живой nginx и панель, поэтому автопроброс всегда идёт первым).
   # XKIT_YES=1 (CI/cloud-init): без вопросов — «сделаю позже сам»
+  # v8.2.2: install_protocols_prompt живёт в модуле xkit_protocols.sh — без его
+  # загрузки вызов падал «command not found», вопрос о протоколах не задавался
+  # и инбаунды мастера не создавались (живой баг 8.1.6–8.2.1).
+  xkit_protocols_load || warn "Модуль протоколов не загружен — выбор протоколов позже: xkit protocols"
   echo ""
   log "Что дальше?"
   echo "  1) Одиночный сервер — автопроброс инбаундов за nginx (по умолчанию)"
@@ -10857,7 +10861,13 @@ camo_site_install() { # [hex-seed], без аргумента используе
   if [ -z "$seed" ]; then seed="$(camo_seed_load || true)"; fi
   if [ -z "$seed" ]; then seed="$(rand_hex 32)"; fi
   [[ "$seed" =~ ^[0-9a-f]{64}$ ]] || { err "Seed: ровно 64 hex-символа"; return 1; }
-  if [ -z "${1:-}" ] && [ -f "$CAMO_DIR/index.html" ] && [ -f "$CAMO_DIR/assets/style.css" ]; then
+  # v8.2.2: идемпотентность только при сохранённом seed И sitegen-маркере.
+  # Старый camo (до 8.2.0: 6 тем-визиток, seed не сохранялся) иначе оставался
+  # навсегда — «сохранён без изменений» при каждом regen_conf_and_apply.
+  # signup/ — страница sitegen, в старом движке её не было.
+  if [ -z "${1:-}" ] && camo_seed_load >/dev/null 2>&1 \
+     && [ -f "$CAMO_DIR/index.html" ] && [ -f "$CAMO_DIR/assets/style.css" ] \
+     && [ -d "$CAMO_DIR/signup" ]; then
     ok "Сайт-прикрытие сохранён без изменений (seed зафиксирован)"; return 0
   fi
   stage="$(mktemp -d "$(dirname "$CAMO_DIR")/.camo.new.XXXXXX")" || return 1
@@ -10893,12 +10903,15 @@ camo_files() {
   cat <<EOF
 Файлы сайта, которые можно заменить вручную:
   $CAMO_DIR/index.html       — главная страница
-  $CAMO_DIR/about.html       — о проекте
-  $CAMO_DIR/contact.html     — контакты
-  $CAMO_DIR/privacy.html     — privacy
+  $CAMO_DIR/about/index.html — о проекте
+  $CAMO_DIR/pricing/index.html — тарифы
+  $CAMO_DIR/faq/index.html   — FAQ
+  $CAMO_DIR/privacy/index.html — privacy
+  $CAMO_DIR/login/index.html — страница входа (demo)
+  $CAMO_DIR/signup/index.html — регистрация (demo)
   $CAMO_DIR/404.html         — страница ошибки
   $CAMO_DIR/assets/style.css — оформление
-  $CAMO_DIR/assets/mark.svg  — локальная графика
+  $CAMO_DIR/favicon.svg      — локальная графика
 Используйте только локальные ресурсы. Ручные правки будут перезаписаны при camo regenerate.
 EOF
 }
