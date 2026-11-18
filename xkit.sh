@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.1.5"
+XKIT_VERSION="8.2.0"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -4719,6 +4719,13 @@ xkit_install_body() {
 
   # v6.0.0: нативные подписки панели на 127.0.0.1 — из них в файлы подписок xkit
   # попадают ссылки, которые рендерит сама панель (vpn:// AmneziaWG и др.)
+  # v8.1.7: реквизиты панели сразу после установки (шаг 3), не в конце после
+  # тестов транспортов. Раньше /root/xkit-info.txt появлялся только после
+  # install_protocols_prompt/nodes_menu — пользователь не видел пароль пока не
+  # пройдёт все тесты. Пишем сразу (панель уже стоит, пароль усилен), в конце
+  # установки xkit_info обновит сводку с нодами/протоколами.
+  xkit_info || warn "Не удалось записать сводку реквизитов (повторится в конце установки)"
+
   step "Нативные подписки панели (127.0.0.1, проксируются через nginx)"
   ensure_panel_sub_settings || warn "Не удалось настроить подписки панели — ссылки vpn:// (AWG) не попадут в файлы подписок (повтор: xkit extfix)"
 
@@ -4800,8 +4807,22 @@ xkit_install_body() {
     read -r -p "Выбор [1]: " a || a=""
   fi
   case "${a:-1}" in
-    1|"") auto_route ;;
+    1|"") auto_route
+       # v8.1.6: протоколы мастера сразу после проброса (одиночный сервер).
+       if [ "${XKIT_YES:-0}" != "1" ]; then install_protocols_prompt || true; fi ;;
     2) auto_route || warn "Автопроброс не прошёл — ноды можно добавить позже (xkit nodes)"
+       # v8.1.6: СНАЧАЛА обязательная настройка мастера (его Reality/протоколы),
+       # ПОТОМ ноды. Раньше ноды добавлялись до создания инбаундов мастера →
+       # «как на мастере» было недоступно (мастер пустой) → дефолт 1.1.1.1.
+       echo ""
+       log "Настройка мастера (протоколы/Reality) — перед подключением нод..."
+       if [ "${XKIT_YES:-0}" != "1" ]; then install_protocols_prompt || true; fi
+       # v8.2.0: camo мастера ДО нод — единый seed/бренд проекта должен существовать
+       # до генерации маскировки нод (ноды наследуют бренд мастера как поддомены).
+       # regen_conf_and_apply (шаг 6) уже поднял camo; гарантируем seed явно.
+       if ! camo_seed_load >/dev/null 2>&1; then
+         camo_site_install || warn "Camo мастера не создан до нод — ноды создадут seed сами"
+       fi
        echo ""
        log "Добавление нод (мастер-режим)..."
        nodes_menu ;;
@@ -4813,12 +4834,8 @@ xkit_install_body() {
   case "${INSTALL_BACKUP_STAGE:-}" in /tmp/*) rm -rf -- "$INSTALL_BACKUP_STAGE" ;; esac
   INSTALL_BACKUP_STAGE=""
 
-  # v8.0.8: сразу после установки — какие протоколы включить (через запятую).
-  # Раньше пользователь оставался с голым сервером и должен был сам найти меню
-  # протоколов. XKIT_YES=1 (CI/cloud-init) — пропускаем, настроит сам.
-  if [ "${XKIT_YES:-0}" != "1" ]; then
-    install_protocols_prompt || true
-  fi
+  # v8.1.6: протоколы уже предложены выше (в ветках 1/2). Для варианта 3 («сделаю
+  # позже сам») не навязываем — пользователь настроит через меню. XKIT_YES — пропуск.
 
   echo ""
   xkit_info   # вся сводка в терминал + /root/xkit-info.txt (chmod 600)
@@ -5177,20 +5194,31 @@ reality_scan_run() { # $1 targets (построчно), $2 out.tsv
   grep -v '^$' <<<"$1" > "$tmp" || true
   local total open_cnt
   total="$(wc -l < "$tmp")"
-  log "Шаг 1/2: TCP-проба :443 на ${total} адресах (50 параллельно)..."
+  log "Шаг 1/2: TCP-проба :443 на ${total} адресах (тихий скан: 3 потока, без mass-scan)..."
   cat > "${tmp}.probe" <<'EOF'
 #!/bin/bash
 timeout 2 bash -c 'exec 3<>/dev/tcp/"$1"/443' _ "$1" 2>/dev/null && echo "$1"
 EOF
   chmod +x "${tmp}.probe"
   local openf="${tmp}.open"; : > "$openf"
-  xargs -a "$tmp" -P 50 -n 1 "${tmp}.probe" >> "$openf" 2>/dev/null || true
+  # v8.1.6: тихий скан — 3 потока (не 50), прогресс в реальном времени, чтобы
+  # не было ощущения зависания и не нарваться на abuse-детект провайдера.
+  local done_cnt=0
+  while IFS= read -r ip; do
+    [ -z "$ip" ] && continue
+    printf '\r  TCP-проба: %d/%d (открытых: %d)   ' "$done_cnt" "$total" "$(grep -c . "$openf" 2>/dev/null || echo 0)" >&2
+    timeout 2 bash -c 'exec 3<>/dev/tcp/"$1"/443' _ "$ip" 2>/dev/null && echo "$ip" >> "$openf"
+    done_cnt=$((done_cnt+1))
+  done < "$tmp"
+  printf '\r  TCP-проба: %d/%d (открытых: %d)   \n' "$total" "$total" "$(grep -c . "$openf" 2>/dev/null || echo 0)" >&2
   open_cnt="$(grep -c . "$openf" 2>/dev/null || echo 0)"
   log "Шаг 2/2: TLS-детали на ${open_cnt} открытых адресах..."
   : > "$out"
-  local ip brief cert cn san issuer end tls13 h2 x25519 selfsig verdict tls_version cipher alpn
+  local ip brief cert cn san issuer end tls13 h2 x25519 selfsig verdict tls_version cipher alpn tls_done=0
   while IFS= read -r ip; do
     [ -z "$ip" ] && continue
+    tls_done=$((tls_done+1))
+    printf '\r  TLS-проверка: %d/%d   ' "$tls_done" "$open_cnt" >&2
     brief="$(echo | timeout 6 openssl s_client -brief -connect "${ip}:443" -servername "${ip}" 2>&1)"
     tls13=no;  grep -q "TLSv1.3" <<<"$brief" && tls13=yes
     h2=no;     grep -qi "ALPN protocol: *h2" <<<"$brief" && h2=yes
@@ -5226,6 +5254,7 @@ EOF
       "$ip" "$tls13" "$h2" "$x25519" "$selfsig" "${cn:--}" "${san:--}" "${end:--}" "$verdict" \
       "${issuer:--}" "${tls_version:--}" "${cipher:--}" "${alpn:--}" >> "$out"
   done < "$openf"
+  printf '\r  TLS-проверка: %d/%d   \n' "$open_cnt" "$open_cnt" >&2
   rm -f "$tmp" "${tmp}.probe" "$openf"
   return 0
 }
@@ -5294,7 +5323,7 @@ reality_scan_choose() { # $1 tsv; результат в RDEST / RSNI
 
 # выбор из готового списка; результат в RDEST / RSNI
 reality_known_pick() {
-  echo "1) 1.1.1.1:443                SNI: cloudflare-dns.com  (быстрый, надёжный)"
+  echo "1) 1.1.1.1:443                SNI: cloudflare-dns.com  (по умолчанию)"
   echo "2) www.tesla.com:443          SNI: www.tesla.com"
   echo "3) www.samsung.com:443        SNI: www.samsung.com"
   echo "4) www.lovelive-anime.jp:443  SNI: www.lovelive-anime.jp"
@@ -5307,6 +5336,85 @@ reality_known_pick() {
     4) RDEST="www.lovelive-anime.jp:443"; RSNI="www.lovelive-anime.jp" ;;
     5) RDEST="www.icloud.com:443";       RSNI="www.icloud.com" ;;
     *) return 1 ;;
+  esac
+  return 0
+}
+
+# v8.1.6: пул популярных TLS1.3+H2 сайтов для случайного выбора (разнообразие
+# маскировок у разных пользователей XKIT, без скана подсети и abuse-риска).
+REALITY_POOL=(
+  "www.tesla.com:443|www.tesla.com"
+  "www.samsung.com:443|www.samsung.com"
+  "www.lovelive-anime.jp:443|www.lovelive-anime.jp"
+  "www.icloud.com:443|www.icloud.com"
+  "www.yahoo.com:443|www.yahoo.com"
+  "www.microsoft.com:443|www.microsoft.com"
+  "www.cloudflare.com:443|www.cloudflare.com"
+  "www.amazon.com:443|www.amazon.com"
+)
+reality_pool_random() { # -> RDEST / RSNI (случайный из пула)
+  local n="${#REALITY_POOL[@]}" idx entry
+  idx=$(( RANDOM % n ))
+  entry="${REALITY_POOL[$idx]}"
+  RDEST="${entry%%|*}"; RSNI="${entry##*|}"
+  ok "Случайный dest из пула: ${RDEST} (SNI ${RSNI})"
+}
+
+# v8.1.7: единое меню выбора dest Reality (мастер и нода). Дефолт зависит от типа
+# серта: ДОМЕН → свой сайт (dest=127.0.0.1:8444, SNI=домен — серт ноды совпадает);
+# IP → чужой сайт (1.1.1.1 по умолчанию, свой сайт недоступен — IP-серт без SNI).
+# $1 = "node"|"master"; $2 mdest, $3 msni (как на мастере); $4 node-rec (скан с ноды);
+# $5 host_kind (domain|ip). Результат в RDEST / RSNI.
+reality_dest_menu() { # $1 mode, $2 mdest, $3 msni, $4 node-rec, $5 host-kind
+  local mode="${1:-master}" mdest="${2:-}" msni="${3:-}" nrec="${4:-}" hkind="${5:-ip}"
+  local own_ok=0
+  [ "$hkind" = "domain" ] && own_ok=1
+  echo "Dest (прикрытие) Reality — под какой сайт маскируется туннель:"
+  if [ "$own_ok" = 1 ]; then
+    echo "  1) Свой сайт (домен + наш сертификат) — по умолчанию для домена"
+    echo "  2) 1.1.1.1 / cloudflare-dns.com"
+  else
+    echo "  1) 1.1.1.1 / cloudflare-dns.com (по умолчанию; IP-серт — свой сайт недоступен)"
+    echo "  2) Случайный из пула популярных сайтов"
+  fi
+  echo "  3) Случайный из пула популярных сайтов (разнообразие маскировок)"
+  echo "  4) Выбрать из известного списка (Tesla/Samsung/iCloud/...)"
+  echo "  5) Поиск по подсети (тихий скан /24, отфильтрованные TLS1.3+H2 сайты)"
+  if [ "$mode" = "node" ] && [ -n "$mdest" ] && [ -n "$msni" ]; then
+    echo "  6) Как на мастере (${mdest}, SNI ${msni}) — единая маскировка кластера"
+  fi
+  echo "  7) Вручную (свой dest + SNI)"
+  local c; read -r -p "Выбор [1]: " c; c="${c:-1}"
+  # нормализуем выбор: для домена пункт 1 = свой сайт, пункт 2 = 1.1.1.1
+  if [ "$own_ok" = 1 ]; then
+    case "$c" in
+      1) RDEST="127.0.0.1:8444"; RSNI="__OWN_DOMAIN__"; return 0 ;;
+      2) RDEST="1.1.1.1:443"; RSNI="cloudflare-dns.com"; return 0 ;;
+    esac
+  else
+    case "$c" in
+      1) RDEST="1.1.1.1:443"; RSNI="cloudflare-dns.com"; return 0 ;;
+    esac
+  fi
+  case "$c" in
+    2|3) reality_pool_random ;;
+    4) reality_known_pick || return 1 ;;
+    5) if [ "$mode" = "node" ] && [ -n "$nrec" ]; then
+         node_reality_scan_pick "$nrec" || return 1
+       else
+         reality_scan_pick || return 1
+       fi ;;
+    6) if [ "$mode" = "node" ] && [ -n "$mdest" ] && [ -n "$msni" ]; then
+         RDEST="$mdest"; RSNI="$msni"
+       else
+         RDEST="1.1.1.1:443"; RSNI="cloudflare-dns.com"
+       fi ;;
+    7) local dh dp
+       dh="$(read_host "dest (домен/IP) -> ")" || return 1
+       read -r -p "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
+       RSNI="$(read_host "SNI -> ")" || return 1
+       RDEST="${dh}:${dp}" ;;
+    *) if [ "$own_ok" = 1 ]; then RDEST="127.0.0.1:8444"; RSNI="__OWN_DOMAIN__"; else RDEST="1.1.1.1:443"; RSNI="cloudflare-dns.com"; fi ;;
   esac
   return 0
 }
@@ -5405,14 +5513,16 @@ reality_wizard() {
   kit_session || return 1
   echo ""
   echo "Какой dest (сайт-прикрытие) используем для Reality?"
-  echo "1) Свой сайт на этом сервере (${XKIT_HOST:-домен} + наш сертификат) — лучший камуфляж"
-  echo "2) Скан подсети — найти подходящие сайты рядом"
-  echo "3) Готовый список проверенных сайтов"
-  echo "4) Ввести адрес сайта и SNI вручную"
-  read -r -p "Выбор [1-4]: " c
+  echo "1) 1.1.1.1 / cloudflare-dns.com (по умолчанию)"
+  echo "2) Свой сайт на этом сервере (${XKIT_HOST:-домен} + наш сертификат) — камуфляж за nginx"
+  echo "3) Случайный из пула популярных сайтов (разнообразие маскировок)"
+  echo "4) Скан подсети — найти подходящие сайты рядом (тихий скан)"
+  echo "5) Готовый список проверенных сайтов"
+  echo "6) Ввести адрес сайта и SNI вручную"
+  read -r -p "Выбор [1]: " c; c="${c:-1}"
   local dest="" sni=""
   case "$c" in
-    1)
+    2)
       # v7.2.5: IP-режим с валидным сертификатом (LE shortlived IP) тоже годится.
       # nginx на 127.0.0.1:8444 отдаёт наш серт, посторонние после Reality-фолбэка
       # видят сайт-прикрытие, а SNI=XKIT_HOST (IP) не проверяется по CN — раньше
@@ -5428,15 +5538,16 @@ reality_wizard() {
       save_xkit_env
       regen_conf_and_apply || return 1
       dest="127.0.0.1:8444"; sni="$XKIT_HOST" ;;
-    2) reality_scan_pick || return 1; dest="$RDEST"; sni="$RSNI" ;;
-    3) reality_known_pick || return 1; dest="$RDEST"; sni="$RSNI" ;;
-    4)
+    3) reality_pool_random; dest="$RDEST"; sni="$RSNI" ;;
+    4) reality_scan_pick || return 1; dest="$RDEST"; sni="$RSNI" ;;
+    5) reality_known_pick || return 1; dest="$RDEST"; sni="$RSNI" ;;
+    6)
       local dh dp
       dh="$(read_host "dest (IP или домен) -> ")"
       read -r -p "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
       sni="$(read_host "SNI (домен из сертификата dest) -> ")"
       dest="${dh}:${dp}" ;;
-    *) err "Нет такого пункта"; return 1 ;;
+    *) dest="1.1.1.1:443"; sni="cloudflare-dns.com" ;;
   esac
   [ -n "$dest" ] && [ -n "$sni" ] || { err "dest/SNI не определены"; return 1; }
   reality_create_inbound "$dest" "$sni"
@@ -6046,7 +6157,7 @@ node_reality_scan_pick() { # $1 rec ноды
     tlist="$(reality_expand_targets "$t")"
     case "$tlist" in ERR:*) err "$tlist"; return 1 ;; esac
   fi
-  log "Сканирую с ноды: TCP :443 (50 потоков) -> TLS-детали..."
+  log "Сканирую с ноды: TCP :443 (тихий скан, 3 потока) -> TLS-детали..."
   # V-01 (аудит №2): список целей уходит на ноду base64'ом (вне shell-строки);
   # токены уже валидированы в reality_expand_targets — двойной барьер
   local tb64; tb64="$(printf '%s' "$tlist" | base64 -w0)"
@@ -6062,7 +6173,7 @@ if [ -n "${TARGETS:-}" ]; then printf '%s\n' "$TARGETS" | grep -v '^$' > "$TMP";
   [ -n "$P" ] || { echo "ERR: не удалось определить IP ноды"; exit 1; }
   i=1; while [ "$i" -le 254 ]; do echo "$P.$i"; i=$((i+1)); done > "$TMP"
 fi
-xargs -a "$TMP" -P 50 -n 1 probe >> "$OPEN" 2>/dev/null || true
+xargs -a "$TMP" -P 3 -n 1 probe >> "$OPEN" 2>/dev/null || true
 while IFS= read -r ip; do
   [ -z "$ip" ] && continue
   brief="$(echo | timeout 6 openssl s_client -brief -connect "${ip}:443" -servername "${ip}" 2>&1)"
@@ -6507,49 +6618,40 @@ EOS
   fi
   ok "Порт туннеля на ноде: ${tport} (выбран автоматически, случайный — туда ходит только мастер)"
 
-  # (7.4.0, минимум вопросов): Dest (прикрытие) Reality на ноде больше не
-  # спрашиваем — это внутренняя кухня каскада, а не пользовательский выбор.
-  # Автоматически: как на мастере (единая маскировка кластера), иначе 1.1.1.1.
-  # Полное ручное меню остаётся для особых случаев: XKIT_NODE_DEST_MENU=1.
+  # v8.1.6: единое меню выбора dest (дефолт 1.1.1.1, пул/список/тихий скан/как на
+  # мастере/вручную). Раньше при неинтерактивной установке молча брался 1.1.1.1,
+  # а полное меню было только под XKIT_NODE_DEST_MENU=1. Теперь меню по умолчанию.
   local mdest msni
   mdest="$(jq -r '[.[]|select(.streamSettings|fromjson?|.security? == "reality")][0].streamSettings|fromjson?|.realitySettings.dest // ""' <<<"${INBOUNDS:-[]}" 2>/dev/null)"
   msni="$(jq -r '[.[]|select(.streamSettings|fromjson?|.security? == "reality")][0].streamSettings|fromjson?|.realitySettings.serverNames[0] // ""' <<<"${INBOUNDS:-[]}" 2>/dev/null)"
-  local ndest="" nsni="" RDEST="" RSNI="" dc=""
-  if [ "${XKIT_NODE_DEST_MENU:-0}" = "1" ]; then
-    echo "Dest (прикрытие) для Reality на ноде:"
-    echo "  1) 1.1.1.1 (быстро и надёжно)   2) известный список   3) ПОИСК С ДОПОЛНИТЕЛЬНОГО СЕРВЕРА"
-    if [ -n "$mdest" ] && [ -n "$msni" ]; then
-      echo "  4) как на мастере (${mdest}, SNI ${msni})"
-    else
-      echo "  4) как на мастере (на мастере Reality-инбаунд не найден — недоступно)"
-    fi
-    echo "  5) вручную"
-    read -r -p "Выбор [1]: " dc; dc="${dc:-1}"
-    case "$dc" in
-      2) reality_known_pick || return 1; ndest="$RDEST"; nsni="$RSNI" ;;
-      3) node_reality_scan_pick "$rec" || return 1; ndest="$RDEST"; nsni="$RSNI" ;;
-      4) [ -n "$mdest" ] && [ -n "$msni" ] || { err "На мастере нет Reality — выберите другой вариант"; return 1; }
-         ndest="$mdest"; nsni="$msni" ;;
-      5)
-        local dh dp
-        dh="$(read_host "dest -> ")"
-        read -r -p "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
-        nsni="$(read_host "SNI -> ")"
-        ndest="${dh}:${dp}" ;;
-      *) ndest="1.1.1.1:443"; nsni="cloudflare-dns.com" ;;
-    esac
-  elif [ -n "${XKIT_NODE_DEST:-}" ]; then
+  local ndest="" nsni="" RDEST="" RSNI=""
+  if [ -n "${XKIT_NODE_DEST:-}" ]; then
     # точечный override окружением: XKIT_NODE_DEST=host:port [XKIT_NODE_SNI=...]
     ndest="$XKIT_NODE_DEST"; nsni="${XKIT_NODE_SNI:-}"
     [[ "$ndest" == *:* ]] || ndest="${ndest}:443"
     [ -n "$nsni" ] || nsni="${ndest%%:*}"
     ok "Dest задан окружением: ${ndest} (SNI ${nsni})"
-  elif [ -n "$mdest" ] && [ -n "$msni" ]; then
-    ndest="$mdest"; nsni="$msni"
-    ok "Dest Reality на ноде: как на мастере — ${ndest} (SNI ${nsni}) — единая маскировка кластера"
+  elif [ "${XKIT_NODE_DEST_AUTO:-0}" = "1" ]; then
+    # неинтерактивный режим (CI/cloud-init): как на мастере, иначе 1.1.1.1
+    if [ -n "$mdest" ] && [ -n "$msni" ]; then
+      ndest="$mdest"; nsni="$msni"
+      ok "Dest Reality на ноде: как на мастере — ${ndest} (SNI ${nsni})"
+    else
+      ndest="1.1.1.1:443"; nsni="cloudflare-dns.com"
+      ok "Dest Reality на ноде: ${ndest} (SNI ${nsni}) — по умолчанию"
+    fi
   else
-    ndest="1.1.1.1:443"; nsni="cloudflare-dns.com"
-    ok "Dest Reality на ноде: ${ndest} (SNI ${nsni}) — на мастере Reality-прикрытие не найдено, беру надёжный дефолт"
+    # v8.1.7: дефолт по типу серта ноды (домен → свой сайт, IP → чужой сайт).
+    local nhkind; nhkind="$(host_kind "$nhost")"
+    reality_dest_menu node "$mdest" "$msni" "$rec" "$nhkind" || return 1
+    ndest="$RDEST"; nsni="$RSNI"
+    # свой сайт: SNI = домен ноды (серт ноды), dest = внутренний nginx 8444
+    if [ "$nsni" = "__OWN_DOMAIN__" ]; then
+      nsni="$nhost"; ndest="127.0.0.1:8444"
+      ok "Dest Reality на ноде: свой сайт (${ndest}, SNI ${nsni}) — маскировка под домен ноды"
+    else
+      ok "Dest Reality на ноде: ${ndest} (SNI ${nsni})"
+    fi
   fi
 
   log "Генерирую ключи Reality для ноды..."
@@ -7385,13 +7487,19 @@ EOS
   local npin; npin="$(cert_pin "$nhost" 443)"
   [ -n "$npin" ] || { err "Не снял пин nginx-серта ноды на 443 — маскировка не подтверждена"; return 1; }
   rec="$(jq -c --arg p "$npin" '.panel.port = 443 | .panel.tls = true | .panel.pincert = $p | .panel.hidden = true' <<<"$rec")"
-  # v7.7.3: SNI Reality-туннеля обязан совпадать с SAN серта ноды (dest 8444 отдаёт
-  # именно его). node_add наследует мастер-SNI (напр. mengin.ru), а серт ноды —
-  # api.mengin.ru: Go-клиент отвергал handshake, туннель рвался. Выравниваем
-  # serverNames туннельного inbound ноды и .tunnel.sni реестра с хостом ноды.
-  local tsni tport tck tlist tib tid tstream tbody
-  tsni="$nhost"; tport="$(jq -r '.tunnel.port // empty' <<<"$rec")"
-  if [ -n "$tport" ]; then
+  # v8.1.7: SNI туннеля должен совпадать с сертификатом DEST, а не всегда с хостом
+  # ноды. Раньше (v7.7.3) SNI принудительно = хост ноды — это верно ТОЛЬКО когда
+  # dest = свой сайт (127.0.0.1:8444, серт ноды). Для чужого dest (1.1.1.1/пул)
+  # SNI = домен чужого сайта, иначе handshake рвётся (dest отдаёт чужой серт).
+  local tdest tsni tport tck tlist tib tid tstream tbody
+  tdest="$(jq -r '.tunnel.dest // ""' <<<"$rec")"
+  tport="$(jq -r '.tunnel.port // empty' <<<"$rec")"
+  if [ "$tdest" = "127.0.0.1:8444" ] || [ "$tdest" = "127.0.0.1:8444/" ]; then
+    tsni="$nhost"   # свой сайт: серт ноды = его домен
+  else
+    tsni="$(jq -r '.tunnel.sni // ""' <<<"$rec")"   # чужой dest: SNI из меню (домен сайта)
+  fi
+  if [ -n "$tport" ] && [ -n "$tsni" ]; then
     tck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)"
     if node_login "$rec" "$tck" 2>/dev/null; then
       tlist="$(node_api "$rec" panel/api/inbounds/list GET "" "$tck")"
@@ -8811,6 +8919,19 @@ xkit_extras_install() { # протоколы + TUI текущей архитек
   else
     xkit_component_fetch "$name" "$XKIT_TUI_FILE" || rc=1
   fi
+  # v8.2.0: camo-движок sitegen (два python-файла: движок + обёртка кластера).
+  # Кладём в lib/xkit; camo_sitegen_path найдёт их там. Без них маскировка не
+  # сгенерится — ставим обязательно (fetch с SHA-проверкой).
+  local cf
+  for cf in sitegen.py camo_sitegen.py; do
+    if [ -r "$src/$cf" ] && xkit_dir_trusted "$src" "$src/$cf"; then
+      install -m 644 "$src/$cf" "$XKIT_MENU_DIR/$cf" || rc=1
+    elif [ -r "$src/tools/$cf" ] && xkit_dir_trusted "$src/tools" "$src/tools/$cf"; then
+      install -m 644 "$src/tools/$cf" "$XKIT_MENU_DIR/$cf" || rc=1
+    else
+      xkit_component_fetch "$cf" "$XKIT_MENU_DIR/$cf" || rc=1
+    fi
+  done
   return "$rc"
 }
 
@@ -9831,12 +9952,25 @@ proto_panel_camo_content() {
   local d="${CAMO_DIR:-/var/www/camo}" html css svg
   [ -r "$d/index.html" ] || { camo_site_install 2>/dev/null || true; }
   [ -r "$d/index.html" ] || return 1
-  # Совместимость с ручным одностраничным camo: если assets удалены, отдаём HTML.
-  if [ ! -r "$d/assets/style.css" ] || [ ! -r "$d/assets/mark.svg" ]; then cat "$d/index.html"; return 0; fi
-  html="$(cat "$d/index.html")"; css="$(cat "$d/assets/style.css")"; svg="$(cat "$d/assets/mark.svg")"
+  # v8.2.0: sitegen — многофайловый SaaS. Для HY2 masquerade (одна HTML-строка)
+  # инлайним CSS и favicon SVG, убираем ссылки на assets/внешние страницы.
+  if [ ! -r "$d/assets/style.css" ]; then cat "$d/index.html"; return 0; fi
+  html="$(cat "$d/index.html")"; css="$(cat "$d/assets/style.css")"
+  svg=""; [ -r "$d/favicon.svg" ] && svg="$(cat "$d/favicon.svg")"
+  # инлайн CSS вместо link stylesheet
   html="${html/<link rel=\"stylesheet\" href=\"\/assets\/style.css\">/<style>${css}<\/style>}"
-  html="${html/<link rel=\"icon\" href=\"\/assets\/mark.svg\">/}"
-  html="${html/<img class=\"mark\" src=\"\/assets\/mark.svg\" alt=\"\">/${svg}}"
+  # favicon: link → inline data URI (или убираем)
+  if [ -n "$svg" ]; then
+    local b64; b64="$(printf '%s' "$svg" | base64 -w0)"
+    html="${html/<link rel=\"icon\" type=\"image\/svg+xml\" href=\"\/favicon.svg\">/<link rel=\"icon\" href=\"data:image\/svg+xml;base64,${b64}\">}"
+  else
+    html="${html/<link rel=\"icon\" type=\"image\/svg+xml\" href=\"\/favicon.svg\">/}"
+  fi
+  # ссылки на другие страницы → # (одностраничный masquerade)
+  html="${html//href=\"\/about\/\"/href=\"#\"}"
+  html="${html//href=\"\/faq\/\"/href=\"#\"}"
+  html="${html//href=\"\/pricing\/\"/href=\"#\"}"
+  html="${html//href=\"\/contact\/\"/href=\"#\"}"
   html="${html//href=\"\/about.html\"/href=\"#\"}"
   html="${html//href=\"\/contact.html\"/href=\"#\"}"
   printf '%s' "$html"
@@ -10676,41 +10810,33 @@ camo_seed_save() {
   mkdir -p "$XKIT_DIR"; chmod 700 "$XKIT_DIR"
   ( umask 077; local t; t="$(mktemp "${XKIT_CAMO_STATE}.new.XXXXXX")" || exit 1; printf 'XKIT_CAMO_SEED=%q\n' "$1" >"$t"; mv "$t" "$XKIT_CAMO_STATE" )
 }
-camo_generate_tree() { # seed destination
-  python3 - "$1" "$2" <<'PY'
-import sys,hashlib,pathlib
-seed,dest=sys.argv[1:]
-p=pathlib.Path(dest); (p/'assets').mkdir(parents=True,exist_ok=True)
-def pick(seq,n):
-    h=hashlib.sha256((seed+':'+n).encode()).digest()
-    return seq[int.from_bytes(h[:8],'big')%len(seq)]
-themes=[
- ('atelier','Morrow & Field','Small editions, careful printing and paper goods made in our workshop.'),
- ('studio','Stillroom Studio','Independent product and portrait photography, arranged by appointment.'),
- ('workshop','Northbank Cycles','Bicycle maintenance, wheel building and practical repairs.'),
- ('bakery','Daybreak Oven','Slow-fermented bread and a short seasonal menu, baked each morning.'),
- ('florist','Fern & Hollow','Seasonal stems, quiet arrangements and local weekend delivery.'),
- ('cafe','Juniper Counter','Coffee, simple lunches and a few seats by the window.'),
-]
-layouts=['split','stack','journal']
-palettes=[('#f4f1ea','#26312c','#596f62'),('#f6f7f9','#202830','#526f91'),('#faf5ef','#382b27','#9a6245'),('#f2f5f7','#25333b','#427783')]
-kind,title,tagline=pick(themes,'theme'); layout=pick(layouts,'layout'); bg,fg,accent=pick(palettes,'palette')
-font=pick(['system-ui,sans-serif','Georgia,serif','Arial,sans-serif'],'font')
-radius=pick(['0','6px','14px'],'radius')
-owner=pick(['A. Mercer','R. Bennett','L. Hart','M. Ellis','S. Nolan'],'owner')
-addr=pick(['18 Mill Lane','42 Station Road','7 Cedar Court','26 Market Square'],'address')
-nav='<nav><a href="/">Home</a><a href="/about.html">About</a><a href="/contact.html">Contact</a></nav>'
-css=f'''body{{margin:0;background:{bg};color:{fg};font-family:{font};line-height:1.65}}main{{max-width:880px;margin:auto;padding:9vh 7vw}}nav{{display:flex;gap:22px;margin-bottom:70px}}a{{color:{fg};text-decoration:none}}a:hover{{color:{accent}}}.mark{{width:42px;height:42px;border:1px solid {accent};border-radius:{radius};margin-bottom:25px}}h1{{font-size:clamp(30px,5vw,54px);line-height:1.1;font-weight:500}}.lead{{max-width:560px;color:{accent}}}.meta{{margin-top:55px;padding-top:20px;border-top:1px solid {accent};font-size:14px}}body.split main{{display:grid;grid-template-columns:2fr 1fr;gap:60px}}body.split nav{{grid-column:1/-1}}body.journal h1{{max-width:620px}}@media(max-width:650px){{body.split main{{display:block}}nav{{margin-bottom:40px}}}}'''
-(p/'assets/style.css').write_text(css)
-(p/'assets/mark.svg').write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="42" height="42"><rect x="1" y="1" width="40" height="40" rx="4" fill="none" stroke="{accent}"/><path d="M11 29V13l10 10 10-10v16" fill="none" stroke="{accent}"/></svg>')
-def page(heading,text,extra=''):
-    return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{heading} — {title}</title><link rel="stylesheet" href="/assets/style.css"><link rel="icon" href="/assets/mark.svg"></head><body class="{layout}"><main>{nav}<section><img class="mark" src="/assets/mark.svg" alt=""><h1>{heading}</h1><p class="lead">{text}</p>{extra}</section><aside class="meta">{owner}<br>{addr}<br>Mon–Fri 09:00–17:00</aside></main></body></html>'''
-(p/'index.html').write_text(page(title,tagline))
-(p/'about.html').write_text(page('A small, independent practice',f'{title} is a fictional local {kind}. We keep our work deliberate and our opening hours simple.'))
-(p/'contact.html').write_text(page('Visit or write',f'Appointments can be arranged in person at {addr}. General correspondence is handled during opening hours.'))
-(p/'privacy.html').write_text(page('Privacy','This static website does not use analytics, external fonts, tracking pixels or data-collection forms.'))
-(p/'404.html').write_text(page('Page not found','The requested page is not available. Use the navigation above to continue.'))
-PY
+camo_generate_tree() { # seed destination [domain] [node-name]
+  # v8.2.0: движок маскировки — sitegen (правдоподобный SaaS, тысячи уникальных
+  # комбинаций, антифингерпринт CSS). Один master_seed = один бренд/проект на кластер;
+  # нода (--node) получает лёгкую вариацию контента, тот же бренд. Реальный домен
+  # (--domain) подменяет бренд-домен; для IP домен не задан → бренд-домен sitegen.
+  local seed="$1" dest="$2" domain="${3:-}" node="${4:-}"
+  local wrapper
+  wrapper="$(camo_sitegen_path)" || { err "camo: движок sitegen не найден (компонент camo_sitegen.py)"; return 1; }
+  local args=(--seed "$seed" --out "$dest" -q)
+  [ -n "$domain" ] && args+=(--domain "$domain")
+  [ -n "$node" ] && args+=(--node "$node")
+  python3 "$wrapper" "${args[@]}"
+}
+
+# путь к обёртке camo_sitegen.py: рядом с xkit.sh, в lib/xkit, или в devtree tools/
+camo_sitegen_path() {
+  local self cand
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for cand in \
+    "${XKIT_CAMO_SITEGEN:-}" \
+    "$self/camo_sitegen.py" \
+    "$self/tools/camo_sitegen.py" \
+    "${XKIT_MENU_DIR}/camo_sitegen.py" \
+    "/usr/local/lib/xkit/camo_sitegen.py"; do
+    [ -n "$cand" ] && [ -f "$cand" ] && { printf '%s' "$cand"; return 0; }
+  done
+  return 1
 }
 camo_site_install() { # [hex-seed], без аргумента использует сохранённый
   require_root
@@ -10722,10 +10848,15 @@ camo_site_install() { # [hex-seed], без аргумента используе
     ok "Сайт-прикрытие сохранён без изменений (seed зафиксирован)"; return 0
   fi
   stage="$(mktemp -d "$(dirname "$CAMO_DIR")/.camo.new.XXXXXX")" || return 1
-  camo_generate_tree "$seed" "$stage" || { rm -rf "$stage"; return 1; }
-  # Внешние ресурсы и формы запрещены; генератор не должен молча их пропустить.
-  if grep -R -E 'https?://|src="//|<form|@import' "$stage" --include='*.html' --include='*.css' | grep -v 'http://www.w3.org/2000/svg'; then
-    rm -rf "$stage"; err "Camo содержит внешний ресурс или форму"; return 1
+  # v8.2.0: реальный домен мастера подменяет бренд-домен sitegen; для IP — не задан.
+  local cdom=""
+  [ "$(host_kind "${XKIT_HOST:-}")" = "domain" ] && cdom="$XKIT_HOST"
+  camo_generate_tree "$seed" "$stage" "$cdom" || { rm -rf "$stage"; return 1; }
+  # v8.2.0: sitegen — правдоподобный SaaS с demo-формами (login/signup, без сети)
+  # и canonical/sitemap ссылками на свой домен. Запрещены только ВНЕШНИЕ загружаемые
+  # ресурсы (script/link/img с чужого хоста, @import, protocol-relative src).
+  if grep -R -E '<script[^>]+src="https?://|<link[^>]+rel="stylesheet"[^>]+href="https?://|<img[^>]+src="https?://|src="//|@import' "$stage" --include='*.html' --include='*.css' | grep -v 'http://www.w3.org/2000/svg'; then
+    rm -rf "$stage"; err "Camo содержит внешний загружаемый ресурс"; return 1
   fi
   camo_seed_save "$seed" || { rm -rf "$stage"; return 1; }
   oldbak="$(mktemp -d "$(dirname "$CAMO_DIR")/.camo.old.XXXXXX")" || { rm -rf "$stage"; return 1; }
@@ -12935,8 +13066,9 @@ node_camo_seed_for() { # $1 имя ноды -> hex64 (детерминирова
   if [ -z "$ms" ]; then
     ms="$(rand_hex 32)"
     camo_seed_save "$ms" || { err "Не сохраняю seed мастера"; return 1; }
-    # v7.7.4: это штатная первая генерация, не проблема — INFO вместо WARN
-    log "Seed мастера создан (детерминированный дизайн camo для всех нод)"
+    # v7.7.4: это штатная первая генерация, не проблема — INFO вместо WARN.
+    # v8.2.0: log -> stderr, чтобы не загрязнять stdout (функция возвращает hex64).
+    log "Seed мастера создан (детерминированный дизайн camo для всех нод)" >&2
   fi
   printf '%s' "$(printf 'xkit-node-camo:v1:%s:%s' "$ms" "$1" | sha256sum | awk '{print $1}')"
 }
@@ -12946,59 +13078,25 @@ node_camo_portal() { printf 'https://%s/' "${XKIT_HOST:-}"; }
 # Пост-обработка дерева camo_generate_tree: referrer-политика, Portal, фейк-логин,
 # dev/api-страницы для vhost'ов. Всё в том же стиле (css/mark от seed).
 node_camo_postprocess() { # $1 seed, $2 portal-url, $3 dest
+  # v8.2.0: sitegen уже даёт полноценный SaaS (login/signup формы, FAQ, статус).
+  # Postprocess минимальный: referrer-политика + ссылка Portal на мастер в nav.
+  # Старые фейк-страницы (login.html/dev.html/api.html) больше не нужны — sitegen
+  # генерит login/index.html, signup/index.html, status/index.html сам.
   python3 - "$1" "$2" "$3" <<'PY'
-import hashlib,pathlib,sys
+import pathlib,sys
 seed,portal,dest=sys.argv[1:]
 p=pathlib.Path(dest)
-css=(p/'assets/style.css').read_text()
-def digest(s):
-    return hashlib.sha256((seed+':'+s).encode()).hexdigest()
-brand={'font':None}
-import re
-m=re.search(r'font-family:([^;]+);',css)
-font=m.group(1) if m else 'system-ui,sans-serif'
-m=re.search(r'background:([^;]+);',css)
-bg=m.group(1) if m else '#f4f1ea'
-m=re.search(r'\.lead\{max-width:560px;color:([^}]+)\}',css)
-accent=m.group(1) if m else '#555'
-def page(title,heading,text,form=False):
-    form_html=''
-    if form:
-        form_html=('<section><form method="post" action="/login" class="login">'
-                   '<h1>Employee sign-in</h1>'
-                   '<p><label>User<br><input type="text" name="user" autocomplete="off"></label></p>'
-                   '<p><label>Password<br><input type="password" name="pass"></label></p>'
-                   '<p><button type="submit">Sign in</button></p>'
-                   '</form></section>')
-    return (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
-            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-            f'<meta name="referrer" content="no-referrer">'
-            f'<title>{title}</title><link rel="stylesheet" href="/assets/style.css">'
-            f'<link rel="icon" href="/assets/mark.svg"></head><body class="stack"><main>'
-            f'<nav><a href="/">Home</a><a href="/about.html">About</a>'
-            f'<a href="/contact.html">Contact</a><a href="{portal}" rel="noopener">Portal</a></nav>'
-            f'{form_html}<section><img class="mark" src="/assets/mark.svg" alt="">'
-            f'<h1>{heading}</h1><p class="lead">{text}</p></section>'
-            f'<aside class="meta">Internal use only<br>Mon-Fri 09:00-17:00</aside>'
-            f'</main></body></html>')
-(p/'login.html').write_text(page('Sign in','', '', form=True))
-(p/'dev.html').write_text(page('Dev portal','Internal tools',
-    'Build and deployment dashboards are available to staff from the office network.'))
-api_h=int(digest('api')[:8],16)%4+2
-(p/'api.html').write_text(page('API status','All systems operational',
-    f'Uptime {99+int(digest("u")[:2],16)%98//100}.{int(digest("n")[:4],16)%100}% over the last 30 days. '
-    f'Region eu-central, {api_h} services monitored.'))
-for f in p.glob('*.html'):
-    t=f.read_text()
+for f in p.rglob('*.html'):
+    t=f.read_text(encoding='utf-8')
     if '<meta name="referrer"' not in t:
         t=t.replace('<meta charset="utf-8">','<meta charset="utf-8"><meta name="referrer" content="no-referrer">',1)
-    if 'href="'+portal+'" rel="noopener">Portal</a>' not in t:
-        t=t.replace('</nav>',f'<a href="{portal}" rel="noopener">Portal</a></nav>',1)
-    f.write_text(t)
-css+=('form.login{max-width:360px;margin:40px 0;padding:28px;border:1px solid '+accent+';border-radius:12px}'
-      'form.login input{width:100%;box-sizing:border-box;margin-top:4px;padding:9px;border:1px solid '+accent+';background:'+bg+';color:inherit}'
-      'form.login button{margin-top:14px;padding:9px 18px;background:'+accent+';color:'+bg+';border:0;cursor:pointer;font-family:'+font+'}')
-(p/'assets/style.css').write_text(css)
+    # ссылка на мастер-портал в навигации (sitegen: header, не nav)
+    if portal and 'href="'+portal+'"' not in t:
+        if '</nav>' in t:
+            t=t.replace('</nav>','<a href="'+portal+'" rel="noopener">Portal</a></nav>',1)
+        elif '</header>' in t:
+            t=t.replace('</header>','<a href="'+portal+'" rel="noopener">Portal</a></header>',1)
+    f.write_text(t,encoding='utf-8')
 PY
 }
 
@@ -13062,13 +13160,15 @@ EOF
 
 # Проверка: единственная внешняя ссылка — Portal на мастера (+ xmlns w3.org у SVG).
 node_camo_check_tree() { # $1 dest, $2 portal -> 0 = чисто
+  # v8.2.0: sitegen — правдоподобный SaaS (demo-формы, canonical/sitemap на свой
+  # домен). Запрещены только внешние ЗАГРУЖАЕМЫЕ ресурсы (script/link/img с чужого
+  # хоста). Canonical/sitemap/текстовые ссылки на свой домен — легитимны.
   local dest="$1" portal="$2" bad
-  bad="$(grep -R -E 'https?://' "$dest" --include='*.html' --include='*.css' 2>/dev/null \
-        | grep -v 'http://www.w3.org/2000/svg' \
-        | grep -v -- "${portal}" || true)"
-  [ -z "$bad" ] || { err "Camo содержит внешние ресурсы помимо Portal: $bad"; return 1; }
+  bad="$(grep -R -E '<script[^>]+src="https?://|<link[^>]+rel="stylesheet"[^>]+href="https?://|<img[^>]+src="https?://|src="//|@import' "$dest" --include='*.html' --include='*.css' 2>/dev/null \
+        | grep -v 'http://www.w3.org/2000/svg' || true)"
+  [ -z "$bad" ] || { err "Camo содержит внешний загружаемый ресурс: $bad"; return 1; }
   grep -q 'name="referrer" content="no-referrer"' "$dest/index.html" || { err "Нет referrer-политики"; return 1; }
-  [ -f "$dest/login.html" ] || { err "Нет login.html"; return 1; }
+  [ -f "$dest/login/index.html" ] || [ -f "$dest/login.html" ] || { err "Нет login-страницы"; return 1; }
   return 0
 }
 
@@ -13090,8 +13190,15 @@ node_camo_deploy_one() { # $1 имя, [$2 домен|""], [$3 force]
     fi
   fi
   stage="$(mktemp -d "${TMPDIR:-/tmp}/.xkit-camo.XXXXXX")" || return 1
-  camo_generate_tree "$seed" "$stage" || { rm -rf "$stage"; return 1; }
-  node_camo_postprocess "$seed" "$portal" "$stage" || { rm -rf "$stage"; return 1; }
+  # v8.2.0: единый бренд кластера — master_seed (не производный), нода получает
+  # лёгкую вариацию контента (--node). Реальный хост ноды = поддомен проекта.
+  local mseed ndom
+  mseed="$(camo_seed_load || true)"
+  if [ -z "$mseed" ]; then mseed="$(rand_hex 32)"; camo_seed_save "$mseed" || { rm -rf "$stage"; return 1; }; fi
+  ndom="$(jq -r '.host' <<<"$rec")"
+  [ "$(host_kind "$ndom")" = "domain" ] || ndom=""   # IP → бренд-домен sitegen
+  camo_generate_tree "$mseed" "$stage" "$ndom" "$nname" || { rm -rf "$stage"; return 1; }
+  node_camo_postprocess "$mseed" "$portal" "$stage" || { rm -rf "$stage"; return 1; }
   node_camo_check_tree "$stage" "$portal" || { rm -rf "$stage"; return 1; }
   local payload htar
   payload="$(tar -C "$stage" -czf - . | base64 -w0)"
