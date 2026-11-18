@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.2.0"
+XKIT_VERSION="8.2.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -1671,6 +1671,20 @@ save_xkit_env() {
 }
 
 load_xkit_env() {
+  # v8.2.1: при ОТСУТСТВИИ env-файла НЕ затираем состояние в памяти — во время
+  # установки xkit.env ещё не записан, а load вызывают xkit_info/version_probes;
+  # сброс обнулял XKIT_HOST/CRT/KEY/SUB_TOKEN → шаг nginx падал «XKIT_HOST не
+  # задан», ссылки подписок уходили с пустым хостом (живой баг 8.2.0).
+  if [ ! -r "$XKIT_ENV" ]; then
+    # дефолты только для НЕзаданных переменных (:= не трогает уже установленные)
+    : "${XKIT_HOST:=}" "${XKIT_CRT:=}" "${XKIT_KEY:=}" "${XKIT_CERT_MODE:=}" "${XKIT_SUB_TOKEN:=}"
+    : "${XKIT_UFW:=0}" "${XKIT_PANEL_SUB_PORT:=}" "${XKIT_PANEL_SUB_PATH:=}" "${XKIT_REALITY_INTERNAL:=0}"
+    : "${XKIT_BAL_STRATEGY:=leastLoad}" "${XKIT_POOL_INBOUND:=}" "${XKIT_POOL_TAG:=}"
+    : "${XKIT_TG_TOKEN:=}" "${XKIT_TG_CHAT:=}" "${XKIT_TG_PROXY:=}" "${XKIT_TG_ADMINS:=}" "${XKIT_XUI_API_TOKEN:=}"
+    : "${BACKUP_ENABLED:=1}" "${BACKUP_INTERVAL_H:=24}" "${BACKUP_KEEP_DAYS:=14}" "${BACKUP_KEEP_MIN:=3}"
+    : "${XKIT_REPO_URL:=}"
+    return 1
+  fi
   # v7.4.4: XKIT_VERSION из xkit.env НЕ должен переопределять версию скрипта —
   # старый env (сохранился от прошлой установки) показывал в сводке «XKIT v7.4.0»
   # под бинарём 7.4.x (живой лог 7.4.2: сводка после «починки поверх»).
@@ -1685,7 +1699,6 @@ load_xkit_env() {
   : "${BACKUP_KEEP_DAYS:=14}"; : "${BACKUP_KEEP_MIN:=3}"
   local _repo="${XKIT_REPO_URL:-}"   # внешнее значение (от install.sh) не теряем
   XKIT_REPO_URL="$_repo"             # №22: фолбэк ДО чтения env — ранний return не теряет
-  [ -r "$XKIT_ENV" ] || return 1
   # shellcheck disable=SC1090
   . "$XKIT_ENV"
   [ -n "${XKIT_REPO_URL:-}" ] || XKIT_REPO_URL="$_repo"
@@ -9330,7 +9343,7 @@ xkit_main_impl() {
         rollback) shift; require_root; versions_rollback "${1:-}" ;;
         *) die "versions: list | status | install <3xui> <xray> | rollback [snapshot]" ;;
       esac ;;
-    camo)
+    camo)    shift
       case "${1:-status}" in
         status) camo_status ;;
         files) camo_files ;;
