@@ -4,7 +4,7 @@
 
 **Ваш VPN-сервер под ключ: панель 3X-UI за nginx, все протоколы, одна подписка на пользователя — и управление из Telegram.**
 
-![Version](https://img.shields.io/badge/version-8.2.3-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-8.2.4-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)

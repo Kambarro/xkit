@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.2.3"
+XKIT_VERSION="8.2.4"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -7364,7 +7364,32 @@ node_hide_panel() { # $1 rec -> stdout: обновлённый rec; rc1 = не �
   nbase="$(normalize_panel_path "$(jq -r '.panel.base // "/"' <<<"$rec")")"
   # v8.2.3: уже скрытая нода (порт в реестре = 443) — повторный hide не должен
   # проксировать 443 на 127.0.0.1:443 (петля) и переустанавливать маскировку.
+  # v8.2.4: НО серт nginx мог устареть (hide прошёл до выпуска LE) — обновляем
+  # ssl_certificate до актуального LE live и переснимаем пин, без переустановки.
   if [ "$(jq -r '.panel.hidden // false' <<<"$rec")" = "true" ]; then
+    local hcrt hkey hpin
+    hcrt="$(node_ssh "$rec" 'for d in /etc/letsencrypt/live/*/; do [ -s "${d}fullchain.pem" ] && [ -s "${d}privkey.pem" ] && { printf "%s" "${d}fullchain.pem"; exit 0; }; done; printf ""' 2>/dev/null)"
+    if [ -n "$hcrt" ]; then
+      hkey="${hcrt%fullchain.pem}privkey.pem"
+      node_ssh "$rec" "env HCRT='${hcrt}' HKEY='${hkey}' bash -s" >&2 <<'EOSS' || warn "Не обновил ssl_certificate nginx — повторите: xkit nodes hide"
+set -eu
+conf=/etc/nginx/sites-available/xkit.conf
+[ -f "$conf" ] || exit 0
+if grep -q "ssl_certificate ${HCRT};" "$conf"; then exit 0; fi
+sed -i "s|ssl_certificate .*|ssl_certificate ${HCRT};|; s|ssl_certificate_key .*|ssl_certificate_key ${HKEY};|" "$conf"
+nginx -t 2>/dev/null && { systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx >/dev/null 2>&1 || true; } || echo 'WARN: nginx -t не прошёл — ssl_certificate не обновлён'
+EOSS
+      # reload асинхронен — ретрай пина, как в основном пути hide
+      local _ht
+      for _ht in 1 2 3 4 5 6 7 8 9 10; do
+        hpin="$(cert_pin "$nhost" 443)"
+        [ -n "$hpin" ] && break
+        sleep 2
+      done
+      if [ -n "$hpin" ]; then
+        rec="$(jq -c --arg p "$hpin" '.panel.pincert = $p' <<<"$rec")"
+      fi
+    fi
     ok "Панель ноды уже спрятана: https://${nhost}:443${nbase}" >&2
     printf '%s' "$rec"; return 0
   fi
@@ -7456,6 +7481,12 @@ if os.path.exists(conf):
     else:
         blk = m.group(0)
         s = s[:m.start()] + blk[:-1] + '\n' + pblock + '\n}' + s[m.end():]
+    # v8.2.4: существующий конфиг мог остаться со СТАРЫМ self-signed сертом
+    # (hide прошёл до выпуска LE, или прошлый hide не обновил ssl_certificate).
+    # Приводим ssl_certificate/key к переданным crt/key (LE live, если есть) —
+    # иначе снаружи 443 отдаёт self-signed, хотя LE уже выпущен (живой баг).
+    s = re.sub(r'ssl_certificate\s+[^;]+;', 'ssl_certificate ' + crt + ';', s)
+    s = re.sub(r'ssl_certificate_key\s+[^;]+;', 'ssl_certificate_key ' + key + ';', s)
     open(conf, 'w').write(s)
 else:
     # конфига нет (чистая нода) — минимальный camo + панель, без default_server
