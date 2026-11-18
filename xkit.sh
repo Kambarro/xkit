@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.2.2"
+XKIT_VERSION="8.2.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -96,8 +96,11 @@ confirm_utf8_repair() { # $1 сырой ввод -> очищенный ввод 
 # нормализация ответа confirm(): пунктуация/гомоглифы/регистр -> «низкая» форма
 confirm_normalize() { # $1 сырой -> stdout
   local ans
+  # 0) v8.2.3: управляющие символы терминала (backspace/DEL/escape-остатки после
+  # набора+удаления кириллицы) — долой, иначе «y\x7f» не распознаётся как «y»
+  ans="$(input_clean "$1")"
   # 1) пунктуация/пробелы/CR-хвосты — долой (tr байтовый, локаль не важна)
-  ans="$(printf '%s' "$1" | tr -d $' \t\r\n\v\f!?.,;:"`\'()+*=#%&@$^~|\\<>[]{}_-')"
+  ans="$(printf '%s' "$ans" | tr -d $' \t\r\n\v\f!?.,;:"`\'()+*=#%&@$^~|\\<>[]{}_-')"
   # 2) гомоглифы/раскладки: fullwidth-двойники IME и кириллическая у (= y)
   ans="${ans//ｙ/y}"; ans="${ans//Ｙ/y}"; ans="${ans//ｎ/n}"; ans="${ans//Ｎ/n}"
   ans="${ans//у/y}"
@@ -441,6 +444,24 @@ xkit_awg_route_remove() { # $1 сохранённый внешний интер�
 }
 
 #=========================== ВАЛИДАЦИЯ ВВОДА ==================================
+# v8.2.3: артефакты терминала (backspace/DEL/escape-остатки после набора и
+# удаления кириллицы, CR-хвосты) вырезаются ДО валидации — иначе «чистый» на
+# вид ввод падает на невидимых байтах. Правило: любой НОВЫЙ интерактивный ввод
+# структурированного значения (имя/хост/порт/путь/email/токен/дата/выбор)
+# обязан прогонять значение через input_clean перед валидацией/сравнением.
+# Свободный текст (заметки) НЕ чистить — там легитимны любые символы.
+input_clean() { # $1 сырой ввод -> очищенный в stdout (cntrl + пробелы по краям)
+  local s
+  # escape-последовательности терминала (стрелки/цвет: ESC [ ... буква) вырезаются ЦЕЛИКОМ,
+  # иначе после удаления ESC остаётся printable-хвост («Y\x1b[C» -> «Y[C»)
+  s="$(printf '%s' "$1" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\x1b[()][0-9A-B]//g')"
+  s="$(printf '%s' "$s" | tr -d '[:cntrl:]')"
+  # пробелы по краям (bash parameter expansion, без внешних процессов)
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
 is_domain() {
   [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]] || return 1
   # TLD должен содержать букву: иначе "999.999.999.999" проходит как домен
@@ -547,6 +568,7 @@ read_host() {
       # (choose_host) сделает fallback на IP. В интерактиве пустая строка = переспрос.
       echo; return 1
     fi
+    v="$(input_clean "$v")"
     if is_domain "$v" || is_ip "$v"; then printf '%s' "$v"; return 0; fi
     err "Некорректно: '$v'. Нужен домен или IP — без http://, путей и портов"
   done
@@ -587,6 +609,7 @@ read_port() {
   local prompt="$1" v
   while true; do
     read -r -p "$prompt" v || die "Ввод прерван"
+    v="$(input_clean "$v")"
     if is_port "$v"; then printf '%s' "$v"; return 0; fi
     err "Порт должен быть числом 1-65535"
   done
@@ -596,6 +619,7 @@ read_path() {
   local prompt="$1" v
   while true; do
     read -r -p "$prompt" v || die "Ввод прерван"
+    v="$(input_clean "$v")"
     if is_path "$v"; then printf '%s' "$v"; return 0; fi
     err "Путь: начинается с /, буквы/цифры/._~/- (без пробелов)"
   done
@@ -6374,7 +6398,8 @@ node_add() {
   # (симметрия с v3.2.1, ревью v4.7.0: на порту/юзере EOF давал дефолты
   # 22/root и попытку коннекта к ноде)
   read -r -p "Имя ноды (латиница, например de1): " nname || { echo; return 1; }
-  [[ "$nname" =~ ^[a-zA-Z0-9_-]{1,20}$ ]] || { err "Имя: латиница/цифры/-/_ до 20 символов"; return 1; }
+  nname="$(input_clean "$nname")"
+  [[ "$nname" =~ ^[a-zA-Z0-9_-]{1,20}$ ]] || { err "Имя: латиница/цифры/-/_ до 20 символов (получено: $(printf '%q' "$nname"))"; return 1; }
   if jq -e --arg n "$nname" 'any(.[]; .name==$n)' <(nodes_load) >/dev/null 2>&1; then
     confirm "Нода '$nname' уже есть. Переподключить без переустановки? [Y/n] " y && node_reconnect_existing "$nname"
     return $?
@@ -6386,9 +6411,9 @@ node_add() {
     return $?
   fi
   read -r -p "SSH порт [22]: " nport || { echo; return 1; }
-  nport="${nport:-22}"; is_port "$nport" || { err "Порт"; return 1; }
+  nport="$(input_clean "$nport")"; nport="${nport:-22}"; is_port "$nport" || { err "Порт"; return 1; }
   read -r -p "SSH пользователь [root]: " nuser || { echo; return 1; }
-  nuser="${nuser:-root}"
+  nuser="$(input_clean "$nuser")"; nuser="${nuser:-root}"
   # аудит №4: без валидации «a"b» уезжало в ssh/jq-реестр; допускаем то, что
   # легитимно для useradd: латиница/цифры/._-, не с цифры, до 32 символов
   [[ "$nuser" =~ ^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$ ]] || { err "SSH-пользователь: только латиница/цифры/._- (до 32 симв., не с цифры)"; return 1; }
@@ -7135,6 +7160,7 @@ nodes_del() {
   nodes_list
   local n rec
   read -r -p "Имя ноды для удаления (Enter — отмена): " n
+  n="$(input_clean "$n")"
   [ -z "$n" ] && return 0
   rec="$(nodes_load | jq -c --arg n "$n" '[.[]|select(.name==$n)][0] // empty')"
   [ -n "$rec" ] || { err "Нода '$n' не найдена"; return 1; }
@@ -7336,6 +7362,12 @@ node_hide_panel() { # $1 rec -> stdout: обновлённый rec; rc1 = не �
   nhost="$(jq -r '.host' <<<"$rec")"
   nport="$(jq -r '.panel.port' <<<"$rec")"
   nbase="$(normalize_panel_path "$(jq -r '.panel.base // "/"' <<<"$rec")")"
+  # v8.2.3: уже скрытая нода (порт в реестре = 443) — повторный hide не должен
+  # проксировать 443 на 127.0.0.1:443 (петля) и переустанавливать маскировку.
+  if [ "$(jq -r '.panel.hidden // false' <<<"$rec")" = "true" ]; then
+    ok "Панель ноды уже спрятана: https://${nhost}:443${nbase}" >&2
+    printf '%s' "$rec"; return 0
+  fi
   is_port "$nport" || { err "node_hide_panel: некорректный порт панели"; return 1; }
   is_nginx_path "$nbase" || { err "node_hide_panel: небезопасный путь панели '$nbase'"; return 1; }
   # v7.7.0: панель может быть на HTTP (самоподпись не применилась) — тогда
@@ -7501,7 +7533,15 @@ NGXEOF
 fi
 echo OK-HIDE >&2
 EOS
-  local npin; npin="$(cert_pin "$nhost" 443)"
+  # v8.2.3: reload nginx асинхронен — сразу после OK-HIDE порт 443 может ещё
+  # отдавать старый конфиг/не отвечать (живой баг: «Не снял пин nginx-серта на
+  # 443», хотя маскировка прошла). Ретрай до ~20 сек, как у готовности панели.
+  local npin='' _pin_try
+  for _pin_try in 1 2 3 4 5 6 7 8 9 10; do
+    npin="$(cert_pin "$nhost" 443)"
+    [ -n "$npin" ] && break
+    sleep 2
+  done
   [ -n "$npin" ] || { err "Не снял пин nginx-серта ноды на 443 — маскировка не подтверждена"; return 1; }
   rec="$(jq -c --arg p "$npin" '.panel.port = 443 | .panel.tls = true | .panel.pincert = $p | .panel.hidden = true' <<<"$rec")"
   # v8.1.7: SNI туннеля должен совпадать с сертификатом DEST, а не всегда с хостом
@@ -12997,9 +13037,13 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       ;;
     *) err "Режим '$mode' не знаю (self|ip|domain|wildcard|own)"; return 1 ;;
   esac
+  # v8.2.3: у скрытой ноды панель за nginx 443 (порт в реестре = 443), а не на
+  # прямом порту — пин снимается с 443, иначе TLS-probe бьёт в закрытый порт.
+  local probe_port; probe_port="$(jq -r '.panel.port' <<<"$rec")"
+  [ "$(jq -r '.panel.hidden // false' <<<"$rec")" = "true" ] && probe_port=443
   local tls_probe='' tls_try
-  for tls_try in 1 2 3 4 5; do
-    tls_probe="$(cert_pin "$nhost" "$(jq -r '.panel.port' <<<"$rec")")"
+  for tls_try in 1 2 3 4 5 6 7 8 9 10; do
+    tls_probe="$(cert_pin "$nhost" "$probe_port")"
     [ -n "$tls_probe" ] && break
     sleep 2
   done
