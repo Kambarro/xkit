@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v9.0.0
+#  XKIT — КЛАССИЧЕСКОЕ МЕНЮ (fallback для TUI), v9.1.0
 #
 #  Меню вынесено из xkit.sh в отдельный файл: ядро (API, установка, nginx,
 #  подписки, ноды) не раздувается, а правки меню не трогают xkit.sh.
@@ -223,15 +223,17 @@ menu_versions() {
   while true; do
     echo ""; echo "=== ВЕРСИИ 3X-UI/XRAY ==="
     versions_status
-    echo " 1) Показать проверенные сочетания версий"
-    echo " 2) Установить сочетание версий (проверка, копия, откат при ошибке)"
-    echo " 3) Вернуть предыдущие версии"
+    echo " 1) Показать доступные версии (GitHub, последние 5)"
+    echo " 2) Установить связку — выбор номером (проверка, копия, откат при ошибке)"
+    echo " 3) Поставить последние официальные версии"
+    echo " 4) Вернуть предыдущие версии"
     echo " 0) Назад"
-    local c u x; read -r -p "Выбор: " c || return 0
+    local c; read -r -p "Выбор: " c || return 0
     case "$c" in
       1) versions_list ;;
-      2) read -r -p "Версия 3X-UI: " u; read -r -p "Версия Xray: " x; versions_install "$u" "$x" ;;
-      3) versions_rollback ;;
+      2) versions_install ;;
+      3) versions_latest ;;
+      4) versions_rollback ;;
       0) return 0 ;;
     esac
   done

@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.0.0"
+XKIT_VERSION="9.1.0"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -308,33 +308,7 @@ XUI_INSTALLER_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/insta
 
 # K-02 (аудит №2): установщик 3X-UI — по тегу ПОСЛЕДНЕГО РЕЛИЗА (master плавает
 # и может измениться в любой момент). Переопределить: XKIT_3XUI_TAG=vX.Y.Z
-# v7.2.1 (баг: недетерминированная установка): без токена GitHub API ограничен
-# 60 запросами/час на IP — на NAT/прокси-адресах часты 403, и установка ТИХО
-# скатывалась на master (плавающий). Цепочка источников тега:
-# XKIT_3XUI_TAG -> API -> редирект github.com/.../releases/latest (веб-редирект
-# без лимитов API) -> master с громким предупреждением.
-xui_tag_from_api() {
-  curl -fsSL --max-time 10 https://api.github.com/repos/MHSanaei/3x-ui/releases/latest 2>/dev/null \
-    | jq -r '.tag_name // ""' 2>/dev/null || true
-}
-xui_tag_from_redirect() {
-  local loc
-  loc="$(curl -s --max-time 10 -o /dev/null -w '%{redirect_url}' \
-    https://github.com/MHSanaei/3x-ui/releases/latest 2>/dev/null)" || return 1
-  [[ "$loc" =~ /tag/(v[0-9][A-Za-z0-9._-]{0,39})$ ]] || return 1
-  printf '%s' "${BASH_REMATCH[1]}"
-}
-xui_install_url() {
-  local tag="${XKIT_3XUI_TAG:-}"
-  [ -n "$tag" ] || tag="$(xui_tag_from_api)"
-  [ -n "$tag" ] || tag="$(xui_tag_from_redirect || true)"
-  if [[ "$tag" =~ ^[A-Za-z0-9._-]{1,40}$ ]]; then
-    printf 'https://raw.githubusercontent.com/mhsanaei/3x-ui/%s/install.sh' "$tag"
-  else
-    warn "Тег релиза 3X-UI не определён (API и редирект недоступны) — установка с master НЕдетерминирована. Зафиксируйте: XKIT_3XUI_TAG=vX.Y.Z" >&2
-    printf '%s' "$XUI_INSTALLER_URL"
-  fi
-}
+# Резолв тега (xui_tag_from_api/redirect, xui_install_url) — в src/26_versions.sh.
 XKIT_DIR="/etc/xkit"
 XKIT_ENV="${XKIT_DIR}/xkit.env"
 XKIT_ROUTES="${XKIT_DIR}/routes.tsv"
@@ -5202,7 +5176,7 @@ external_proxy_fix() {
 
 #=========================== REALITY / CAMO / XRAY ============================
 # CAMO_DIR используется Reality/Hysteria; реализации camo и менеджера версий —
-# в src/26_versions_camo.sh (единый fail-closed путь, без старых bypass).
+# в src/26_versions.sh (единый fail-closed путь, без старых bypass).
 CAMO_DIR="/var/www/camo"
 
 reality_expand_targets() { # CIDR (/24 и меньше) или список -> по IP в строке
@@ -6518,9 +6492,17 @@ node_add() {
       _need_install=1 ;;
   esac
   if [ "$_need_install" = "1" ]; then
+  # v9.1.0: один раз спрашиваем версию панели номером (Enter = как на мастере).
+  # Xray на ноде меняется в самой панели — отдельного выбора ядра нет.
+  local _node_tag="" _mtag
+  _mtag="$(node_xui_tag_master || true)"
+  if [ -t 0 ] && [ "${XKIT_YES:-0}" != 1 ]; then
+    _node_tag="$(node_version_select "${_mtag:+v$_mtag}")" || _node_tag=""
+    node_version_hint
+  fi
   log "Устанавливаю 3X-UI на ноду (официальный установщик, от root)..."
-  # K-02: тот же тег-релиз, что и на мастере; URL валидирован в xui_install_url
-  local xuiu; xuiu="$(xui_install_url)"
+  # K-02: выбранный тег (или тег мастера/последний); URL валидирован в xui_install_url
+  local xuiu; xuiu="$(XKIT_3XUI_TAG="${_node_tag:-${XKIT_3XUI_TAG:-}}" xui_install_url)"
   node_ssh "$rec" "XUI_URL='${xuiu}' bash -s" <<'EOS' || { err "Установка 3X-UI на ноде не удалась"; return 1; }
 export DEBIAN_FRONTEND=noninteractive
 # (баг, найден при проверке установки ноды 7.4.0): sqlite3 ставился ТОЛЬКО вместе
@@ -9211,7 +9193,7 @@ xkit_menu_json() {
         {title:"Сертификат: выпустить заново", desc:"Домен / IP / самоподписанный", args:[], fn:"menu_service_cert", mode:"exec"},
         {title:"Резервная копия", desc:"Создать, проверить, восстановить", args:["backup"], mode:"exec"},
         {title:"Обновить XKIT", desc:"Проверка файла и резервная копия", args:["update"], mode:"exec"},
-        {title:"Версии 3X-UI/Xray", desc:"Список, установка, откат", args:["versions"], mode:"exec"},
+        {title:"Версии 3X-UI/Xray", desc:"Доступные релизы, выбор номером, последние, откат", args:["versions"], mode:"exec"},
         {title:"Сайт-заглушка", desc:"Состояние или создать заново", args:["camo"], mode:"exec"},
         {title:"Архив для диагностики", desc:"Без секретов", args:["doctor","export"], mode:"exec"},
         {title:"BBR и настройки TCP", desc:"Пропускная способность и задержка", args:["bbr"], mode:"exec"},
@@ -9286,7 +9268,9 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit nodes ufw <имя|all> [on|status] — UFW ноды: статус / включить (SSH/80/443/туннель, остальное закрыть)
   xkit nodes pool-link — ссылка каскада (вход мастера, балансировка по нодам)
   xkit nodes versions <имя|all> — версии 3X-UI/Xray на нодах (vs мастер и последний релиз)
-  xkit nodes upgrade <имя|all> [vX.Y.Z] — обновить 3X-UI на нодах (бэкап + проверка панели)
+  xkit nodes upgrade <имя|all> [vX.Y.Z] — обновить 3X-UI на нодах (бэкап + проверка панели);
+                         без тега в TTY — выбор номером; Xray меняется в панели ноды
+  xkit nodes latest <имя|all> — последний официальный 3X-UI на нодах
   xkit nodes cert <имя|all> [self|ip|domain|wildcard] [домен] — сертификат панели ноды (wildcard выпускает мастер по dns-01)
   xkit nodes cert show — таблица сертификатов/камо нод
   xkit nodes cert-renew [имя|--cron] — продление wildcard-линейджей мастера + пере-раздача нодам
@@ -9328,8 +9312,10 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
                          без аргумента — версия XKIT_CORE_PIN (${XKIT_CORE_PIN:-26.6.27})
   xkit bbr status|on|off — BBR + fq (TCP congestion control): рекомендация
                          после установки; on пишет /etc/sysctl.d/99-xkit-bbr.conf
-  xkit versions list|status — связки и установленные версии
-  xkit versions install <3xui> <xray> — SHA-256 + snapshot + probes + rollback
+  xkit versions list|status — доступные релизы GitHub и установленные версии
+  xkit versions install [<3xui> <xray>] — выбор номером (без аргументов) или явно;
+                         SHA-256 + snapshot + probes + rollback
+  xkit versions latest   — последние официальные 3X-UI + Xray (одно подтверждение)
   xkit versions rollback [snapshot] — восстановить прежнюю связку и БД
   xkit camo status|files — состояние и файлы, которые можно заменить вручную
   xkit camo regenerate [seed] — новый случайный сайт; seed = воспроизводимый вариант
@@ -9413,6 +9399,7 @@ xkit_main_impl() {
                pool-link) shift; node_pool_link ;;
                versions) shift; nodes_versions "${1:-all}" ;;
                upgrade) shift; nodes_upgrade "${1:-}" "${2:-}" ;;
+               latest) shift; nodes_latest "${1:-}" ;;
                cert) shift; node_cert_dispatch "$@" ;;
                cert-renew) shift; node_cert_dispatch renew "$@" ;;
                camo) shift; node_camo_dispatch "$@" ;;
@@ -9438,8 +9425,9 @@ xkit_main_impl() {
         list) versions_list ;;
         status) versions_status ;;
         install) shift; require_root; versions_install "$@" ;;
+        latest) require_root; versions_latest ;;
         rollback) shift; require_root; versions_rollback "${1:-}" ;;
-        *) die "versions: list | status | install <3xui> <xray> | rollback [snapshot]" ;;
+        *) die "versions: list | status | install [<3xui> <xray>] | latest | rollback [snapshot]" ;;
       esac ;;
     camo)    shift
       case "${1:-status}" in
@@ -10550,367 +10538,9 @@ proto_panel_menu() {
   done
 }
 
-#================= v6.1.0: ВЕРСИИ 3X-UI/XRAY И САЙТ-ПРИКРЫТИЕ ================
-# Манифест — фильтр известных связок, а НЕ доказательство совместимости.
-# Окончательное решение принимают локальные binary/config/service/API probes.
-XKIT_VERSION_STATE="${XKIT_DIR}/versions.env"
-XKIT_VERSION_BACKUPS="${BACKUP_DIR}/versions"
-XKIT_CAMO_STATE="${XKIT_DIR}/camo.env"
-# v7.2.1: + связка 3.11.0 + 26.10.21 — именно её бандлит установщик 3x-ui
-# v3.11.0, т.е. это ДЕФОЛТНЫЙ результат стандартной установки; раньше она
-# честно показывалась как unlisted сразу после чистой установки.
-XKIT_VERSION_MANIFEST='
-[
- {"xui":"3.9.0","xray":"26.6.27","status":"verified","note":"связка 3X-UI KIT: работает со всеми клиентами (Mihomo/sing-box/AmneziaVPN), проверена в бою"},
- {"xui":"3.11.0","xray":"26.6.27","status":"verified","note":"панель 3.11 + последнее совместимое с Mihomo/sing-box ядро; 26.7+ ломает REALITY у этих клиентов"},
- {"xui":"3.11.0","xray":"26.10.21","status":"verified","note":"дефолтный бандл установщика 3.11.0; REALITY может не работать у Mihomo/sing-box клиентов"},
- {"xui":"3.11.0","xray":"26.10.31","status":"verified","note":"новое ядро; совместимость с клиентами проверяйте сами"}
-]'
-
-versions_manifest() {
-  local f="${XKIT_VERSION_MANIFEST_FILE:-}"
-  if [ -n "$f" ]; then
-    [ -f "$f" ] || { err "Манифест не найден: $f"; return 1; }
-    local owner; owner="$(stat -Lc '%u' "$f" 2>/dev/null)"
-    { [ "$owner" = 0 ] || [ "$owner" = "$(id -u)" ]; } || { err "Владелец манифеста не доверен"; return 1; }
-    [ "$(stat -Lc '%a' "$f" 2>/dev/null)" = "600" ] || [ "$(stat -Lc '%a' "$f" 2>/dev/null)" = "400" ] || {
-      err "Манифест должен быть доступен на запись только владельцу (0600/0400)"; return 1;
-    }
-    jq -e 'type=="array" and all(.[]; (.xui|test("^[0-9]+(\\.[0-9]+)+$")) and (.xray|test("^[0-9]+(\\.[0-9]+)+$")))' "$f" >/dev/null || {
-      err "Некорректный манифест версий"; return 1;
-    }
-    cat "$f"
-  else
-    jq -e . <<<"$XKIT_VERSION_MANIFEST" >/dev/null || return 1
-    printf '%s\n' "$XKIT_VERSION_MANIFEST"
-  fi
-}
-
-version_norm() { local v="${1#v}"; [[ "$v" =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1; printf '%s' "$v"; }
-version_arch() {
-  case "$(uname -m)" in
-    x86_64) V_XUI=amd64; V_XRAY=64 ;;
-    aarch64|arm64) V_XUI=arm64; V_XRAY=arm64-v8a ;;
-    *) err "Архитектура $(uname -m) не поддерживается"; return 1 ;;
-  esac
-}
-version_xray_bin() {
-  local b
-  for b in /usr/local/x-ui/bin/xray-linux-*; do [ -x "$b" ] && { printf '%s' "$b"; return 0; }; done
-  return 1
-}
-version_xui_current() {
-  local s=""
-  if [ -x /usr/local/x-ui/x-ui ]; then s="$(/usr/local/x-ui/x-ui -v 2>/dev/null || true)"; fi
-  [ -n "$s" ] || s="$(x-ui version 2>/dev/null || true)"
-  grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$s" | head -n1
-}
-version_xray_current() {
-  local b; b="$(version_xray_bin)" || return 1
-  "$b" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
-}
-version_pair_status() { # xui xray -> verified|unlisted
-  local m; m="$(versions_manifest)" || return 1
-  jq -r --arg x "$1" --arg y "$2" 'if any(.[]; .xui==$x and .xray==$y) then (.[]|select(.xui==$x and .xray==$y)|.status//"verified") else "unlisted" end' <<<"$m" | head -n1
-}
-versions_state_load() { [ -r "$XKIT_VERSION_STATE" ] && . "$XKIT_VERSION_STATE" || true; }
-versions_state_save() { # xui xray snapshot
-  (
-    umask 077
-    # v8.1.5: /etc/xkit может ещё не существовать (versions_install вызывается на
-    # шаге 3 установки, до mkdir на шаге 5) — создаём каталог перед mktemp.
-    mkdir -p "$XKIT_DIR" || exit 1
-    local t; t="$(mktemp "${XKIT_VERSION_STATE}.new.XXXXXX")" || exit 1
-    { printf 'XKIT_XUI_VERSION=%q\n' "$1"; printf 'XKIT_XRAY_VERSION=%q\n' "$2"; printf 'XKIT_VERSION_SNAPSHOT=%q\n' "$3"; } >"$t"
-    mv "$t" "$XKIT_VERSION_STATE"
-  )
-}
-
-version_snapshot() { # -> путь; останавливает панель только на короткое копирование БД
-  require_root
-  local d ts; ts="$(date +%Y%m%d-%H%M%S)"; d="${XKIT_VERSION_BACKUPS}/${ts}"
-  mkdir -p "$d" || return 1; chmod 700 "$XKIT_VERSION_BACKUPS" "$d"
-  systemctl stop x-ui 2>/dev/null || true
-  local rc=0
-  if [ -d /usr/local/x-ui ]; then cp -a /usr/local/x-ui "$d/x-ui" || rc=1; fi
-  if [ -d /etc/x-ui ]; then cp -a /etc/x-ui "$d/etc-x-ui" || rc=1; fi
-  systemctl start x-ui 2>/dev/null || true
-  [ "$rc" -eq 0 ] || return 1
-  [ -f /etc/systemd/system/x-ui.service ] && cp -a /etc/systemd/system/x-ui.service "$d/" || true
-  [ -f /usr/bin/x-ui ] && cp -a /usr/bin/x-ui "$d/x-ui-cli" || true
-  [ -f "$XUI_RESULT" ] && cp -a "$XUI_RESULT" "$d/install-result.env" || true
-  printf '%s' "$d"
-}
-version_snapshot_restore() {
-  local d="$1"
-  [ -d "$d" ] || { err "Snapshot не найден: $d"; return 1; }
-  systemctl stop x-ui 2>/dev/null || true
-  if [ -d "$d/x-ui" ]; then mkdir -p /usr/local/x-ui; cp -a "$d/x-ui/." /usr/local/x-ui/ || return 1; fi
-  if [ -d "$d/etc-x-ui" ]; then mkdir -p /etc/x-ui; cp -a "$d/etc-x-ui/." /etc/x-ui/ || return 1; fi
-  [ -f "$d/x-ui.service" ] && cp -a "$d/x-ui.service" /etc/systemd/system/x-ui.service
-  [ -f "$d/x-ui-cli" ] && cp -a "$d/x-ui-cli" /usr/bin/x-ui
-  [ -f "$d/install-result.env" ] && cp -a "$d/install-result.env" "$XUI_RESULT"
-  systemctl daemon-reload 2>/dev/null || true
-  systemctl restart x-ui 2>/dev/null || true
-}
-
-version_download_verified() { # url sha-url output; SHA обязателен, без интерактивного bypass
-  local url="$1" sumurl="$2" out="$3" sum got want attempt
-  sum="${out}.sha256"
-  # v8.1.4: retry + resume + длинный timeout. GitHub releases с РФ-хостов часто
-  # отдаёт медленно/обрывает (curl 28 timeout на 21MB Xray). 3 попытки, --continue-at -
-  # (докачка), --retry на сетевые сбои, --max-time 600 (большие архивы на медленном канале).
-  for attempt in 1 2 3; do
-    if curl -fL --retry 3 --retry-delay 3 --retry-all-errors \
-         --connect-timeout 30 --max-time 600 --continue-at - \
-         -o "$out" "$url"; then
-      break
-    fi
-    [ "$attempt" -lt 3 ] && { warn "Скачивание не удалось (попытка $attempt/3), повторяю..."; sleep 3; }
-  done
-  [ -s "$out" ] || { err "Не удалось скачать $url (3 попытки)"; return 1; }
-  curl -fsSL --retry 3 --retry-delay 2 --max-time 60 -o "$sum" "$sumurl" || { err "Нет официальной SHA-256: $sumurl — установка запрещена"; return 1; }
-  want="$(grep -oE '[0-9a-fA-F]{64}' "$sum" | head -n1 | tr 'A-F' 'a-f')"
-  got="$(sha256sum "$out" | awk '{print $1}')"
-  [ -n "$want" ] && [ "$want" = "$got" ] || { err "SHA-256 не совпал — установка запрещена"; return 1; }
-  ok "SHA-256 проверен: $(basename "$url")"
-}
-
-version_extract_xui() { # archive destdir; без абсолютных путей, .. и ссылок
-  python3 - "$1" "$2" <<'PY'
-import sys,tarfile
-p,d=sys.argv[1:]
-with tarfile.open(p,'r:gz') as t:
-    for m in t.getmembers():
-        n=m.name
-        if n.startswith('/') or '..' in n.split('/') or m.issym() or m.islnk() or m.isdev():
-            raise SystemExit('unsafe tar member: '+n)
-    t.extractall(d,filter='data')
-PY
-}
-
-version_probes() { # expected-xray expected-xui
-  local xb cfg; xb="$(version_xray_bin)" || { err "Xray binary не найден"; return 1; }
-  "$xb" version >/dev/null 2>&1 || { err "Xray не запускается"; return 1; }
-  local xv; xv="$(version_xray_current)"
-  [ "$xv" = "$1" ] || { err "Xray version mismatch: ожидали $1, получили ${xv:-unknown}"; return 1; }
-  cfg="/usr/local/x-ui/bin/config.json"
-  if [ -s "$cfg" ]; then "$xb" run -test -config "$cfg" >/dev/null 2>&1 || { err "Xray отклонил config.json"; return 1; }; fi
-  systemctl is-active --quiet x-ui || { err "Служба x-ui не активна"; return 1; }
-  load_xkit_env >/dev/null 2>&1 || true
-  if [ -n "${PANEL_PORT:-}" ]; then
-    local code; code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${PANEL_PORT}${PANEL_WBP:-/}" || true)"
-    case "$code" in 200|301|302|400|401|403|404) ;; *) err "Локальный API панели не отвечает"; return 1 ;; esac
-  fi
-  if [ -n "$2" ]; then
-    local uv; uv="$(version_xui_current)"
-    [ "$uv" = "$2" ] || { err "3X-UI version mismatch: ожидали $2, получили ${uv:-unknown}"; return 1; }
-  fi
-  return 0
-}
-
-# (7.4.0) Список релизов официального репозитория 3x-ui (GitHub API без токена;
-# лимит 60 запросов/час на IP — при отказе остаётся ручной ввод тега).
-xui_releases_list() { # [$1 = сколько тегов, по умолчанию 10] -> stdout: теги
-  local n="${1:-10}"
-  curl -fsSL --max-time 15 "https://api.github.com/repos/MHSanaei/3x-ui/releases?per_page=${n}" 2>/dev/null \
-    | jq -r '.[].tag_name' 2>/dev/null | grep -E '^v[0-9]+(\.[0-9]+)+$' | head -n "$n"
-}
-
-versions_installer_select() {
-  # Неинтерактивно: XKIT_3XUI_TAG=vX.Y.Z и XKIT_XRAY_VERSION=A.B.C.
-  # Для выбранной вручную версии 3X-UI обязателен SHA-256 её install.sh.
-  if [ -n "${XKIT_3XUI_TAG:-}" ] || [ -n "${XKIT_XRAY_VERSION:-}" ]; then
-    log "Выбор версий задан окружением: 3X-UI ${XKIT_3XUI_TAG:-default}, Xray ${XKIT_XRAY_VERSION:-default}"
-    return 0
-  fi
-  [ -t 0 ] || return 0
-  local a u x rel
-  echo "Версии 3X-UI/Xray:"
-  echo "  1) Последняя официальная версия 3X-UI и входящий в неё Xray [Enter]"
-  echo "  2) Выбрать версию из официального списка GitHub"
-  echo "  3) Выбрать проверенное сочетание версий 3X-UI + Xray"
-  read -r -p "Ваш выбор: " a || return 0
-  a="${a:-1}"
-  case "$a" in
-    1) return 0 ;;
-    2)
-      # (7.4.0): «странный вариант v из манифеста» заменён явным выбором релиза
-      # из официального репозитория: теги берутся LIVE у MHSanaei/3x-ui, SHA-256
-      # install.sh выбранного тега на шаге установки показывается и требует
-      # подтверждения (v7.2.2) — пин XKIT_XUI_SHA256 по-прежнему можно задать сразу.
-      log "Запрашиваю релизы официального репозитория MHSanaei/3x-ui..."
-      rel="$(xui_releases_list 10)"
-      if [ -n "$rel" ]; then
-        echo "Официальные релизы (новые сверху):"
-        local i=1 t
-        while IFS= read -r t; do printf '  %2d) %s\n' "$i" "$t"; i=$((i+1)); done <<<"$rel"
-        read -r -p "Номер из списка или тег (Enter = последний): " u || return 1
-        u="${u:-$(head -n1 <<<"$rel")}"
-      else
-        warn "Список релизов недоступен (GitHub API лимит/сеть) — введите тег вручную"
-        read -r -p "Тег релиза (например v2.4.0): " u || return 1
-      fi
-      if [[ "$u" =~ ^[0-9]+$ ]]; then
-        u="$(sed -n "${u}p" <<<"$rel" | tr -d '[:space:]')"
-        [ -n "$u" ] || { err "Нет такого номера в списке"; return 1; }
-      fi
-      u="${u#v}"
-      u="$(version_norm "$u")" || { err "'$u' не похож на тег релиза (пример: v2.4.0)"; return 1; }
-      XKIT_3XUI_TAG="v$u"
-      ok "Выбран релиз официального репозитория: ${XKIT_3XUI_TAG} (Xray — тот, что бандлит его install.sh)"
-      [ -n "${XKIT_XUI_SHA256:-}" ] || \
-        log "SHA-256 install.sh ${XKIT_3XUI_TAG} не закреплён — на шаге установки будет показан и потребует подтверждения"
-      ;;
-    3)
-      # v8.1.2: выбор цифрой из списка проверенных связок (или ввод вручную).
-      # Манифест — рекомендация, а не запрет: своя связка допускается с подтверждением.
-      local m idx nu nx
-      m="$(versions_manifest)" || return 1
-      echo "Проверенные сочетания (новые сверху):"
-      local i=1
-      while IFS=$'\t' read -r nu nx st nt; do
-        printf '  %2d) 3X-UI %-10s Xray %-10s %s\n' "$i" "$nu" "$nx" "$nt"
-        i=$((i+1))
-      done < <(jq -r '.[]|[.xui,.xray,(.status//"verified"),(.note//"")]|@tsv' <<<"$m")
-      echo "   0) Ввести версии вручную"
-      read -r -p "Номер связки [1]: " idx || return 1
-      idx="${idx:-1}"
-      if [ "$idx" = 0 ]; then
-        read -r -p "Версия 3X-UI (например 3.9.0): " u || return 1
-        read -r -p "Версия Xray (Enter = не менять): " x || return 1
-      elif [[ "$idx" =~ ^[0-9]+$ ]]; then
-        u="$(jq -r --argjson i "$((idx-1))" '.[$i].xui // empty' <<<"$m")"
-        x="$(jq -r --argjson i "$((idx-1))" '.[$i].xray // empty' <<<"$m")"
-        [ -n "$u" ] || { err "Нет такого номера в списке"; return 1; }
-      else
-        err "Введите номер из списка или 0"; return 1
-      fi
-      u="$(version_norm "$u")" || return 1
-      XKIT_3XUI_TAG="v$u"
-      if [ -n "$x" ]; then
-        XKIT_XRAY_VERSION="$(version_norm "$x")" || return 1; XKIT_CORE_PIN="$XKIT_XRAY_VERSION"
-        if [ "$(version_pair_status "$u" "$XKIT_XRAY_VERSION")" = unlisted ]; then
-          warn "Связки ${u}+${XKIT_XRAY_VERSION} нет в списке проверенных — ставите на свой риск"
-          confirm "Продолжить с непроверенной связкой? [y/N] " n || { err "Отменено"; return 1; }
-        fi
-      fi
-      # v7.2.2 (UX): пин SHA-256 больше не тупик для интерактивного выбора —
-      # на шаге установки он будет вычислен, показан и потребует подтверждения.
-      # Закрепить сразу: XKIT_XUI_SHA256=<64 hex> (актуальное значение — check-upstream.sh).
-      [ -n "${XKIT_XUI_SHA256:-}" ] || \
-        log "SHA-256 install.sh ${XKIT_3XUI_TAG} не закреплён — на шаге установки будет показан и потребует подтверждения"
-      ;;
-    *) return 0 ;;
-  esac
-}
-versions_list() {
-  local m; m="$(versions_manifest)" || return 1
-  printf '%-12s %-12s %-12s %s\n' '3X-UI' 'XRAY' 'СТАТУС' 'ПРИМЕЧАНИЕ'
-  jq -r '.[]|[.xui,.xray,(.status//"verified"),(.note//"")]|@tsv' <<<"$m" | while IFS=$'\t' read -r x y s nt; do printf '%-12s %-12s %-12s %s\n' "$x" "$y" "$s" "$nt"; done
-  echo "verified = проверенная связка; установка всё равно с SHA-256, snapshot и авто-rollback"
-  echo "Рекомендуется 26.6.27 — последнее ядро, совместимое со всеми клиентами (Mihomo/sing-box)"
-}
-versions_status() {
-  local x u; x="$(version_xray_current || true)"; u="$(version_xui_current || true)"
-  echo "3X-UI: ${u:-не установлен / версия неизвестна}"
-  echo "Xray:  ${x:-не установлен / версия неизвестна}"
-  if [ -n "$u" ] && [ -n "$x" ]; then echo "Связка: $(version_pair_status "$u" "$x")"; fi
-  [ -r "$XKIT_VERSION_STATE" ] && { versions_state_load; echo "Последний snapshot: ${XKIT_VERSION_SNAPSHOT:-неизвестен}"; }
-  return 0
-}
-
-versions_install() { # xui xray [--allow-unlisted] [--allow-downgrade]
-  require_root
-  local u x allow=0 down=0 snap work stage xb uv
-  u="$(version_norm "${1:-}")" || { err "Использование: xkit versions install <3xui> <xray>"; return 1; }
-  x="$(version_norm "${2:-}")" || { err "Некорректная версия Xray"; return 1; }
-  shift 2 || true
-  while [ $# -gt 0 ]; do case "$1" in --allow-unlisted) allow=1;; --allow-downgrade) down=1;; *) err "Неизвестный флаг: $1"; return 1;; esac; shift; done
-  command -v x-ui >/dev/null 2>&1 || [ -x /usr/local/x-ui/x-ui ] || die "3X-UI не установлен: выбор связки доступен при установке"
-  [ "$(version_pair_status "$u" "$x")" != "unlisted" ] || [ "$allow" = 1 ] || {
-    err "Связки нет в манифесте. Сначала проверьте её; для осознанного эксперимента: --allow-unlisted"; return 1;
-  }
-  uv="$(version_xui_current || true)"
-  if [ -n "$uv" ] && dpkg --compare-versions "$u" lt "$uv" && [ "$down" != 1 ]; then
-    err "Downgrade 3X-UI $uv -> $u запрещён: схема БД может быть несовместима. --allow-downgrade только после внешнего бэкапа"; return 1
-  fi
-  if [ -f "$XUI_RESULT" ] && grep -q 'XUI_DB_TYPE=postgres' "$XUI_RESULT" 2>/dev/null && [ "${XKIT_ALLOW_POSTGRES_VERSION_CHANGE:-0}" != 1 ]; then
-    err "PostgreSQL не входит в файловый snapshot. Сделайте Backup в панели и явно задайте XKIT_ALLOW_POSTGRES_VERSION_CHANGE=1"; return 1
-  fi
-  [ -f /etc/x-ui/x-ui.db ] || [ -n "$uv" ] || warn "Установленная БД не найдена; проверьте тип БД панели"
-  # v8.1.4: если обе версии УЖЕ установлены — не качаем/не переустанавливаем зря.
-  # Переустановка xkit поверх готовой панели не должна заново тянуть 21MB Xray
-  # (GitHub с РФ-хостов медленный/обрывается) — просто подтверждаем и идём дальше.
-  local xcur; xcur="$(version_xray_current || true)"
-  if [ "$uv" = "$u" ] && [ "$xcur" = "$x" ]; then
-    ok "Связка 3X-UI $u + Xray $x уже установлена — пропускаю скачивание/переустановку"
-    return 0
-  fi
-  confirm "Установить связку 3X-UI $u + Xray $x с backup и автоматическим rollback? [y/N]" || return 1
-  version_arch || return 1
-  work="$(mktemp -d)" || return 1; stage="$work/stage"; mkdir -p "$stage"
-  local base="https://github.com/MHSanaei/3x-ui/releases/download/v${u}/x-ui-linux-${V_XUI}.tar.gz"
-  local xurl="https://github.com/XTLS/Xray-core/releases/download/v${x}/Xray-linux-${V_XRAY}.zip"
-  version_download_verified "$base" "${base}.sha256" "$work/xui.tar.gz" || { rm -rf "$work"; return 1; }
-  version_download_verified "$xurl" "${xurl}.dgst" "$work/xray.zip" || { rm -rf "$work"; return 1; }
-  version_extract_xui "$work/xui.tar.gz" "$stage" || { rm -rf "$work"; err "Небезопасный/битый архив 3X-UI"; return 1; }
-  [ -x "$stage/x-ui/x-ui" ] || chmod +x "$stage/x-ui/x-ui" 2>/dev/null || true
-  [ -x "$stage/x-ui/x-ui" ] || { rm -rf "$work"; err "В архиве нет x-ui"; return 1; }
-  python3 - "$work/xray.zip" "$work" <<'PY' || { rm -rf "$work"; return 1; }
-import sys,zipfile
-with zipfile.ZipFile(sys.argv[1]) as z:
-    n=next((n for n in z.namelist() if n.rstrip('/')=='xray'),None)
-    if n is None: raise SystemExit('xray missing')
-    z.extract(n,sys.argv[2])
-PY
-  chmod 755 "$work/xray" || { rm -rf "$work"; return 1; }
-  "$work/xray" version >/dev/null 2>&1 || { rm -rf "$work"; err "Скачанный Xray не запускается"; return 1; }
-  snap="$(version_snapshot)" || { rm -rf "$work"; err "Snapshot не создан — отмена"; return 1; }
-  systemctl stop x-ui 2>/dev/null || true
-  mkdir -p /usr/local/x-ui
-  cp -a "$stage/x-ui/." /usr/local/x-ui/ || { version_snapshot_restore "$snap"; rm -rf "$work"; return 1; }
-  xb="$(version_xray_bin)" || { version_snapshot_restore "$snap"; rm -rf "$work"; return 1; }
-  install -m 755 "$work/xray" "$xb" || { version_snapshot_restore "$snap"; rm -rf "$work"; return 1; }
-  rm -rf "$work"
-  systemctl daemon-reload 2>/dev/null || true
-  systemctl restart x-ui 2>/dev/null || true
-  sleep 3
-  if version_probes "$x" "$u"; then
-    versions_state_save "$u" "$x" "$snap" || return 1
-    ok "Связка установлена и прошла локальные probes: 3X-UI $u + Xray $x"
-    log "Snapshot прежней связки: $snap"
-  else
-    err "Проверки не прошли — откат прежней связки"
-    version_snapshot_restore "$snap" || return 1
-    sleep 2
-    systemctl is-active --quiet x-ui || { err "Rollback не поднял x-ui; snapshot: $snap"; return 1; }
-    ok "Прежняя связка восстановлена"
-    return 1
-  fi
-}
-
-versions_rollback() {
-  require_root
-  versions_state_load
-  local d="${1:-${XKIT_VERSION_SNAPSHOT:-}}"
-  [ -n "$d" ] && [ -d "$d" ] || { err "Нет snapshot для отката"; return 1; }
-  confirm "Восстановить прежние 3X-UI/Xray и БД из $d? [y/N]" || return 1
-  version_snapshot_restore "$d" || return 1
-  sleep 3
-  systemctl is-active --quiet x-ui || { err "x-ui не активен после rollback"; return 1; }
-  versions_status
-}
-
-# Старая команда остаётся совместимой, но больше не имеет bypass SHA-256.
-core_pin_install() {
-  local v u; v="$(version_norm "${1:-${XKIT_CORE_PIN:-}}")" || { err "Некорректная версия Xray"; return 1; }
-  u="$(version_xui_current || true)"
-  [ -n "$u" ] || { err "Версия 3X-UI неизвестна; используйте versions install <3xui> <xray>"; return 1; }
-  versions_install "$u" "$v" --allow-unlisted
-}
-
+#================= XKIT: САЙТ-ПРИКРЫТИЕ (camo, sitegen) ======================
 # Детерминированный camo: seed сохраняется, restart/повторная установка сайт не меняют.
+XKIT_CAMO_STATE="${XKIT_DIR}/camo.env"
 camo_seed_load() {
   if [ -r "$XKIT_CAMO_STATE" ]; then . "$XKIT_CAMO_STATE"; fi
   if [[ "${XKIT_CAMO_SEED:-}" =~ ^[0-9a-f]{64}$ ]]; then printf '%s' "$XKIT_CAMO_SEED"; return 0; fi
@@ -11016,6 +10646,537 @@ camo_regenerate() {
   camo_site_install "$seed"
 }
 
+#================= XKIT: ВЕРСИИ 3X-UI/XRAY (единый модуль, v9.1.0) ============
+# Вся логика версий мастера и нод в одном месте: резолв тегов, списки релизов
+# GitHub (кэш 6ч, экономия API), интерактивный выбор номером, установка с
+# SHA/snapshot/автооткатом. Манифест «проверенных связок» удалён (v9.1.0):
+# совместимость индивидуальна, решение принимают binary/config/service/API probes.
+XKIT_VERSION_STATE="${XKIT_DIR}/versions.env"
+XKIT_VERSION_BACKUPS="${BACKUP_DIR}/versions"
+XKIT_RELEASES_CACHE="${XKIT_DIR}/releases-cache"
+XKIT_RELEASES_TTL=21600   # 6 часов — экономим лимит GitHub API (60/час на IP)
+
+#--- резолв тегов 3X-UI (переехало из 02_log.sh) ------------------------------
+# Цепочка источников тега: XKIT_3XUI_TAG -> API -> редирект releases/latest
+# (веб-редирект без лимитов API) -> master с громким предупреждением.
+xui_tag_from_api() {
+  curl -fsSL --max-time 10 https://api.github.com/repos/MHSanaei/3x-ui/releases/latest 2>/dev/null \
+    | jq -r '.tag_name // ""' 2>/dev/null || true
+}
+xui_tag_from_redirect() {
+  local loc
+  loc="$(curl -s --max-time 10 -o /dev/null -w '%{redirect_url}' \
+    https://github.com/MHSanaei/3x-ui/releases/latest 2>/dev/null)" || return 1
+  [[ "$loc" =~ /tag/(v[0-9][A-Za-z0-9._-]{0,39})$ ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+xui_install_url() {
+  local tag="${XKIT_3XUI_TAG:-}"
+  [ -n "$tag" ] || tag="$(xui_tag_from_api)"
+  [ -n "$tag" ] || tag="$(xui_tag_from_redirect || true)"
+  if [[ "$tag" =~ ^[A-Za-z0-9._-]{1,40}$ ]]; then
+    printf 'https://raw.githubusercontent.com/mhsanaei/3x-ui/%s/install.sh' "$tag"
+  else
+    warn "Тег релиза 3X-UI не определён (API и редирект недоступны) — установка с master НЕдетерминирована. Зафиксируйте: XKIT_3XUI_TAG=vX.Y.Z" >&2
+    printf '%s' "$XUI_INSTALLER_URL"
+  fi
+}
+
+#--- списки релизов GitHub с кэшем 6ч -----------------------------------------
+# _releases_cached <repo> <n> -> теги (новые сверху). Кэш в файле; при свежем
+# кэше API не дёргается. Пустой результат = сеть/лимит недоступны (фолбэк ручной).
+_releases_cached() { # $1 repo (MHSanaei/3x-ui), $2 сколько
+  local repo="$1" n="${2:-5}" cf now mt tags
+  mkdir -p "$XKIT_RELEASES_CACHE" 2>/dev/null || true
+  cf="${XKIT_RELEASES_CACHE}/$(echo "$repo" | tr '/' '_').tags"
+  now="$(date +%s)"
+  if [ -r "$cf" ]; then
+    mt="$(stat -c %Y "$cf" 2>/dev/null || echo 0)"
+    if [ $((now-mt)) -lt "$XKIT_RELEASES_TTL" ] && [ -s "$cf" ]; then
+      head -n "$n" "$cf"; return 0
+    fi
+  fi
+  tags="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=${n}" 2>/dev/null \
+    | jq -r '.[].tag_name' 2>/dev/null | grep -E '^v[0-9]+(\.[0-9]+)+$' | head -n "$n")"
+  if [ -n "$tags" ]; then
+    printf '%s\n' "$tags" > "$cf" 2>/dev/null || true
+    printf '%s\n' "$tags"
+  elif [ -r "$cf" ] && [ -s "$cf" ]; then
+    head -n "$n" "$cf"   # устаревший кэш лучше пустоты
+  fi
+}
+xui_releases_list() { _releases_cached "MHSanaei/3x-ui" "${1:-5}"; }
+xray_releases_list() { _releases_cached "XTLS/Xray-core" "${1:-5}"; }
+xui_tag_latest() { xui_releases_list 1 | head -n1; }
+xray_tag_latest() { xray_releases_list 1 | head -n1; }
+
+#--- базовые хелперы версий ---------------------------------------------------
+version_norm() { local v="${1#v}"; [[ "$v" =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1; printf '%s' "$v"; }
+version_arch() {
+  case "$(uname -m)" in
+    x86_64) V_XUI=amd64; V_XRAY=64 ;;
+    aarch64|arm64) V_XUI=arm64; V_XRAY=arm64-v8a ;;
+    *) err "Архитектура $(uname -m) не поддерживается"; return 1 ;;
+  esac
+}
+version_xray_bin() {
+  local b
+  for b in /usr/local/x-ui/bin/xray-linux-*; do [ -x "$b" ] && { printf '%s' "$b"; return 0; }; done
+  return 1
+}
+version_xui_current() {
+  local s=""
+  if [ -x /usr/local/x-ui/x-ui ]; then s="$(/usr/local/x-ui/x-ui -v 2>/dev/null || true)"; fi
+  [ -n "$s" ] || s="$(x-ui version 2>/dev/null || true)"
+  grep -oE '[0-9]+\.[0-9]+\.[0-9]+' <<<"$s" | head -n1
+}
+version_xray_current() {
+  local b; b="$(version_xray_bin)" || return 1
+  "$b" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+versions_state_load() { [ -r "$XKIT_VERSION_STATE" ] && . "$XKIT_VERSION_STATE" || true; }
+versions_state_save() { # xui xray snapshot
+  (
+    umask 077
+    # v8.1.5: /etc/xkit может ещё не существовать (versions_install вызывается на
+    # шаге 3 установки, до mkdir на шаге 5) — создаём каталог перед mktemp.
+    mkdir -p "$XKIT_DIR" 2>/dev/null || true
+    local t; t="$(mktemp "${XKIT_VERSION_STATE}.new.XXXXXX")" || exit 1
+    printf 'XKIT_VERSION_XUI=%q\nXKIT_VERSION_XRAY=%q\nXKIT_VERSION_SNAPSHOT=%q\n' "$1" "$2" "$3" >"$t"
+    mv "$t" "$XKIT_VERSION_STATE"
+  )
+}
+version_snapshot() { # -> путь; останавливает панель только на короткое копирование БД
+  require_root
+  local d ts; ts="$(date +%Y%m%d-%H%M%S)"; d="${XKIT_VERSION_BACKUPS}/${ts}"
+  mkdir -p "$d" || return 1; chmod 700 "$XKIT_VERSION_BACKUPS" "$d"
+  systemctl stop x-ui 2>/dev/null || true
+  local rc=0
+  if [ -d /usr/local/x-ui ]; then cp -a /usr/local/x-ui "$d/x-ui" || rc=1; fi
+  if [ -d /etc/x-ui ]; then cp -a /etc/x-ui "$d/etc-x-ui" || rc=1; fi
+  systemctl start x-ui 2>/dev/null || true
+  [ "$rc" -eq 0 ] || return 1
+  [ -f /etc/systemd/system/x-ui.service ] && cp -a /etc/systemd/system/x-ui.service "$d/" || true
+  [ -f /usr/bin/x-ui ] && cp -a /usr/bin/x-ui "$d/x-ui-cli" || true
+  [ -f "$XUI_RESULT" ] && cp -a "$XUI_RESULT" "$d/install-result.env" || true
+  printf '%s' "$d"
+}
+version_snapshot_restore() {
+  local d="$1"
+  [ -d "$d" ] || { err "Snapshot не найден: $d"; return 1; }
+  systemctl stop x-ui 2>/dev/null || true
+  if [ -d "$d/x-ui" ]; then mkdir -p /usr/local/x-ui; cp -a "$d/x-ui/." /usr/local/x-ui/ || return 1; fi
+  if [ -d "$d/etc-x-ui" ]; then mkdir -p /etc/x-ui; cp -a "$d/etc-x-ui/." /etc/x-ui/ || return 1; fi
+  [ -f "$d/x-ui.service" ] && cp -a "$d/x-ui.service" /etc/systemd/system/x-ui.service
+  [ -f "$d/x-ui-cli" ] && cp -a "$d/x-ui-cli" /usr/bin/x-ui
+  [ -f "$d/install-result.env" ] && cp -a "$d/install-result.env" "$XUI_RESULT"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl restart x-ui 2>/dev/null || true
+}
+
+version_download_verified() { # url sha-url output; SHA обязателен, без интерактивного bypass
+  local url="$1" sumurl="$2" out="$3" sum got want attempt
+  sum="${out}.sha256"
+  # v8.1.4: retry + resume + длинный timeout. GitHub releases с РФ-хостов часто
+  # отдаёт медленно/обрывает (curl 28 timeout на 21MB Xray). 3 попытки, --continue-at -
+  # (докачка), --retry на сетевые сбои, --max-time 600 (большие архивы на медленном канале).
+  for attempt in 1 2 3; do
+    if curl -fL --retry 3 --retry-delay 3 --retry-all-errors \
+         --connect-timeout 30 --max-time 600 --continue-at - \
+         -o "$out" "$url"; then
+      break
+    fi
+    [ "$attempt" -lt 3 ] && { warn "Скачивание не удалось (попытка $attempt/3), повторяю..."; sleep 3; }
+  done
+  [ -s "$out" ] || { err "Не удалось скачать $url (3 попытки)"; return 1; }
+  curl -fsSL --retry 3 --retry-delay 2 --max-time 60 -o "$sum" "$sumurl" || { err "Нет официальной SHA-256: $sumurl — установка запрещена"; return 1; }
+  want="$(grep -oE '[0-9a-fA-F]{64}' "$sum" | head -n1 | tr 'A-F' 'a-f')"
+  got="$(sha256sum "$out" | awk '{print $1}')"
+  [ -n "$want" ] && [ "$want" = "$got" ] || { err "SHA-256 не совпал — установка запрещена"; return 1; }
+  ok "SHA-256 проверен: $(basename "$url")"
+}
+
+version_extract_xui() { # archive destdir; без абсолютных путей, .. и ссылок
+  python3 - "$1" "$2" <<'PY'
+import sys,tarfile
+p,d=sys.argv[1:]
+with tarfile.open(p,'r:gz') as t:
+    for m in t.getmembers():
+        n=m.name
+        if n.startswith('/') or '..' in n.split('/') or m.issym() or m.islnk() or m.isdev():
+            raise SystemExit('unsafe tar member: '+n)
+    t.extractall(d,filter='data')
+PY
+}
+
+version_probes() { # expected-xray expected-xui
+  local xb cfg; xb="$(version_xray_bin)" || { err "Xray binary не найден"; return 1; }
+  "$xb" version >/dev/null 2>&1 || { err "Xray не запускается"; return 1; }
+  local xv; xv="$(version_xray_current)"
+  [ "$xv" = "$1" ] || { err "Xray version mismatch: ожидали $1, получили ${xv:-unknown}"; return 1; }
+  cfg="/usr/local/x-ui/bin/config.json"
+  if [ -s "$cfg" ]; then "$xb" run -test -config "$cfg" >/dev/null 2>&1 || { err "Xray отклонил config.json"; return 1; }; fi
+  systemctl is-active --quiet x-ui || { err "Служба x-ui не активна"; return 1; }
+  load_xkit_env >/dev/null 2>&1 || true
+  if [ -n "${PANEL_PORT:-}" ]; then
+    local code; code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:${PANEL_PORT}${PANEL_WBP:-/}" || true)"
+    case "$code" in 200|301|302|400|401|403|404) ;; *) err "Локальный API панели не отвечает"; return 1 ;; esac
+  fi
+  if [ -n "$2" ]; then
+    local uv; uv="$(version_xui_current)"
+    [ "$uv" = "$2" ] || { err "3X-UI version mismatch: ожидали $2, получили ${uv:-unknown}"; return 1; }
+  fi
+  return 0
+}
+
+#--- интерактивный выбор номером (v9.1.0) -------------------------------------
+# version_pick <xui|xray> [default-tag] -> печатает выбранный тег (vX.Y.Z).
+# Список из 5 последних релизов GitHub (кэш 6ч); 0 = ввести вручную; Enter =
+# default (если задан) или последний. Подсказка совместимости — одной строкой.
+version_pick() { # $1 kind, $2 default-tag (необязательно)
+  local kind="$1" def="${2:-}" rel i=1 t choice tag hint
+  case "$kind" in
+    xui) rel="$(xui_releases_list 5)"; hint="3X-UI" ;;
+    xray) rel="$(xray_releases_list 5)"; hint="Xray (26.6.27 — последнее ядро, совместимое со всеми клиентами Mihomo/sing-box; новее — проверяйте сами)" ;;
+    *) return 1 ;;
+  esac
+  echo "" >&2
+  if [ -n "$rel" ]; then
+    echo "Доступные версии ${hint} (новые сверху):" >&2
+    while IFS= read -r t; do
+      [ -n "$t" ] || continue
+      if [ "$i" = 1 ]; then printf '  %d) %s  (последняя)\n' "$i" "$t" >&2
+      else printf '  %d) %s\n' "$i" "$t" >&2; fi
+      i=$((i+1))
+    done <<<"$rel"
+    echo "  0) ввести версию вручную" >&2
+    local dprompt="Номер [1=последняя]"
+    [ -n "$def" ] && dprompt="Номер [Enter=${def}]"
+    read -r -p "${dprompt}: " choice || return 1
+    if [ -z "$choice" ]; then
+      tag="${def:-$(head -n1 <<<"$rel")}"
+    elif [ "$choice" = 0 ]; then
+      read -r -p "Версия (например 3.11.0 или 26.6.27): " tag || return 1
+    elif [[ "$choice" =~ ^[0-9]+$ ]]; then
+      tag="$(sed -n "${choice}p" <<<"$rel" | tr -d '[:space:]')"
+      [ -n "$tag" ] || { err "Нет такого номера в списке"; return 1; }
+    else
+      tag="$choice"   # допускаем ввод тега прямо в поле номера
+    fi
+  else
+    warn "Список релизов недоступен (GitHub API лимит/сеть) — введите версию вручную"
+    read -r -p "Версия ${hint} (например 3.11.0): " tag || return 1
+  fi
+  tag="$(version_norm "$tag")" || { err "'$tag' не похож на версию (пример: 3.11.0)"; return 1; }
+  printf 'v%s' "$tag"
+}
+
+# Выбор при УСТАНОВКЕ мастера (задаёт XKIT_3XUI_TAG/XKIT_XRAY_VERSION для установщика).
+versions_installer_select() {
+  if [ -n "${XKIT_3XUI_TAG:-}" ] || [ -n "${XKIT_XRAY_VERSION:-}" ]; then
+    log "Выбор версий задан окружением: 3X-UI ${XKIT_3XUI_TAG:-default}, Xray ${XKIT_XRAY_VERSION:-default}"
+    return 0
+  fi
+  [ -t 0 ] || return 0
+  local a u x
+  echo "Версии 3X-UI/Xray:"
+  echo "  1) Последние официальные версии 3X-UI и Xray [Enter]"
+  echo "  2) Выбрать версии номером из списка GitHub"
+  echo "  3) Ввести версии вручную"
+  read -r -p "Ваш выбор: " a || return 0
+  a="${a:-1}"
+  case "$a" in
+    1)
+      u="$(xui_tag_latest || true)"; x="$(xray_tag_latest || true)"
+      [ -n "$u" ] && XKIT_3XUI_TAG="$u"
+      [ -n "$x" ] && { XKIT_XRAY_VERSION="${x#v}"; XKIT_CORE_PIN="$XKIT_XRAY_VERSION"; }
+      log "Последние версии: 3X-UI ${XKIT_3XUI_TAG:-default}, Xray ${XKIT_XRAY_VERSION:-бандл панели}"
+      ;;
+    2)
+      u="$(version_pick xui)" || return 1
+      XKIT_3XUI_TAG="$u"
+      x="$(version_pick xray)" || return 1
+      XKIT_XRAY_VERSION="${x#v}"; XKIT_CORE_PIN="$XKIT_XRAY_VERSION"
+      ok "Выбрано: 3X-UI ${XKIT_3XUI_TAG} + Xray ${XKIT_XRAY_VERSION}"
+      ;;
+    3)
+      read -r -p "Версия 3X-UI (например 3.11.0): " u || return 1
+      u="$(version_norm "$u")" || return 1
+      XKIT_3XUI_TAG="v$u"
+      read -r -p "Версия Xray (Enter = бандл панели): " x || return 1
+      if [ -n "$x" ]; then XKIT_XRAY_VERSION="$(version_norm "$x")" || return 1; XKIT_CORE_PIN="$XKIT_XRAY_VERSION"; fi
+      ;;
+    *) return 0 ;;
+  esac
+  [ -n "${XKIT_XUI_SHA256:-}" ] || \
+    log "SHA-256 install.sh ${XKIT_3XUI_TAG:-} не закреплён — на шаге установки будет показан и потребует подтверждения"
+}
+
+#--- список/статус/установка/откат (мастер) -----------------------------------
+versions_list() { # доступные релизы (не манифест — его больше нет)
+  echo "3X-UI (GitHub, последние 5):"
+  local t i=1 x; t="$(xui_releases_list 5)"
+  if [ -n "$t" ]; then while IFS= read -r x; do printf '  %d) %s\n' "$i" "$x"; i=$((i+1)); done <<<"$t"; else echo "  (список недоступен — GitHub API лимит/сеть)"; fi
+  echo "Xray (GitHub, последние 5):"
+  i=1; t="$(xray_releases_list 5)"
+  if [ -n "$t" ]; then while IFS= read -r x; do printf '  %d) %s\n' "$i" "$x"; i=$((i+1)); done <<<"$t"; else echo "  (список недоступен — GitHub API лимит/сеть)"; fi
+  echo "Подсказка: Xray 26.6.27 — последнее ядро, совместимое со всеми клиентами (Mihomo/sing-box); новее — проверяйте сами."
+  echo "Установка: xkit versions install (выбор номером) | xkit versions latest | xkit versions install <3xui> <xray>"
+}
+versions_status() {
+  local x u; x="$(version_xray_current || true)"; u="$(version_xui_current || true)"
+  echo "3X-UI: ${u:-не установлен / версия неизвестна}"
+  echo "Xray:  ${x:-не установлен / версия неизвестна}"
+  [ -r "$XKIT_VERSION_STATE" ] && { versions_state_load; echo "Последний snapshot: ${XKIT_VERSION_SNAPSHOT:-неизвестен}"; }
+  return 0
+}
+
+versions_install() { # [xui xray] [--allow-downgrade]; без аргументов — выбор номером
+  require_root
+  local u x down=0 snap work stage xb uv
+  # без аргументов (или только флаги) — интерактивный выбор номером
+  if [ $# -eq 0 ] || [ "${1#--}" != "$1" ]; then
+    if [ -t 0 ]; then
+      u="$(version_pick xui "$(version_xui_current || true)")" || return 1
+      x="$(version_pick xray "$(version_xray_current || true)")" || return 1
+      u="${u#v}"; x="${x#v}"
+      set -- "$u" "$x" "$@"
+    else
+      err "Использование: xkit versions install <3xui> <xray> (или интерактивно в TTY)"; return 1
+    fi
+  fi
+  u="$(version_norm "${1:-}")" || { err "Использование: xkit versions install <3xui> <xray>"; return 1; }
+  x="$(version_norm "${2:-}")" || { err "Некорректная версия Xray"; return 1; }
+  shift 2 || true
+  while [ $# -gt 0 ]; do case "$1" in --allow-downgrade) down=1;; --allow-unlisted) ;; *) err "Неизвестный флаг: $1"; return 1;; esac; shift; done
+  command -v x-ui >/dev/null 2>&1 || [ -x /usr/local/x-ui/x-ui ] || die "3X-UI не установлен: выбор связки доступен при установке"
+  uv="$(version_xui_current || true)"
+  if [ -n "$uv" ] && dpkg --compare-versions "$u" lt "$uv" && [ "$down" != 1 ]; then
+    err "Downgrade 3X-UI $uv -> $u запрещён: схема БД может быть несовместима. --allow-downgrade только после внешнего бэкапа"; return 1
+  fi
+  if [ -f "$XUI_RESULT" ] && grep -q 'XUI_DB_TYPE=postgres' "$XUI_RESULT" 2>/dev/null && [ "${XKIT_ALLOW_POSTGRES_VERSION_CHANGE:-0}" != 1 ]; then
+    err "PostgreSQL не входит в файловый snapshot. Сделайте Backup в панели и явно задайте XKIT_ALLOW_POSTGRES_VERSION_CHANGE=1"; return 1
+  fi
+  [ -f /etc/x-ui/x-ui.db ] || [ -n "$uv" ] || warn "Установленная БД не найдена; проверьте тип БД панели"
+  # v8.1.4: если обе версии УЖЕ установлены — не качаем/не переустанавливаем зря.
+  local xcur; xcur="$(version_xray_current || true)"
+  if [ "$uv" = "$u" ] && [ "$xcur" = "$x" ]; then
+    ok "Связка 3X-UI $u + Xray $x уже установлена — пропускаю скачивание/переустановку"
+    return 0
+  fi
+  confirm "Установить связку 3X-UI $u + Xray $x с backup и автоматическим rollback? [y/N]" || return 1
+  version_arch || return 1
+  work="$(mktemp -d)" || return 1; stage="$work/stage"; mkdir -p "$stage"
+  local base="https://github.com/MHSanaei/3x-ui/releases/download/v${u}/x-ui-linux-${V_XUI}.tar.gz"
+  local xurl="https://github.com/XTLS/Xray-core/releases/download/v${x}/Xray-linux-${V_XRAY}.zip"
+  version_download_verified "$base" "${base}.sha256" "$work/xui.tar.gz" || { rm -rf "$work"; return 1; }
+  version_download_verified "$xurl" "${xurl}.dgst" "$work/xray.zip" || { rm -rf "$work"; return 1; }
+  version_extract_xui "$work/xui.tar.gz" "$stage" || { rm -rf "$work"; err "Небезопасный/битый архив 3X-UI"; return 1; }
+  [ -x "$stage/x-ui/x-ui" ] || chmod +x "$stage/x-ui/x-ui" 2>/dev/null || true
+  [ -x "$stage/x-ui/x-ui" ] || { rm -rf "$work"; err "В архиве нет x-ui"; return 1; }
+  python3 - "$work/xray.zip" "$work" <<'PY' || { rm -rf "$work"; return 1; }
+import sys,zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    n=next((n for n in z.namelist() if n.rstrip('/')=='xray'),None)
+    if n is None: raise SystemExit('xray missing')
+    z.extract(n,sys.argv[2])
+PY
+  chmod 755 "$work/xray" || { rm -rf "$work"; return 1; }
+  "$work/xray" version >/dev/null 2>&1 || { rm -rf "$work"; err "Скачанный Xray не запускается"; return 1; }
+  snap="$(version_snapshot)" || { rm -rf "$work"; err "Snapshot не создан — отмена"; return 1; }
+  systemctl stop x-ui 2>/dev/null || true
+  mkdir -p /usr/local/x-ui
+  cp -a "$stage/x-ui/." /usr/local/x-ui/ || { version_snapshot_restore "$snap"; rm -rf "$work"; return 1; }
+  xb="$(version_xray_bin)" || { version_snapshot_restore "$snap"; rm -rf "$work"; return 1; }
+  install -m 755 "$work/xray" "$xb" || { version_snapshot_restore "$snap"; rm -rf "$work"; return 1; }
+  rm -rf "$work"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl restart x-ui 2>/dev/null || true
+  sleep 3
+  if version_probes "$x" "$u"; then
+    versions_state_save "$u" "$x" "$snap" || return 1
+    ok "Связка установлена и прошла локальные probes: 3X-UI $u + Xray $x"
+    log "Snapshot прежней связки: $snap"
+  else
+    err "Проверки не прошли — откат прежней связки"
+    version_snapshot_restore "$snap" || return 1
+    sleep 2
+    systemctl is-active --quiet x-ui || { err "Rollback не поднял x-ui; snapshot: $snap"; return 1; }
+    ok "Прежняя связка восстановлена"
+    return 1
+  fi
+}
+
+# Последние официальные версии обеих компонент (одно подтверждение).
+versions_latest() {
+  require_root
+  local u x
+  u="$(xui_tag_latest || true)"; x="$(xray_tag_latest || true)"
+  [ -n "$u" ] && [ -n "$x" ] || { err "Не удалось определить последние версии (GitHub API лимит/сеть). Задайте вручную: xkit versions install <3xui> <xray>"; return 1; }
+  warn "Новейшее ядро Xray может ломать REALITY у клиентов Mihomo/sing-box — проверьте подключение после установки."
+  log "Последние официальные: 3X-UI ${u} + Xray ${x}"
+  versions_install "${u#v}" "${x#v}"
+}
+
+versions_rollback() {
+  require_root
+  versions_state_load
+  local d="${1:-${XKIT_VERSION_SNAPSHOT:-}}"
+  [ -n "$d" ] && [ -d "$d" ] || { err "Нет snapshot для отката"; return 1; }
+  confirm "Восстановить прежние 3X-UI/Xray и БД из $d? [y/N]" || return 1
+  version_snapshot_restore "$d" || return 1
+  sleep 3
+  systemctl is-active --quiet x-ui || { err "x-ui не активен после rollback"; return 1; }
+  versions_status
+}
+
+# Старая команда остаётся совместимой (смена только Xray при текущей панели).
+core_pin_install() {
+  local v u; v="$(version_norm "${1:-${XKIT_CORE_PIN:-}}")" || { err "Некорректная версия Xray"; return 1; }
+  u="$(version_xui_current || true)"
+  [ -n "$u" ] || { err "Версия 3X-UI неизвестна; используйте versions install <3xui> <xray>"; return 1; }
+  versions_install "$u" "$v"
+}
+
+#--- версии нод (переехало из 37_nodes_upgrade_v772.sh, v9.1.0) ---------------
+# тег 3X-UI на мастере (из бинарника; пусто = не установлен)
+node_xui_tag_master() { version_xui_current; }
+
+# версии компонентов ноды -> TSV: xui xray xkit-marker
+node_versions_one() { # $1 rec -> TSV на stdout
+  local rec="$1" v="" x="" k=""
+  v="$(node_ssh "$rec" '/usr/local/x-ui/x-ui -v 2>/dev/null || x-ui version 2>/dev/null || true' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  x="$(node_ssh "$rec" '"$(ls -1 /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -n1)" version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1' 2>/dev/null)"
+  k="$(node_ssh "$rec" 'test -f /etc/xkit/.installed && cat /etc/xkit/.installed 2>/dev/null || echo "-"' 2>/dev/null)"
+  printf '%s\t%s\t%s' "${v:-?}" "${x:-?}" "${k:-?}"
+}
+
+nodes_versions() { # $1 имя|all
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  local want="${1:-all}" arr n rec mv mlatest="" row v x k
+  arr="$(nodes_load)"
+  [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет"; return 0; }
+  mv="$(node_xui_tag_master)"
+  mlatest="$(xui_tag_from_redirect || true)"
+  echo ""
+  printf '%-12s %-10s %-12s %-12s %s\n' "НОДА" "3X-UI" "XRAY" "vs МАСТЕР" "ПОСЛЕДНИЙ"
+  echo "-------------------------------------------------------------------"
+  while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    n="$(jq -r '.name' <<<"$rec")"
+    [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
+    row="$(node_versions_one "$rec")"
+    IFS=$'\t' read -r v x k <<<"$row"
+    local cmp="-"
+    [ "$v" = "?" ] || [ -z "$mv" ] || {
+      cmp="совпадает"
+      [ "$v" = "$mv" ] || cmp="$([ "$(printf '%s\n%s\n' "$v" "$mv" | sort -V | tail -1)" = "$mv" ] && echo "отстаёт" || echo "новее")"
+    }
+    local mark=""
+    [ "$v" != "?" ] && [ -n "$mlatest" ] && [ "$v" != "${mlatest#v}" ] && [ "$(printf '%s\n%s\n' "$v" "${mlatest#v}" | sort -V | tail -1)" = "${mlatest#v}" ] && mark="← доступно ${mlatest}"
+    printf '%-12s %-10s %-12s %-12s %s\n' "$n" "$v" "$x" "$cmp" "$mark"
+  done < <(jq -c '.[]' <<<"$arr")
+  echo "-------------------------------------------------------------------"
+  [ -n "$mv" ] && echo "Мастер: 3X-UI ${mv}, Xray $(version_xray_current || echo '?')" || echo "Мастер: 3X-UI не установлен"
+  [ -n "$mlatest" ] && echo "Последний релиз 3X-UI: ${mlatest} (обновление: xkit nodes upgrade <имя|all>)"
+  return 0
+}
+
+# обновление 3X-UI на ноде официальным установщиком
+node_upgrade_one() { # $1 rec, $2 тег (пусто = как на мастере/последний)
+  local rec="$1" tag="${2:-}" n u url ts vnew
+  n="$(jq -r '.name' <<<"$rec")"
+  [ -n "$tag" ] || tag="$(node_xui_tag_master)"
+  [ -n "$tag" ] || tag="$(xui_tag_from_redirect || true)"
+  [ -n "$tag" ] || { err "${n}: не определён тег 3X-UI (укажите: xkit nodes upgrade ${n} vX.Y.Z)"; return 1; }
+  tag="$(version_norm "${tag#v}")" || { err "${n}: '$tag' не похож на тег (vX.Y.Z)"; return 1; }
+  tag="v${tag}"
+  u="https://raw.githubusercontent.com/mhsanaei/3x-ui/${tag}/install.sh"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  log "${n}: обновляю 3X-UI до ${tag} (официальный установщик, бэкап сначала)..."
+  node_ssh "$rec" "XUI_URL='${u}' TS='${ts}' bash -s" <<'EOS' || { err "${n}: обновление 3X-UI не удалось (бэкап: /root/x-ui-backup-\${TS}.tar.gz)"; return 1; }
+set -u
+# 0. бэкап /etc/x-ui (600) — откат: tar -xzf /root/x-ui-backup-${TS}.tar.gz -C / && systemctl restart x-ui
+if [ -d /etc/x-ui ]; then
+  tar -czf /root/x-ui-backup-${TS}.tar.gz -C / etc/x-ui 2>/dev/null || true
+  chmod 600 /root/x-ui-backup-${TS}.tar.gz 2>/dev/null || true
+fi
+# 1. скачать установщик и проверить синтаксис (K-02, как при добавлении ноды)
+DL="$(mktemp)"
+curl -fsSL "${XUI_URL:?}" -o "$DL" || { echo "ERR: не удалось скачать ${XUI_URL}"; rm -f "$DL"; exit 1; }
+bash -n "$DL" || { echo "ERR: install.sh ${tag} не проходит bash -n"; rm -f "$DL"; exit 1; }
+# 2. сохранить webListen (установщик его затирает) и вернуть после
+WL="$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webListen'" 2>/dev/null || echo 127.0.0.1)"
+# 3. официальный установщик, неинтерактивно
+XUI_NONINTERACTIVE=1 bash "$DL" </dev/null
+rm -f "$DL"
+# 4. webListen обратно (панель не должна светиться наружу после апгрейда)
+if command -v sqlite3 >/dev/null 2>&1 && [ -f /etc/x-ui/x-ui.db ]; then
+  sqlite3 /etc/x-ui/x-ui.db "INSERT OR REPLACE INTO settings (key,value) VALUES ('webListen','${WL}');"
+fi
+systemctl restart x-ui
+# 5. готовность панели (webListen=127.0.0.1, порт из БД; до 60 сек)
+P="$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null)"
+[ -n "$P" ] || P=54321
+up=0; for i in $(seq 1 30); do
+  ss -ltnH 2>/dev/null | grep -q "127.0.0.1:${P} " && { up=1; break; }
+  sleep 2
+done
+[ "$up" = 1 ] || { echo "ERR: панель не поднялась на 127.0.0.1:${P} за 60 сек — проверьте: journalctl -u x-ui -n 30"; exit 1; }
+echo "OK-UPGRADE ${tag}"
+EOS
+  vnew="$(node_ssh "$rec" '/usr/local/x-ui/x-ui -v 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1' 2>/dev/null)"
+  ok "${n}: 3X-UI обновлён до ${tag} (установлено: ${vnew:-?}); бэкап: /root/x-ui-backup-${ts}.tar.gz"
+  audit_event nodes.upgrade "$n" ok "$tag"
+  return 0
+}
+
+nodes_upgrade() { # $1 имя|all, [$2 vX.Y.Z]; без тега в TTY — выбор номером
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  local want="${1:-}" tag="${2:-}" arr n rec any=0 rc=0
+  [ -n "$want" ] || { err "xkit nodes upgrade <имя|all> [vX.Y.Z]"; return 1; }
+  # v9.1.0: без тега в интерактиве — выбор номером (Enter = как на мастере)
+  if [ -z "$tag" ] && [ -t 0 ] && [ "${XKIT_YES:-0}" != 1 ]; then
+    local _mt; _mt="$(node_xui_tag_master || true)"
+    tag="$(node_version_select "${_mt:+v$_mt}")" || tag=""
+    node_version_hint
+  fi
+  arr="$(nodes_load)"
+  [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет"; return 0; }
+  while IFS= read -r rec; do
+    [ -z "$rec" ] && continue
+    n="$(jq -r '.name' <<<"$rec")"
+    [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
+    any=1
+    node_upgrade_one "$rec" "$tag" || rc=1
+  done < <(jq -c '.[]' <<<"$arr")
+  [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes upgrade <имя|all> [vX.Y.Z])"; return 1; }
+  return "$rc"
+}
+
+# Выбор версии 3X-UI для ноды номером (один раз при установке / при смене).
+# Xray на ноде меняется в самой панели (Настройки -> Xray) — отдельного выбора
+# ядра для ноды нет (решение владельца v9.1.0: проще и меньше риска).
+node_version_select() { # $1 default-tag (необязательно) -> тег vX.Y.Z
+  local def="${1:-}" tag
+  tag="$(version_pick xui "$def")" || return 1
+  printf '%s' "$tag"
+}
+node_version_hint() {
+  log "Подсказка: версию Xray на ноде можно сменить в самой панели 3X-UI (Настройки -> Xray)."
+}
+
+# Последние официальные версии на ноде: панель = последний тег 3X-UI.
+# Xray бандлится установщиком панели; смена ядра — в панели ноды.
+nodes_latest() { # $1 имя|all
+  load_xkit_env || die "Сначала установка (пункт 1)"
+  local want="${1:-}" tag
+  [ -n "$want" ] || { err "xkit nodes latest <имя|all>"; return 1; }
+  tag="$(xui_tag_latest || true)"
+  [ -n "$tag" ] || { err "Не удалось определить последний тег 3X-UI (GitHub API лимит/сеть)"; return 1; }
+  log "Последний официальный 3X-UI: ${tag} (Xray — бандл установщика; смена ядра — в панели ноды)"
+  nodes_upgrade "$want" "$tag"
+}
 #=========================== XKIT 7: ЭКСПЛУАТАЦИЯ И ДИАГНОСТИКА ===============
 # Все состояния пишутся атомарно в своём каталоге. В журнал/дашборд/общий
 # snapshot секреты не передаются. Отложенный restart — явная операция.
@@ -13908,132 +14069,6 @@ nodes_freeze_show() {
         "$n" "$(_freeze_verdict_ru "$v")" "$mb" "$tr" "$(date -d "@${at}" '+%F %R' 2>/dev/null || echo '-')"
     done
   ok "Файл вердиктов: $XKIT_FREEZE_STATE (замер валиден для провайдера/региона мастера)"
-}
-#================= XKIT 7.7.2: ВЕРСИИ/ОБНОВЛЕНИЕ КОМПОНЕНТОВ НОД =================
-# Проблема (живой кейс 7.7.1): пользователь не знает, какие версии 3X-UI/Xray
-# стоят на нодах, и не может их обновить — версии были видны только на мастере
-# (xkit versions status), а ноды оставались чёрным ящиком.
-#
-# `xkit nodes versions <имя|all>` — таблица: 3X-UI/Xray/XKIT каждой ноды +
-# сравнение с мастером (отстаёт/совпадает) и последний тег релиза 3X-UI.
-# `xkit nodes upgrade <имя|all> [vX.Y.Z]` — обновление 3X-UI на ноде ОФИЦИАЛЬНЫМ
-# установщиком (тот же URL-контракт, что при добавлении ноды):
-#   - тег по умолчанию = тег мастера (единая версия кластера) или последний;
-#   - бэкап /etc/x-ui -> /root/x-ui-backup-<ts>.tar.gz (600) ДО установки;
-#   - установщик гоняется с XUI_NONINTERACTIVE=1 </dev/null (K-02: bash -n пин);
-#   - после установки: панель должна подняться на 127.0.0.1:<порт> (webListen
-#     сохраняется в БД, таймаут 60с) — иначе WARN и совет проверить вручную;
-#   - реестр nodes.json НЕ трогается: порты/пути/токены переживают обновление.
-# Восстановление после неудачного апгрейда: распаковать бэкап и
-# systemctl restart x-ui.
-
-# тег 3X-UI на мастере (из бинарника; пусто = не установлен)
-node_xui_tag_master() { version_xui_current; }
-
-# версии компонентов ноды -> TSV: xui xray xkit-marker
-node_versions_one() { # $1 rec -> TSV на stdout
-  local rec="$1" v="" x="" k=""
-  v="$(node_ssh "$rec" '/usr/local/x-ui/x-ui -v 2>/dev/null || x-ui version 2>/dev/null || true' 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
-  x="$(node_ssh "$rec" '"$(ls -1 /usr/local/x-ui/bin/xray-linux-* 2>/dev/null | head -n1)" version 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1' 2>/dev/null)"
-  k="$(node_ssh "$rec" 'test -f /etc/xkit/.installed && cat /etc/xkit/.installed 2>/dev/null || echo "-"' 2>/dev/null)"
-  printf '%s\t%s\t%s' "${v:-?}" "${x:-?}" "${k:-?}"
-}
-
-nodes_versions() { # $1 имя|all
-  load_xkit_env || die "Сначала установка (пункт 1)"
-  local want="${1:-all}" arr n rec mv mlatest="" row v x k
-  arr="$(nodes_load)"
-  [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет"; return 0; }
-  mv="$(node_xui_tag_master)"
-  mlatest="$(xui_tag_from_redirect || true)"
-  echo ""
-  printf '%-12s %-10s %-12s %-12s %s\n' "НОДА" "3X-UI" "XRAY" "vs МАСТЕР" "ПОСЛЕДНИЙ"
-  echo "-------------------------------------------------------------------"
-  while IFS= read -r rec; do
-    [ -z "$rec" ] && continue
-    n="$(jq -r '.name' <<<"$rec")"
-    [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
-    row="$(node_versions_one "$rec")"
-    IFS=$'\t' read -r v x k <<<"$row"
-    local cmp="-"
-    [ "$v" = "?" ] || [ -z "$mv" ] || {
-      cmp="совпадает"
-      [ "$v" = "$mv" ] || cmp="$([ "$(printf '%s\n%s\n' "$v" "$mv" | sort -V | tail -1)" = "$mv" ] && echo "отстаёт" || echo "новее")"
-    }
-    local mark=""
-    [ "$v" != "?" ] && [ -n "$mlatest" ] && [ "$v" != "${mlatest#v}" ] && [ "$(printf '%s\n%s\n' "$v" "${mlatest#v}" | sort -V | tail -1)" = "${mlatest#v}" ] && mark="← доступно ${mlatest}"
-    printf '%-12s %-10s %-12s %-12s %s\n' "$n" "$v" "$x" "$cmp" "$mark"
-  done < <(jq -c '.[]' <<<"$arr")
-  echo "-------------------------------------------------------------------"
-  [ -n "$mv" ] && echo "Мастер: 3X-UI ${mv}, Xray $(version_xray_current || echo '?')" || echo "Мастер: 3X-UI не установлен"
-  [ -n "$mlatest" ] && echo "Последний релиз 3X-UI: ${mlatest} (обновление: xkit nodes upgrade <имя|all>)"
-  return 0
-}
-
-# обновление 3X-UI на ноде официальным установщиком
-node_upgrade_one() { # $1 rec, $2 тег (пусто = как на мастере/последний)
-  local rec="$1" tag="${2:-}" n u url ts vnew
-  n="$(jq -r '.name' <<<"$rec")"
-  [ -n "$tag" ] || tag="$(node_xui_tag_master)"
-  [ -n "$tag" ] || tag="$(xui_tag_from_redirect || true)"
-  [ -n "$tag" ] || { err "${n}: не определён тег 3X-UI (укажите: xkit nodes upgrade ${n} vX.Y.Z)"; return 1; }
-  tag="$(version_norm "${tag#v}")" || { err "${n}: '$tag' не похож на тег (vX.Y.Z)"; return 1; }
-  tag="v${tag}"
-  u="https://raw.githubusercontent.com/mhsanaei/3x-ui/${tag}/install.sh"
-  ts="$(date +%Y%m%d-%H%M%S)"
-  log "${n}: обновляю 3X-UI до ${tag} (официальный установщик, бэкап сначала)..."
-  node_ssh "$rec" "XUI_URL='${u}' TS='${ts}' bash -s" <<'EOS' || { err "${n}: обновление 3X-UI не удалось (бэкап: /root/x-ui-backup-\${TS}.tar.gz)"; return 1; }
-set -u
-# 0. бэкап /etc/x-ui (600) — откат: tar -xzf /root/x-ui-backup-${TS}.tar.gz -C / && systemctl restart x-ui
-if [ -d /etc/x-ui ]; then
-  tar -czf /root/x-ui-backup-${TS}.tar.gz -C / etc/x-ui 2>/dev/null || true
-  chmod 600 /root/x-ui-backup-${TS}.tar.gz 2>/dev/null || true
-fi
-# 1. скачать установщик и проверить синтаксис (K-02, как при добавлении ноды)
-DL="$(mktemp)"
-curl -fsSL "${XUI_URL:?}" -o "$DL" || { echo "ERR: не удалось скачать ${XUI_URL}"; rm -f "$DL"; exit 1; }
-bash -n "$DL" || { echo "ERR: install.sh ${tag} не проходит bash -n"; rm -f "$DL"; exit 1; }
-# 2. сохранить webListen (установщик его затирает) и вернуть после
-WL="$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webListen'" 2>/dev/null || echo 127.0.0.1)"
-# 3. официальный установщик, неинтерактивно
-XUI_NONINTERACTIVE=1 bash "$DL" </dev/null
-rm -f "$DL"
-# 4. webListen обратно (панель не должна светиться наружу после апгрейда)
-if command -v sqlite3 >/dev/null 2>&1 && [ -f /etc/x-ui/x-ui.db ]; then
-  sqlite3 /etc/x-ui/x-ui.db "INSERT OR REPLACE INTO settings (key,value) VALUES ('webListen','${WL}');"
-fi
-systemctl restart x-ui
-# 5. готовность панели (webListen=127.0.0.1, порт из БД; до 60 сек)
-P="$(sqlite3 /etc/x-ui/x-ui.db "SELECT value FROM settings WHERE key='webPort'" 2>/dev/null)"
-[ -n "$P" ] || P=54321
-up=0; for i in $(seq 1 30); do
-  ss -ltnH 2>/dev/null | grep -q "127.0.0.1:${P} " && { up=1; break; }
-  sleep 2
-done
-[ "$up" = 1 ] || { echo "ERR: панель не поднялась на 127.0.0.1:${P} за 60 сек — проверьте: journalctl -u x-ui -n 30"; exit 1; }
-echo "OK-UPGRADE ${tag}"
-EOS
-  vnew="$(node_ssh "$rec" '/usr/local/x-ui/x-ui -v 2>/dev/null | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" | head -n1' 2>/dev/null)"
-  ok "${n}: 3X-UI обновлён до ${tag} (установлено: ${vnew:-?}); бэкап: /root/x-ui-backup-${ts}.tar.gz"
-  audit_event nodes.upgrade "$n" ok "$tag"
-  return 0
-}
-
-nodes_upgrade() { # $1 имя|all, [$2 vX.Y.Z]
-  load_xkit_env || die "Сначала установка (пункт 1)"
-  local want="${1:-}" tag="${2:-}" arr n rec any=0 rc=0
-  [ -n "$want" ] || { err "xkit nodes upgrade <имя|all> [vX.Y.Z]"; return 1; }
-  arr="$(nodes_load)"
-  [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет"; return 0; }
-  while IFS= read -r rec; do
-    [ -z "$rec" ] && continue
-    n="$(jq -r '.name' <<<"$rec")"
-    [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
-    any=1
-    node_upgrade_one "$rec" "$tag" || rc=1
-  done < <(jq -c '.[]' <<<"$arr")
-  [ "$any" = "1" ] || { err "Нода '${want}' не найдена (xkit nodes upgrade <имя|all> [vX.Y.Z])"; return 1; }
-  return "$rc"
 }
 #=========================== TELEGRAM ТРАНСПОРТ (v8.0.0) =====================
 # РФ-мастер: api.telegram.org заблокирован. Бот ходит через ноды:
