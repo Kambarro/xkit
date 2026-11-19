@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.6"
+XKIT_VERSION="9.1.7"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6086,53 +6086,60 @@ for n in nodes:
                 "streamSettings": stream, "mux": {"enabled": False, "concurrency": -1}})
 tpl["outbounds"] = generated + outb
 
-# v9.1.6 (живой баг): мастер резолвит домены в IPv6 первым (DNS отдаёт AAAA),
-# а IPv6 на РФ-мастере часто мёртв -> IPIfNonMatch резолвит в IPv6 -> geo-правила
-# не срабатывают / соединения виснут -> не-RU падает в catch-all blocked («всё
-# встало»), RU-сайты могут уезжать через ноду. Фикс: явный DNS с queryStrategy
-# UseIPv4 + freedom-direct UseIPv4 (резолв и direct-трафик только в рабочий IPv4).
+# v9.1.6: мастер резолвит домены в IPv6 первым (DNS отдаёт AAAA), а IPv6 на
+# РФ-мастере часто мёртв -> IPIfNonMatch резолвит в IPv6 -> geo-правила не
+# срабатывают / соединения виснут. Фикс: явный DNS queryStrategy=UseIPv4
+# (резолв только в рабочий IPv4). freedom domainStrategy НЕ трогаем — DNS уже
+# отдаёт IPv4, принудительный UseIPv4 у freedom не нужен (рабочий тест-конфиг).
 dns = tpl.get("dns") or {}
 dns["queryStrategy"] = "UseIPv4"
 if not dns.get("servers"):
     dns["servers"] = ["1.1.1.1", "8.8.8.8"]
 tpl["dns"] = dns
-for o in tpl["outbounds"]:
-    if o.get("protocol") == "freedom":
-        o.setdefault("settings", {})["domainStrategy"] = "UseIPv4"
 
 r = tpl.setdefault("routing", {})
-# v7.7.1: AsIs не проверяет geoip для доменов — RU-IP, пришедшие доменом,
-# уезжали через ноду. IPIfNonMatch: домен без совпадения резолвится и
-# проверяется по geoip (sniffing в pool-инбаунде даёт домены).
+# IPIfNonMatch: домен без совпадения резолвится (DNS UseIPv4) и проверяется по
+# geoip — RU-IP, пришедшие доменом, не уезжают через ноду.
 r["domainStrategy"] = "IPIfNonMatch"
 rules = r.get("rules") or []
+# v9.1.7 (рабочий тест-конфиг Сергея): RU-правила РАЗДЕЛЬНЫЕ (IP отдельно,
+# домены отдельно) на КАСТОМНЫХ geo-файлах ext:geoip_RU.dat / geosite_RU.dat
+# (точнее стандартных geoip:ru/geosite:category-ru: только RU-доступное внутри).
+# Сохраняем существующие RU-правила пользователя (не перетираем кастомные),
+# снимаем только старый combined-шаблон xkit (geosite:category-ru+geoip:ru).
 rules = [x for x in rules if x.get("balancerTag") != "XKIT_POOL"]
-# v7.7.1: RU -> direct всегда, в т.ч. соло (без pool/нод): сервер в RU
-# отдаёт RU-трафик напрямую с себя. Идемпотентно: старое правило снимаем.
 rules = [x for x in rules if not (x.get("outboundTag") == "direct"
          and "geosite:category-ru" in x.get("domain", []) and "geoip:ru" in x.get("ip", []))]
-rules.insert(0, {"domain": ["geosite:category-ru"], "ip": ["geoip:ru"], "outboundTag": "direct"})
+# существующие RU direct-правила (кастомные ext: или стандартные) сохраняем
+ru_ip = [x for x in rules if x.get("outboundTag") == "direct" and x.get("ip") and not x.get("domain")]
+ru_dom = [x for x in rules if x.get("outboundTag") == "direct" and x.get("domain") and not x.get("ip")]
+# если RU-правил нет вовсе (свежая установка) — ставим дефолт как в рабочем конфиге
+if not ru_ip:
+    ru_ip = [{"type": "field", "outboundTag": "direct", "ip": ["ext:geoip_RU.dat:ru"]}]
+if not ru_dom:
+    ru_dom = [{"type": "field", "outboundTag": "direct",
+               "domain": ["ext:geosite_RU.dat:ru-available-only-inside",
+                          "regexp:.*\\.ru$", "regexp:.*\\.su$", ".рф"]}]
+# порядок (рабочий тест-конфиг): api -> RU-IP -> RU-домены -> каскад -> private -> catch-all
+api_rules = [x for x in rules if x.get("inboundTag") == ["api"] or x.get("outboundTag") == "api"]
+if not api_rules:
+    api_rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
+private_rules = [x for x in rules if x.get("ip") == ["geoip:private"]]
+other = [x for x in rules if x not in api_rules and x not in ru_ip
+         and x not in ru_dom and x not in private_rules
+         and not (not x.get("inboundTag") and not x.get("domain") and not x.get("ip")
+                  and x.get("outboundTag") in ("direct", "blocked")
+                  and (x.get("port") == "0-65535" or not x.get("port")))]
+new_rules = api_rules + ru_ip + ru_dom
 if pool_tag and nodes:
-    # v8.0.7: в балансир заворачиваются ВСЕ клиентские входы (pool + клиентские
-    # инбаунды). RU->direct выше уже глобально отсекает RU; остальное -> ноды.
-    # Служебные inbound (api) и node-туннели НЕ включаем — только клиентские.
+    # каскад ПОСЛЕ RU-правил: RU отсекается в direct до balancer, не-RU -> ноды
     cascade_tags = [pool_tag] + [t for t in client_tags if t != pool_tag]
-    rules.insert(1, {"inboundTag": cascade_tags, "balancerTag": "XKIT_POOL"})
-# v9.1.3 (живой баг, эталон Сергея): catch-all зависит от режима.
-# КАСКАД (есть ноды): catch-all = blocked. Иначе при «мёртвой» ноде (observatory
-# не может пропинговать ноду — напр. IPv6 на ноде не работает) leastLoad не
-# выбирает ноду и не-RU трафик УТЕКАЛ в direct с РФ-IP мастера («трафик не туда»).
-# Эталон: catch-all blocked — не-RU вне каскада честно блокируется, а не уходит
-# с российского IP. СОЛО (0 нод): catch-all = direct (сервер в RU отдаёт не-RU
-# с себя — блокировать нечего, нод нет).
-# xray 26.x отвергает правила без полей ("no effective fields"), а панель
-# выкидывает port без type:field — catch-all = type:field + port 0-65535.
-rules = [x for x in rules if not (not x.get("inboundTag") and not x.get("domain")
-         and not x.get("ip") and x.get("outboundTag") in ("direct", "blocked")
-         and (x.get("port") == "0-65535" or not x.get("port")))]
+    new_rules.append({"type": "field", "inboundTag": cascade_tags, "balancerTag": "XKIT_POOL"})
+new_rules += other + private_rules
+# catch-all: каскад -> blocked (не-RU вне каскада не утекает с РФ-IP), соло -> direct
 _catch = "blocked" if (pool_tag and nodes) else "direct"
-rules.append({"type": "field", "port": "0-65535", "outboundTag": _catch})
-r["rules"] = rules
+new_rules.append({"type": "field", "port": "0-65535", "outboundTag": _catch})
+r["rules"] = new_rules
 
 bal = r.get("balancers") or []
 bal = [b for b in bal if b.get("tag") != "XKIT_POOL"]
@@ -15060,6 +15067,20 @@ proto_ws_create() { # клиентский VLESS WS TLS за nginx (443)
   # маршрут за nginx: local ws path -> 127.0.0.1:port (TLS на 443)
   routes_upsert "$ibid" local ws "$path" "127.0.0.1:${p}" "inbound-${p}"
   regen_conf_and_apply || { api_del_inbound "$ibid" >/dev/null 2>&1 || true; routes_del "$ibid"; err "nginx не применил WS location — inbound удалён"; return 1; }
+  # v9.1.7 (живой баг): host-группа (v3-аналог externalProxy) СРАЗУ при создании —
+  # иначе нативная подписка панели генерит ссылку на 127.0.0.1:port без TLS
+  # (порт закрыт снаружи), а не на HOST:443+tls. Фронт nginx уже пробрасывает
+  # path -> 127.0.0.1:port; не хватало только объявления внешнего входа.
+  if [ "$API_V3" = "1" ]; then
+    v3_host_upsert "$ibid" "$XKIT_HOST" 443 "tls" || \
+      warn "host-группа WS не создалась — ссылки панели покажут порт; выполните: xkit external-proxy"
+  else
+    local fresh; fresh="$(api_get_inbound "$ibid" 2>/dev/null)" || true
+    if [ -n "$fresh" ]; then
+      fresh="$(jq -c --arg d "$XKIT_HOST" '.externalProxy = [{"dest":$d,"port":443,"forceTls":"tls","fingerprint":"chrome","alpn":["http/1.1"],"remark":"xkit"}]' <<<"$fresh")"
+      api_update_inbound "$ibid" "$fresh" >/dev/null 2>&1 || true
+    fi
+  fi
   ok "VLESS WS TLS создан: ${XKIT_HOST}:443${path} (за nginx, сайт-прикрытие на /)"
   sub_regen_quiet || true
   nodes_cascade_sync   # новый клиентский вход сразу в каскад (не-RU -> ноды)
