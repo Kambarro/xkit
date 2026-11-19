@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.3"
+XKIT_VERSION="9.1.4"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -14616,9 +14616,17 @@ tg_bot_confirm() { # $1 chat, $2 action-key, $3 text
 }
 
 # --- длинные операции через systemd-run ---
-tg_bot_run_long() { # $1 chat, $2 unit-name, $3 cmd..., $4 label
-  local chat="$1" unit="$2" label="$4"; shift 4
-  local cmd="$*" err rc
+tg_bot_run_long() { # $1 chat, $2 unit-name, $3 cmd (целиком), $4 label
+  local chat="$1" unit="$2" cmd="$3" label="$4" err rc
+  # v9.1.4 (живой баг): раньше cmd собирался из хвоста аргументов после сдвига,
+  # но все вызовы передают cmd как ОДИН аргумент $3 -> хвост пуст -> cmd пустой ->
+  # `bash -c " > file"` выполнял пустоту (интерактивное меню вместо команды).
+  # Ломало ВСЕ длинные операции бота (update/reboot/backup/survey/cert/...).
+  # cmd берём из $3 напрямую; пустую команду не запускаем (защита от регресса).
+  if [ -z "$cmd" ]; then
+    tg_bot_reply "$chat" "❌ Внутренняя ошибка: пустая команда для $label"
+    return 1
+  fi
   # уникальное имя юнита: повторное нажатие не падает из-за коллизии
   unit="${unit}-$(date +%s)"
   tg_bot_reply "$chat" "⏳ Запускаю: $label (результат по готовности)…"
