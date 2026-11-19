@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.2.4"
+XKIT_VERSION="8.2.5"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -7620,10 +7620,9 @@ node_hide_one() { # $1 имя|all
     n="$(jq -r '.name' <<<"$rec")"
     [ "$want" = "all" ] || [ "$want" = "$n" ] || continue
     any=1
-    if [ "$(jq -r '.panel.hidden // false' <<<"$rec")" = "true" ]; then
-      ok "${n}: панель уже спрятана (https://$(jq -r '.host' <<<"$rec"):443$(jq -r '.panel.base' <<<"$rec"))"
-      continue
-    fi
+    # v8.2.5: node_hide_panel сам обрабатывает уже скрытую ноду (обновляет
+    # устаревший ssl_certificate до LE live + переснимает пин). Раньше здесь
+    # был early-continue «уже спрятана» — фикс 8.2.4 не вызывался (живой баг).
     if hrec="$(node_hide_panel "$rec")"; then
       nodes_load | jq -c --argjson r "$hrec" 'map(if .name==$r.name then $r else . end)' | _xkit_atomic_write "$XKIT_NODES" || { rc=1; continue; }
       node_panel_sync "$n" || warn "${n}: повторите xkit nodes panel-sync ${n}"
