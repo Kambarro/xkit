@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v9.1.0 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v9.1.1 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -151,12 +151,9 @@ proto_xhttp_create() {
   require_root; load_xkit_env || die "Сначала установка XKIT"; kit_session || return 1
   proto_reality_target_pick || return 1
   local p path uuid subid email sid priv pub
+  # v9.1.1: порт и path случайные, без вопросов (спрятано за nginx)
   p="$(rand_free_port 10000 60000)" || return 1
-  read -r -p "Публичный порт XHTTP [${p}]: " pin; p="${pin:-$p}"
-  is_port "$p" || { err "Некорректный порт"; return 1; }
-  ! port_busy "$p" || { err "Порт $p занят"; return 1; }
   path="/xh-$(rand_str 8)"
-  read -r -p "XHTTP path [${path}]: " pin; path="${pin:-$path}"
   is_nginx_path "$path" || { err "Небезопасный XHTTP path"; return 1; }
   read -r priv pub <<<"$(api_get_new_x25519)"
   [ -n "$priv" ] && [ -n "$pub" ] || { err "Нет ключей x25519"; return 1; }
@@ -254,7 +251,7 @@ proto_hy2_install() {
     fi
   fi
   local p; p="$(proto_default_udp_port 8443)" || return 1
-  read -r -p "UDP-порт Hysteria 2 [${p}]: " pin; p="${pin:-$p}"; is_port "$p" || return 1
+  # v9.1.1: UDP-порт из профиля/случайный, без вопроса
   proto_udp_free "$p" || { err "UDP-порт $p уже занят"; return 1; }
   camo_site_install || { err 'Локальный camo для Hysteria 2 не создан'; return 1; }
   HY2_PORT="$p"; HY2_AUTH="$(rand_str 24)"; HY2_OBFS="$(rand_str 24)"
@@ -517,7 +514,7 @@ proto_awg_install() {
     warn 'PPA amnezia раздаёт 3.1 с 12.08.2026: apt-get update && apt-get install --only-upgrade amneziawg'
   fi
   local p; p="$(proto_default_udp_port 443)" || return 1
-  read -r -p "UDP-порт AmneziaWG [${p}]: " pin; p="${pin:-$p}"; is_port "$p" || return 1
+  # v9.1.1: UDP-порт из профиля/случайный, без вопроса
   proto_udp_free "$p" || { err "UDP-порт $p уже занят"; return 1; }
   local dev priv pub psk old_dev
   dev="$(ip route show default 2>/dev/null | awk '/default/{print $5;exit}')"

@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.0"
+XKIT_VERSION="9.1.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -436,6 +436,19 @@ input_clean() { # $1 сырой ввод -> очищенный в stdout (cntrl 
   printf '%s' "$s"
 }
 
+# v9.1.1: для СТРУКТУРИРОВАННЫХ латинских полей (имя/хост/порт/path/email/токен).
+# input_clean убирает cntrl/escape, но ЦЕЛУЮ кириллицу (набранную в русской
+# раскладке и не удалённую до конца) оставляет — она printable UTF-8, не cntrl.
+# Живой баг: «РфкдуHarlequin» проходил в имя ноды и падал на валидации. Здесь
+# вырезаем ВСЕ не-ASCII байты (кириллицу и любой non-ASCII) — остаётся латиница.
+# Свободный текст (заметки/note) чистить этим НЕЛЬЗЯ — там кириллица легитимна.
+input_clean_ascii() { # $1 сырой ввод -> ASCII-очищенный в stdout
+  local s
+  s="$(input_clean "$1")"
+  s="$(printf '%s' "$s" | LC_ALL=C tr -d '\200-\377')"
+  printf '%s' "$s"
+}
+
 is_domain() {
   [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]] || return 1
   # TLD должен содержать букву: иначе "999.999.999.999" проходит как домен
@@ -542,7 +555,7 @@ read_host() {
       # (choose_host) сделает fallback на IP. В интерактиве пустая строка = переспрос.
       echo; return 1
     fi
-    v="$(input_clean "$v")"
+    v="$(input_clean_ascii "$v")"
     if is_domain "$v" || is_ip "$v"; then printf '%s' "$v"; return 0; fi
     err "Некорректно: '$v'. Нужен домен или IP — без http://, путей и портов"
   done
@@ -583,7 +596,7 @@ read_port() {
   local prompt="$1" v
   while true; do
     read -r -p "$prompt" v || die "Ввод прерван"
-    v="$(input_clean "$v")"
+    v="$(input_clean_ascii "$v")"
     if is_port "$v"; then printf '%s' "$v"; return 0; fi
     err "Порт должен быть числом 1-65535"
   done
@@ -593,7 +606,7 @@ read_path() {
   local prompt="$1" v
   while true; do
     read -r -p "$prompt" v || die "Ввод прерван"
-    v="$(input_clean "$v")"
+    v="$(input_clean_ascii "$v")"
     if is_path "$v"; then printf '%s' "$v"; return 0; fi
     err "Путь: начинается с /, буквы/цифры/._~/- (без пробелов)"
   done
@@ -3049,8 +3062,9 @@ client_add() {
   jq -e . <<<"$settings" >/dev/null 2>&1 || { err "settings инбаунда #$id не парсятся как JSON — обновите 3x-ui"; return 1; }
   read -r -p "Имя (email) пользователя [u$(rand_hex 2)]: " email
   email="${email:-u$(rand_hex 2)}"
-  # таб/перевод строки ломают subs.index (awk -F'\t') — вырезаем; остальное — предупреждение
-  email="${email//$'\t'/}"; email="${email//$'\r'/}"; email="${email//$'\n'/}"; email="${email// /}"
+  # v9.1.1: structured email — ASCII-чистка (кириллица из русской раскладки долой);
+  # таб/перевод строки ломают subs.index (awk -F'\t') — input_clean_ascii убирает cntrl
+  email="$(input_clean_ascii "$email")"
   [[ "$email" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]] || warn "Имя содержит нестандартные символы — лучше только A-Za-z0-9._@+-"
   read -r -p "Квота трафика, ГБ (0 = без лимита) [0]: " total; total="${total:-0}"
   read -r -p "Срок жизни, дней (0 = бессрочно) [0]: " days; days="${days:-0}"
@@ -3227,7 +3241,7 @@ client_add_all() {
     read -r -p "Имя (email) пользователя [u$(rand_hex 2)]: " email
   fi
   email="${email:-u$(rand_hex 2)}"
-  email="${email//$'\t'/}"; email="${email//$'\r'/}"; email="${email//$'\n'/}"; email="${email// /}"
+  email="$(input_clean_ascii "$email")"
   [[ "$email" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]] || warn "Имя содержит нестандартные символы — лучше только A-Za-z0-9._@+-"
   if [ "$#" -lt 1 ]; then
     read -r -p "Квота трафика, ГБ (0 = без лимита) [0]: " total; total="${total:-0}"
@@ -3382,6 +3396,7 @@ client_toggle_menu() {
     printf '  %-26s %s\n' "$n" "$cur"
   done <<<"$names"
   read -r -p "Email пользователя: " email
+  email="$(input_clean_ascii "$email")"
   [ -n "$email" ] || { warn "Отменено"; return 0; }
   read -r -p "Действие: 1) выключить  2) включить [1]: " en
   case "${en:-1}" in
@@ -5454,11 +5469,8 @@ reality_scan_pick() {
 # $1 dest (host:port | ip:port | 127.0.0.1:8444), $2 sni
 reality_create_inbound() {
   local dest="$1" sni="$2" p
+  # v9.1.1: порт случайный свободный, без вопроса (всё спрятано за nginx/маскировкой)
   p="$(rand_free_port 10000 60000)" || { err "Нет свободного порта"; return 1; }
-  read -r -p "Публичный порт Reality inbound [${p}]: " pin
-  p="${pin:-$p}"
-  is_port "$p" || { err "Некорректный порт"; return 1; }
-  port_busy "$p" && { err "Порт $p уже занят"; return 1; }
 
   log "Генерирую ключи x25519 через API панели..."
   local priv pub
@@ -6372,7 +6384,7 @@ node_add() {
   # (симметрия с v3.2.1, ревью v4.7.0: на порту/юзере EOF давал дефолты
   # 22/root и попытку коннекта к ноде)
   read -r -p "Имя ноды (латиница, например de1): " nname || { echo; return 1; }
-  nname="$(input_clean "$nname")"
+  nname="$(input_clean_ascii "$nname")"
   [[ "$nname" =~ ^[a-zA-Z0-9_-]{1,20}$ ]] || { err "Имя: латиница/цифры/-/_ до 20 символов (получено: $(printf '%q' "$nname"))"; return 1; }
   if jq -e --arg n "$nname" 'any(.[]; .name==$n)' <(nodes_load) >/dev/null 2>&1; then
     confirm "Нода '$nname' уже есть. Переподключить без переустановки? [Y/n] " y && node_reconnect_existing "$nname"
@@ -6385,9 +6397,9 @@ node_add() {
     return $?
   fi
   read -r -p "SSH порт [22]: " nport || { echo; return 1; }
-  nport="$(input_clean "$nport")"; nport="${nport:-22}"; is_port "$nport" || { err "Порт"; return 1; }
+  nport="$(input_clean_ascii "$nport")"; nport="${nport:-22}"; is_port "$nport" || { err "Порт"; return 1; }
   read -r -p "SSH пользователь [root]: " nuser || { echo; return 1; }
-  nuser="$(input_clean "$nuser")"; nuser="${nuser:-root}"
+  nuser="$(input_clean_ascii "$nuser")"; nuser="${nuser:-root}"
   # аудит №4: без валидации «a"b» уезжало в ssh/jq-реестр; допускаем то, что
   # легитимно для useradd: латиница/цифры/._-, не с цифры, до 32 символов
   [[ "$nuser" =~ ^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$ ]] || { err "SSH-пользователь: только латиница/цифры/._- (до 32 симв., не с цифры)"; return 1; }
@@ -7142,7 +7154,7 @@ nodes_del() {
   nodes_list
   local n rec
   read -r -p "Имя ноды для удаления (Enter — отмена): " n
-  n="$(input_clean "$n")"
+  n="$(input_clean_ascii "$n")"
   [ -z "$n" ] && return 0
   rec="$(nodes_load | jq -c --arg n "$n" '[.[]|select(.name==$n)][0] // empty')"
   [ -n "$rec" ] || { err "Нода '$n' не найдена"; return 1; }
@@ -10351,7 +10363,7 @@ proto_panel_install() { # $1 режим: all (по умолчанию) | awg | h
   local created=0 hp="" ap=""
   if [ "$ok_hy" = "1" ]; then
     local hp; hp="$PROTO_HY2_PORT_DEFAULT"
-    read -r -p "UDP-порт Hysteria 2 (панельный) [${hp}]: " a; hp="${a:-$hp}"
+    # v9.1.1: порт из выбранного UDP-профиля, без вопроса
     is_port "$hp" && proto_udp_free "$hp" || { err "Порт $hp занят/некорректен"; return 1; }
     local auth cl ib
     auth="$(rand_str 24)"
@@ -10365,7 +10377,7 @@ proto_panel_install() { # $1 режим: all (по умолчанию) | awg | h
   fi
   if [ "$ok_awg" = "1" ]; then
     local ap; ap="$PROTO_AWG_PORT_DEFAULT"
-    read -r -p "UDP-порт AmneziaWG (панельный) [${ap}]: " a; ap="${a:-$ap}"
+    # v9.1.1: порт из выбранного UDP-профиля, без вопроса
     is_port "$ap" && proto_udp_free "$ap" || { err "Порт $ap занят/некорректен"; _proto_panel_rollback_created "$hp" ""; return 1; }
     local wpriv wpub cl2 ib2
     read -r wpriv wpub <<<"$(xray_wg_pair)"
@@ -12013,8 +12025,10 @@ node_token_set() {
   arr="$(nodes_load)"; rec="$(jq -c --arg n "$want" '[.[]|select(.name==$n)][0]//empty' <<<"$arr")"
   [ -n "$rec" ] || { err "Нода не найдена"; return 1; }
   read -r -s -p "Scoped API token для $want: " token || { echo; return 1; }; echo
+  token="$(input_clean_ascii "$token")"
   [[ "$token" =~ ^[A-Za-z0-9._~-]{20,512}$ ]] || { err "Токен пуст или имеет неподдерживаемый формат"; return 1; }
   read -r -p "Истекает DD.MM.YYYY или YYYY-MM-DD (Enter — не задан): " expires || return 1
+  expires="$(input_clean_ascii "$expires")"
   if [ -n "$expires" ] && ! [[ "$expires" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then err "Формат даты"; return 1; fi
   ck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)" || return 1
   out="$(XKIT_NODE_API_TOKEN="$token" node_api "$rec" panel/api/inbounds/list GET "" "$ck" 2>/dev/null)"; rm -f "$ck"
