@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.4"
+XKIT_VERSION="9.1.5"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5802,9 +5802,9 @@ node_api() { # $1 rec, $2 path, $3 method, $4 JSON-body, $5 cookie
   local csrf="${NODE_CSRF_TOKEN:-}"
   [ -n "$csrf" ] && a+=(-H "X-CSRF-Token: $csrf")
   if [ -n "$body" ]; then
-    if [ "$path" = "login" ]; then
-      # v7.2.9: логин 3X-UI (v2 и v3) биндится формой (urlencoded) — JSON-тело
-      # эпохи v2 панель v3 не принимает вовсе
+    # v9.1.5: NODE_API_FORM=1 — тело уже urlencoded-форма (xray/update ноды 3.11
+    # требует форму, JSON отвергает «unexpected end of JSON input»); логин — форма всегда
+    if [ "$path" = "login" ] || [ "${NODE_API_FORM:-0}" = "1" ]; then
       a+=(-H 'Content-Type: application/x-www-form-urlencoded' --data @-)
     else
       a+=(-H 'Content-Type: application/json' --data @-)
@@ -6159,25 +6159,28 @@ PY
 # идут в рабочий IPv4). Идемпотентно: правим только freedom без UseIPv4.
 # Применяется через панельный API ноды (Bearer-токен), xray ноды рестартится.
 node_fix_freedom_ipv4() { # $1 rec -> 0 если применено/уже ок, 1 если не удалось
-  local rec="$1" ck resp tpl merged
+  local rec="$1" ck resp inner merged form upd
   ck="$(mktemp /tmp/.xkit-node-ipv4.XXXXXX)" || return 1
   if ! node_login "$rec" "$ck" >/dev/null 2>&1; then rm -f "$ck"; return 1; fi
   resp="$(node_api "$rec" "panel/api/xray/" POST "{}" "$ck" 2>/dev/null)"
-  tpl="$(jq -c '.obj | if type=="string" then fromjson else . end
-                | .xraySetting // {} | if type=="string" then fromjson else . end' \
-                <<<"$resp" 2>/dev/null)"
-  if ! jq -e . >/dev/null 2>&1 <<<"$tpl"; then rm -f "$ck"; return 1; fi
+  # v9.1.5 (живой баг 3.11): шаблон ноды — вложенный obj.xraySetting (dict с
+  # outbounds/routing). obj может быть строкой; xraySetting — строкой или dict.
+  # Достаём ВНУТРЕННИЙ конфиг (где freedom), а не обёртку с geodataSources.
+  inner="$(jq -c '
+    (.obj | if type=="string" then fromjson else . end) as $o
+    | ($o.xraySetting // $o) | if type=="string" then fromjson else . end
+    | select(.outbounds != null)' <<<"$resp" 2>/dev/null)"
+  if ! jq -e '.outbounds' >/dev/null 2>&1 <<<"$inner"; then rm -f "$ck"; return 1; fi
   # уже UseIPv4 у всех freedom — нечего делать (идемпотентность, без рестарта)
   if [ "$(jq '[.outbounds[]? | select(.protocol=="freedom"
-              and (.settings.domainStrategy // "") != "UseIPv4")] | length' <<<"$tpl")" = "0" ]; then
+              and (.settings.domainStrategy // "") != "UseIPv4")] | length' <<<"$inner")" = "0" ]; then
     rm -f "$ck"; return 0
   fi
-  merged="$(jq -c '(.outbounds[]? | select(.protocol=="freedom") | .settings.domainStrategy) = "UseIPv4"' <<<"$tpl")"
-  # панель v3 принимает xraySetting формой (как master_xray_template_set);
-  # node_api с Content-Type: application/json — шлём JSON {"xraySetting": "..."}
-  local body upd
-  body="$(jq -nc --arg x "$merged" '{xraySetting:$x}')"
-  upd="$(node_api "$rec" "panel/api/xray/update" POST "$body" "$ck" 2>/dev/null)"
+  merged="$(jq -c '(.outbounds[]? | select(.protocol=="freedom") | .settings.domainStrategy) = "UseIPv4"' <<<"$inner")"
+  # v9.1.5: панель 3.11 xray/update требует ФОРМУ xraySetting=<urlencoded inner>,
+  # JSON отвергает. inner — внутренний конфиг (не обёртка). NODE_API_FORM=1.
+  form="xraySetting=$(jq -rn --arg x "$merged" '$x|@uri')"
+  upd="$(NODE_API_FORM=1 node_api "$rec" "panel/api/xray/update" POST "$form" "$ck" 2>/dev/null)"
   jq -e '.success == true' <<<"$upd" >/dev/null 2>&1 || { rm -f "$ck"; return 1; }
   node_api "$rec" "panel/api/server/restartXrayService" POST "{}" "$ck" >/dev/null 2>&1 || true
   rm -f "$ck"
@@ -6990,9 +6993,13 @@ nodes_repair() {
     while IFS= read -r rec; do
       [ -z "$rec" ] && continue
       nm="$(jq -r '.name' <<<"$rec")"
-      tport="$(jq -r '.tunnel.port // empty' <<<"$rec")"
+      # v9.1.5: туннельный inbound на ноде слушает INNER-порт (за nginx), а не
+      # публичный tunnel.port (443). Поиск по tunnel.port давал ложное «inbound
+      # НЕТ» для скрытых нод (ws-tls за nginx) -> repair возвращал ошибку ->
+      # self_update не применял маршрутизацию. Берём inner_port, фолбэк tunnel.port.
+      tport="$(jq -r '.tunnel.inner_port // .tunnel.port // empty' <<<"$rec")"
       if [ -z "$tport" ]; then
-        warn "${nm}: в записи нет tunnel.port — пропускаю"
+        warn "${nm}: в записи нет tunnel.inner_port/port — пропускаю"
         continue
       fi
       ttag="inbound-${tport}"
@@ -7228,7 +7235,7 @@ nodes_del() {
     if node_login "$rec" "$ck" 2>/dev/null; then
       local inb_id
       inb_id="$(node_api "$rec" "panel/api/inbounds/list" GET "" "$ck" \
-        | jq -r --arg t "inbound-$(jq -r '.tunnel.port' <<<"$rec")" '[.obj[]?|select(.tag==$t)][0].id // empty')"
+        | jq -r --arg t "inbound-$(jq -r '.tunnel.inner_port // .tunnel.port' <<<"$rec")" '[.obj[]?|select(.tag==$t)][0].id // empty')"
       if [ -n "$inb_id" ] && node_api "$rec" "panel/api/inbounds/del/${inb_id}" POST "" "$ck" >/dev/null 2>&1; then
         ok "Инбаунд на ноде удалён"
       else
@@ -7638,7 +7645,8 @@ EOS
   # SNI = домен чужого сайта, иначе handshake рвётся (dest отдаёт чужой серт).
   local tdest tsni tport tck tlist tib tid tstream tbody
   tdest="$(jq -r '.tunnel.dest // ""' <<<"$rec")"
-  tport="$(jq -r '.tunnel.port // empty' <<<"$rec")"
+  # v9.1.5: inbound туннеля на ноде — inner_port (за nginx), не публичный 443
+  tport="$(jq -r '.tunnel.inner_port // .tunnel.port // empty' <<<"$rec")"
   if [ "$tdest" = "127.0.0.1:8444" ] || [ "$tdest" = "127.0.0.1:8444/" ]; then
     tsni="$nhost"   # свой сайт: серт ноды = его домен
   else
