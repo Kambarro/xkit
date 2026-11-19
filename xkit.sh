@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="8.2.5"
+XKIT_VERSION="9.0.0"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -7269,14 +7269,14 @@ nodes_menu() {
     echo " 9) Сертификат панели сервера: домен / IP / самоподписанный"
     echo "10) Сайт-прикрытие сервера: сайт и страница входа"
     echo "11) Проверка серверов: соединение, SSH, панель, память и диск"
-    echo "12) Проверка зависания передачи между главным и дополнительным сервером"
-    echo "13) Показать отличия настроек / проверить на одном / применить ко всем"
-    echo "14) Ограниченный ключ доступа к панели: задать / проверить срок"
-    echo "15) Получить новый ключ доступа и обновить список в 3X-UI"
-    echo "16) Добавить/обновить сервер в «Узлах» 3X-UI (без импорта)"
-    echo "17) Спрятать панель сервера за nginx 443 (loopback + секретный путь)"
-    echo "18) Версии 3X-UI/Xray на серверах и обновление"
-    echo "19) UFW на сервере: статус / включить (закрыть лишние порты)"
+    echo "12) Показать отличия настроек / проверить на одном / применить ко всем"
+    echo "13) Ограниченный ключ доступа к панели: задать / проверить срок"
+    echo "14) Получить новый ключ доступа и обновить список в 3X-UI"
+    echo "15) Добавить/обновить сервер в «Узлах» 3X-UI (без импорта)"
+    echo "16) Спрятать панель сервера за nginx 443 (loopback + секретный путь)"
+    echo "17) Версии 3X-UI/Xray на серверах и обновление"
+    echo "18) UFW на сервере: статус / включить (закрыть лишние порты)"
+    echo "    (Замер «заморозки» ТСПУ перенесён в меню «Тестирование сервера»)"
     echo " 0) Назад"
     local c
     read -r -p "Выбор: " c || return 0
@@ -7292,18 +7292,17 @@ nodes_menu() {
       9) node_cert_menu; pause_enter ;;
       10) node_camo_menu; pause_enter ;;
       11) local _ck; read -r -p "Имя ноды (Enter — все): " _ck; nodes_check "${_ck:-all}"; pause_enter ;;
-      12) local _fz; read -r -p "Имя ноды (Enter — все): " _fz; nodes_freeze "${_fz:-all}"; pause_enter ;;
-      13) nodes_plan; local _ca; read -r -p "Canary нода (Enter — отмена): " _ca; [ -z "$_ca" ] || { nodes_apply_canary "$_ca" && confirm "Применить остальным? [y/N]" && nodes_apply_remaining; }; pause_enter ;;
-      14) local _tn; read -r -p "Нода: " _tn; node_token_set "$_tn"; node_token_expiry_check; pause_enter ;;
-      15) local _rl; read -r -p "Нода: " _rl; node_relogin "$_rl"; pause_enter ;;
-      16) local _ps; read -r -p "Нода (Enter — все): " _ps; node_panel_sync "${_ps:-all}"; pause_enter ;;
-      17) local _hd; read -r -p "Нода (Enter — все): " _hd; node_hide_one "${_hd:-all}"; pause_enter ;;
-      18) nodes_versions all
+      12) nodes_plan; local _ca; read -r -p "Canary нода (Enter — отмена): " _ca; [ -z "$_ca" ] || { nodes_apply_canary "$_ca" && confirm "Применить остальным? [y/N]" && nodes_apply_remaining; }; pause_enter ;;
+      13) local _tn; read -r -p "Нода: " _tn; node_token_set "$_tn"; node_token_expiry_check; pause_enter ;;
+      14) local _rl; read -r -p "Нода: " _rl; node_relogin "$_rl"; pause_enter ;;
+      15) local _ps; read -r -p "Нода (Enter — все): " _ps; node_panel_sync "${_ps:-all}"; pause_enter ;;
+      16) local _hd; read -r -p "Нода (Enter — все): " _hd; node_hide_one "${_hd:-all}"; pause_enter ;;
+      17) nodes_versions all
           local _un
           read -r -p "Обновить ноду (Enter — отмена, all — все): " _un || _un=""
           [ -z "$_un" ] || nodes_upgrade "$_un" ""
           pause_enter ;;
-      19) local _uf; read -r -p "Нода (Enter — все): " _uf; node_ufw_one "${_uf:-all}" status
+      18) local _uf; read -r -p "Нода (Enter — все): " _uf; node_ufw_one "${_uf:-all}" status
           local _uo; read -r -p "Включить UFW на ноде (Enter — отмена, all — все): " _uo || _uo=""
           [ -z "$_uo" ] || node_ufw_one "$_uo" on
           pause_enter ;;
@@ -8967,18 +8966,27 @@ xkit_load_menu() { # подключить модуль меню (source); 1 = н
 }
 
 #=========================== V5.2: TUI И ПРОТОКОЛЫ ============================
+xkit_repo_relpath() { # $1 имя компонента -> относительный путь в репо (v9.0.0)
+  case "$1" in
+    sitegen.py|camo_sitegen.py|bench.sh|ipregion.sh) printf 'tools/%s' "$1" ;;
+    xkit-tui-linux-*) printf 'bin/%s' "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
+
 xkit_component_fetch() { # $1 имя в репо, $2 конечный файл; SHA-256 обязателен
-  local base="${XKIT_REPO_URL:-}" name="$1" dst="$2" tmp sumf want got
+  local base="${XKIT_REPO_URL:-}" name="$1" dst="$2" tmp sumf want got rel
   [ -n "$base" ] || return 1
   case "$base" in */xkit.sh) base="${base%/*}" ;; esac
   # v7.7.2: пин HEAD-коммита (кэш raw отдавал TUI и пломбу из разных коммитов —
   # SHA не сходился, старый TUI молча оставался). Локальные зеркала не пинним.
   case "$base" in https://raw.githubusercontent.com/*) base="$(xkit_update_base "$base")" ;; esac
   case "$base" in http://127.0.0.1*|http://localhost*|http://\[::1\]*) ;; http://*) return 1 ;; esac
+  rel="$(xkit_repo_relpath "$name")"   # v9.0.0: tools/ и bin/ в репо
   tmp="$(mktemp /tmp/.xkit-component.XXXXXX)" || return 1
   sumf="$(mktemp /tmp/.xkit-component-sum.XXXXXX)" || { rm -f "$tmp"; return 1; }
-  curl -fsSL "${base}/${name}" -o "$tmp" && curl -fsSL "${base}/xkit.sh.sha256" -o "$sumf" || { rm -f "$tmp" "$sumf"; return 1; }
-  want="$(awk -v n="$name" '$2==n{print $1;exit}' "$sumf")"
+  curl -fsSL "${base}/${rel}" -o "$tmp" && curl -fsSL "${base}/xkit.sh.sha256" -o "$sumf" || { rm -f "$tmp" "$sumf"; return 1; }
+  want="$(awk -v n="$rel" '$2==n{print $1;exit}' "$sumf")"
   got="$(sha256sum "$tmp" | awk '{print $1}')"
   [ -n "$want" ] && [ "$want" = "$got" ] || { err "SHA-256 ${name} не совпал или отсутствует"; rm -f "$tmp" "$sumf"; return 1; }
   case "$name" in *.sh) bash -n "$tmp" || { rm -f "$tmp" "$sumf"; return 1; } ;; esac
@@ -9000,7 +9008,11 @@ xkit_extras_install() { # протоколы + TUI текущей архитек
   fi
   case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64|arm64) arch=arm64 ;; *) warn "TUI: архитектура $(uname -m) не поддерживается"; return "$rc" ;; esac
   name="xkit-tui-linux-${arch}"
-  if [ -r "$src/$name" ] && xkit_dir_trusted "$src" "$src/$name"; then
+  # v9.0.0: TUI-бинари в репо лежат в bin/ (локально — bin/ рядом с ядром)
+  if [ -r "$src/bin/$name" ] && xkit_dir_trusted "$src/bin" "$src/bin/$name"; then
+    [ ! -f "$XKIT_TUI_FILE" ] || cp -f "$XKIT_TUI_FILE" "${XKIT_TUI_FILE}.bak"
+    install -m 700 "$src/bin/$name" "$XKIT_TUI_FILE" || rc=1
+  elif [ -r "$src/$name" ] && xkit_dir_trusted "$src" "$src/$name"; then
     [ ! -f "$XKIT_TUI_FILE" ] || cp -f "$XKIT_TUI_FILE" "${XKIT_TUI_FILE}.bak"
     install -m 700 "$src/$name" "$XKIT_TUI_FILE" || rc=1
   else
@@ -9009,12 +9021,13 @@ xkit_extras_install() { # протоколы + TUI текущей архитек
   # v8.2.0: camo-движок sitegen (два python-файла: движок + обёртка кластера).
   # Кладём в lib/xkit; camo_sitegen_path найдёт их там. Без них маскировка не
   # сгенерится — ставим обязательно (fetch с SHA-проверкой).
+  # v9.0.0: инструменты в репо/дереве лежат в tools/.
   local cf
-  for cf in sitegen.py camo_sitegen.py; do
-    if [ -r "$src/$cf" ] && xkit_dir_trusted "$src" "$src/$cf"; then
-      install -m 644 "$src/$cf" "$XKIT_MENU_DIR/$cf" || rc=1
-    elif [ -r "$src/tools/$cf" ] && xkit_dir_trusted "$src/tools" "$src/tools/$cf"; then
+  for cf in sitegen.py camo_sitegen.py bench.sh ipregion.sh; do
+    if [ -r "$src/tools/$cf" ] && xkit_dir_trusted "$src/tools" "$src/tools/$cf"; then
       install -m 644 "$src/tools/$cf" "$XKIT_MENU_DIR/$cf" || rc=1
+    elif [ -r "$src/$cf" ] && xkit_dir_trusted "$src" "$src/$cf"; then
+      install -m 644 "$src/$cf" "$XKIT_MENU_DIR/$cf" || rc=1
     else
       xkit_component_fetch "$cf" "$XKIT_MENU_DIR/$cf" || rc=1
     fi
@@ -9042,7 +9055,9 @@ xkit_tui_run() {
     local self0 arch0
     self0="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
     case "$(uname -m)" in x86_64) arch0=amd64 ;; aarch64|arm64) arch0=arm64 ;; *) arch0=unknown ;; esac
-    [ -r "$(dirname "$self0")/xkit-tui-linux-${arch0}" ] && XKIT_TUI_FILE="$(dirname "$self0")/xkit-tui-linux-${arch0}"
+    # v9.0.0: TUI-бинари в bin/ рядом с ядром (запасной путь — корень, старые деревья)
+    [ -r "$(dirname "$self0")/bin/xkit-tui-linux-${arch0}" ] && XKIT_TUI_FILE="$(dirname "$self0")/bin/xkit-tui-linux-${arch0}"
+    [ ! -r "$XKIT_TUI_FILE" ] && [ -r "$(dirname "$self0")/xkit-tui-linux-${arch0}" ] && XKIT_TUI_FILE="$(dirname "$self0")/xkit-tui-linux-${arch0}"
   fi
   if [ ! -x "$XKIT_TUI_FILE" ] && [ "$(id -u)" = 0 ]; then
     load_xkit_env >/dev/null 2>&1 || true
@@ -9204,6 +9219,12 @@ xkit_menu_json() {
         {title:"Перезапустить всё: 3X-UI / Xray / nginx", desc:"Кратковременный обрыв соединений; после — чек в Telegram", args:["services","restart"], mode:"exec"},
         {title:"Перезагрузить сервер целиком (reboot)", desc:"Доступ пропадёт на 1-3 мин; после загрузки — чек готовности в Telegram", args:["services","reboot"], mode:"exec"}
       ]},
+      {id:"testing", title:"Тестирование сервера", desc:"Проверка самого сервера (железо, диск, канал, геолокация IP), не VPN-туннеля", items:[
+        {title:"Паспорт VPS (bench)", desc:"Система, диск, сырая скорость канала; нагрузка ~6 ГБ + канал, с подтверждением", args:["test","bench"], mode:"exec"},
+        {title:"Геолокация IP (ipregion)", desc:"В какой стране сервисы видят IP; засвечивает IP ~45 сервисам, с подтверждением", args:["test","ipregion"], mode:"exec"},
+        {title:"Замер «заморозки» ТСПУ (freeze)", desc:"Лег мастер->нода: обрыв передачи после 256 КБ; 2-3 минуты", args:["test","freeze","all"], mode:"exec"},
+        {title:"Результаты замеров заморозки", desc:"Показать сохранённые вердикты последних проверок", args:["test","freeze"], mode:"exec"}
+      ]},
       {id:"settings", title:"Настройки", items:[
         {title:"Открывать меню при входе по SSH", desc:"Автоматический запуск xkit", args:[], fn:"ssh_hook_toggle", mode:"exec"},
         {title:"Резервные копии: расписание", desc:"Интервал и хранение", args:["backup","settings"], mode:"exec"},
@@ -9281,6 +9302,8 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit health          — проверка жизнеспособности
   xkit health deep     — глубокая проверка: реальный клиент по нашим ссылкам
                          (REALITY/XHTTP/Hysteria2) открывает страницу через туннель
+  xkit test bench|ipregion|freeze [master|нода] — проверка САМОГО сервера (не туннеля):
+                         паспорт VPS, геолокация IP, замер «заморозки» ТСПУ; напрямую
   xkit backup [create|verify|export] — бэкап, проверка или age-экспорт
   xkit backup auto     — плановый бэкап (гейт интервала; вызывает cron)
   xkit backup settings [enabled interval_h [days min]] — политика бэкапов:
@@ -9407,6 +9430,7 @@ xkit_main_impl() {
     extfix)  require_root; external_proxy_fix ;;
     health)  shift
              if [ "${1:-}" = "deep" ]; then require_root; health_deep; else health_check; fi ;;
+    test)    shift; xkit_test_cmd "$@" ;;
     core-pin) shift; require_root; core_pin_install "${1:-}" ;;
     versions)
       shift
@@ -14333,7 +14357,8 @@ tg_bot_main_menu() { # -> reply_markup json
   jq -nc '[
     [{text:"👥 Пользователи",callback_data:"m:users"},{text:"🖥 Ноды",callback_data:"m:nodes"}],
     [{text:"⏰ Сроки аренды",callback_data:"m:expiry"},{text:"📊 Статус",callback_data:"m:status"}],
-    [{text:"🛠 Обслуживание",callback_data:"m:service"},{text:"🔀 Транспорт TG",callback_data:"m:transport"}]
+    [{text:"🛠 Обслуживание",callback_data:"m:service"},{text:"🧪 Тестирование",callback_data:"m:testing"}],
+    [{text:"🔀 Транспорт TG",callback_data:"m:transport"}]
   ]' | _tg_kb
 }
 
@@ -14537,6 +14562,18 @@ tg_bot_service_menu() { # $1 chat
   tg_bot_reply "$1" "🛠 Обслуживание:" "$kb"
 }
 
+# --- тестирование сервера (меню, v8.3.0) ---
+tg_bot_testing_menu() { # $1 chat
+  local kb
+  kb="$(jq -nc '[
+    [{text:"🖥 Паспорт VPS (bench)",callback_data:"t:bench"},{text:"🌍 Геолокация IP",callback_data:"t:ipregion"}],
+    [{text:"🧊 Заморозка ТСПУ (все ноды)",callback_data:"t:freeze"},{text:"📋 Результаты freeze",callback_data:"t:freeze-show"}],
+    [{text:"🏠 Меню",callback_data:"m:main"}]
+  ]' | _tg_kb)"
+  tg_bot_reply "$1" "🧪 Тестирование сервера (проверка самого сервера, не туннеля):
+bench — нагрузка ~6 ГБ + канал; ipregion — засвечивает IP ~45 сервисам. Запуск напрямую с мастера." "$kb"
+}
+
 # --- обработчик callback_query (кнопки) ---
 tg_bot_handle_callback() { # $1 callback-json
   local cb="$1" cid uid data mid
@@ -14557,6 +14594,7 @@ tg_bot_handle_callback() { # $1 callback-json
     m:status) tg_bot_status "$cid" ;;
     m:expiry) tg_bot_expiry "$cid" ;;
     m:service) tg_bot_service_menu "$cid" ;;
+    m:testing) tg_bot_testing_menu "$cid" ;;
     m:transport) tg_bot_reply "$cid" "$(printf '🔀 TG транспорты (статусы обновляются при проверке):\n%s' "$(tg_transports_load | jq -r '.[]|"\(.type) \(.node//.url) — \(.status)"')")" "$(tg_bot_main_menu)" ;;
     u:add) tg_bot_reply "$cid" "Создать: /adduser <email> [дней] [ГБ]" ;;
     u:*) tg_bot_user_card "$cid" "${data#u:}" ;;
@@ -14569,6 +14607,10 @@ tg_bot_handle_callback() { # $1 callback-json
     ne:*) tg_bot_reply "$cid" "Продлить аренду ноды: /expire node ${data#ne:} <DD.MM.YYYY>" ;;
     nt:*) tg_bot_node_transport "$cid" "${data#nt:}" ;;
     nf:*) tg_bot_run_long "$cid" "freeze-${data#nf:}" "${XKIT_BIN} nodes freeze ${data#nf:}" "freeze ${data#nf:}" ;;
+    t:bench) tg_bot_confirm "$cid" "test-bench" "Паспорт VPS (bench) на мастере: нагрузка ~6 ГБ на диск + канал на 100%" ;;
+    t:ipregion) tg_bot_confirm "$cid" "test-ipregion" "Геолокация IP (ipregion) на мастере: IP засветится ~45 сервисам" ;;
+    t:freeze) tg_bot_run_long "$cid" "test-freeze" "${XKIT_BIN} test freeze all" "заморозка ТСПУ (все ноды)" ;;
+    t:freeze-show) tg_bot_reply "$cid" "$(${XKIT_BIN} test freeze 2>/dev/null | tail -c 3000)" "$(tg_bot_main_menu)" ;;
     nc:*) tg_bot_node_cert_menu "$cid" "${data#nc:}" ;;
     nu:*) tg_bot_node_ufw_menu "$cid" "${data#nu:}" ;;
     nm:*) tg_bot_confirm "$cid" "camo:${data#nm:}" "Развернуть camo на ${data#nm:}" ;;
@@ -14612,6 +14654,8 @@ tg_bot_do_confirm() { # $1 chat, $2 action-key
     restart) tg_bot_run_long "$chat" "restart" "${XKIT_BIN} services restart --yes" "перезапуск стека (чек придёт отдельно)" ;;
     reboot) tg_bot_run_long "$chat" "reboot" "${XKIT_BIN} services reboot --yes" "ребут сервера (чек придёт после загрузки)" ;;
     update) tg_bot_run_long "$chat" "update" "${XKIT_BIN} update" "обновление XKIT" ;;
+    test-bench) XKIT_YES=1 tg_bot_run_long "$chat" "test-bench" "XKIT_YES=1 ${XKIT_BIN} test bench master" "паспорт VPS (bench)" ;;
+    test-ipregion) XKIT_YES=1 tg_bot_run_long "$chat" "test-ipregion" "XKIT_YES=1 ${XKIT_BIN} test ipregion master" "геолокация IP (ipregion)" ;;
     *) tg_bot_reply "$chat" "Действие не распознано" "$(tg_bot_main_menu)" ;;
   esac
 }
@@ -14942,6 +14986,157 @@ open(conf, 'w').write(s)
 PY
 nginx -t 2>/dev/null && systemctl reload nginx >/dev/null 2>&1 || true
 EOF
+}
+#!/usr/bin/env bash
+#=========================== ТЕСТИРОВАНИЕ VPS (v8.3.0) ========================
+# Проверка САМОГО сервера (железо, диск, канал, геолокация IP), НЕ VPN-туннеля.
+# Клиентский опыт (как ходит трафик через каскад) — это nodes profile survey/
+# benchmark и health deep, они живут отдельно.
+#
+# Утилиты:
+#   bench     — паспорт VPS (Teddysun bench.sh, MIT): система, диск, сырая
+#               скорость канала до публичных speedtest-узлов. Нагрузка: ~6 ГБ
+#               временно на диск + канал на 100% на время теста.
+#   ipregion  — в какой стране сервисы «видят» IP (vernette/ipregion, MIT,
+#               вендоренная копия XKIT: отправка debug-лога на файлопомойки
+#               ВЫРЕЗАНА — лог только локальный). Засвечивает IP ~45 сервисам.
+#   freeze    — замер «заморозки» ТСПУ на леге мастер->нода (наш, nodes_freeze).
+#
+# Запуск НАПРЯМУЮ с выбранной машины (мастер или нода) — меряем сам сервер.
+# Вендоренные скрипты доставляются как компоненты релиза (SHA-пины), без
+# wget|bash в рантайме. Ookla speedtest-cli bench качает сам (оставлено).
+
+XKIT_BENCH_FILE="${XKIT_BENCH_FILE:-${XKIT_MENU_DIR}/bench.sh}"
+XKIT_IPREGION_FILE="${XKIT_IPREGION_FILE:-${XKIT_MENU_DIR}/ipregion.sh}"
+XKIT_TEST_RESULTS_DIR="${XKIT_TEST_RESULTS_DIR:-/var/lib/xkit/test-results}"
+
+# путь к вендоренному скрипту: lib/xkit, рядом с ядром, devtree tools/
+xkit_test_script_path() { # $1 bench|ipregion -> путь; 1 = не найден
+  local name="$1" self cand var
+  case "$name" in
+    bench) var="$XKIT_BENCH_FILE" ;;
+    ipregion) var="$XKIT_IPREGION_FILE" ;;
+    *) return 1 ;;
+  esac
+  self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  for cand in "$var" "$self/${name}.sh" "$self/tools/${name}.sh" \
+    "${XKIT_MENU_DIR}/${name}.sh" "/usr/local/lib/xkit/${name}.sh"; do
+    [ -n "$cand" ] && [ -r "$cand" ] && { printf '%s' "$cand"; return 0; }
+  done
+  return 1
+}
+
+# выбрать машину: аргумент (master|имя ноды) или интерактивно.
+# печатает rec-json ноды, либо пустую строку для мастера; 1 = отмена/ошибка
+xkit_test_pick_target() { # $1 цель (""=интерактивно, master, имя ноды)
+  local want="${1:-}" arr names n rec
+  if [ "$want" = "master" ] || [ "$want" = "local" ] || [ "$want" = "мастер" ]; then
+    printf ''; return 0
+  fi
+  arr="$(nodes_load 2>/dev/null || echo '[]')"
+  if [ -n "$want" ]; then
+    rec="$(jq -c --arg n "$want" '[.[]|select(.name==$n)][0]//empty' <<<"$arr")"
+    [ -n "$rec" ] || { err "Нода '${want}' не найдена (xkit nodes list)"; return 1; }
+    printf '%s' "$rec"; return 0
+  fi
+  # интерактив: мастер + список нод
+  echo "" >&2
+  echo "Где запустить проверку (напрямую с этой машины):" >&2
+  echo "  0) Мастер (этот сервер)" >&2
+  names="$(jq -r '.[].name' <<<"$arr" 2>/dev/null)"
+  local i=1
+  while IFS= read -r n; do [ -n "$n" ] && { echo "  ${i}) Нода ${n}" >&2; i=$((i+1)); }; done <<<"$names"
+  local choice; read -r -p "Выбор [0]: " choice || return 1
+  choice="${choice:-0}"
+  if [ "$choice" = "0" ]; then printf ''; return 0; fi
+  [[ "$choice" =~ ^[0-9]+$ ]] || { err "Неверный выбор"; return 1; }
+  n="$(jq -r --argjson i "$((choice-1))" '.[$i].name // empty' <<<"$arr" 2>/dev/null)"
+  [ -n "$n" ] || { err "Нет такого пункта"; return 1; }
+  rec="$(jq -c --arg n "$n" '[.[]|select(.name==$n)][0]//empty' <<<"$arr")"
+  printf '%s' "$rec"; return 0
+}
+
+# запустить вендоренный скрипт на выбранной машине; результат сохранить локально
+# на мастере (чтобы можно было обратиться как к результату) + показать.
+xkit_test_run_script() { # $1 bench|ipregion, $2 rec-json (""=мастер), $3... доп.аргументы
+  local name="$1" rec="$2"; shift 2
+  local script label target outdir outfile rc
+  script="$(xkit_test_script_path "$name")" \
+    || { err "${name}: скрипт не найден (компонент ${name}.sh; xkit update)"; return 1; }
+  if [ -n "$rec" ]; then
+    target="$(jq -r '.name' <<<"$rec")"
+    label="${name} на ноде ${target}"
+  else
+    target="master"; label="${name} на мастере"
+  fi
+  outdir="$XKIT_TEST_RESULTS_DIR"; mkdir -p "$outdir" 2>/dev/null || outdir="/tmp"
+  outfile="${outdir}/${name}-${target}-$(date +%Y%m%d-%H%M%S).txt"
+  log "Запуск: ${label} (напрямую, не через туннель)"
+  if [ -n "$rec" ]; then
+    # на ноде: скрипт едет по stdin (bash -s), вывод возвращаем на мастер
+    node_ssh "$rec" bash -s -- "$@" < "$script" > "$outfile" 2>&1; rc=$?
+  else
+    bash "$script" "$@" > "$outfile" 2>&1; rc=$?
+  fi
+  # показать результат (хвост для длинного вывода) и сохранить путь
+  if [ -s "$outfile" ]; then
+    cat "$outfile"
+  else
+    warn "Вывод пуст (rc=${rc})"
+  fi
+  ok "Результат сохранён: ${outfile}"
+  [ "$rc" = 0 ] || warn "${name}: скрипт завершился с кодом ${rc} (см. вывод выше)"
+  return "$rc"
+}
+
+xkit_test_bench() { # [master|имя ноды]
+  require_root
+  local rec
+  rec="$(xkit_test_pick_target "${1:-}")" || return 1
+  warn "bench грузит канал на 100% и пишет ~6 ГБ временно на диск (удаляет сам)."
+  warn "На боевом сервере с живыми клиентами это кратковременная просадка — лучше на ноде или без нагрузки."
+  confirm "Запустить bench.sh? [y/N] " || { warn "Отменено"; return 0; }
+  xkit_test_run_script bench "$rec"
+}
+
+xkit_test_ipregion() { # [master|имя ноды] [--json]
+  require_root
+  local rec json=0 args=()
+  # отделить цель от флагов
+  local target="" a
+  for a in "$@"; do case "$a" in --json|-j) json=1 ;; *) target="$a" ;; esac; done
+  rec="$(xkit_test_pick_target "$target")" || return 1
+  warn "ipregion делает запросы к ~45 сервисам с IP этой машины — IP «засвечивается» ими."
+  warn "Это разовая проверка геолокации/репутации IP (как при вводе ноды), не постоянная."
+  confirm "Запустить ipregion? [y/N] " || { warn "Отменено"; return 0; }
+  [ "$json" = 1 ] && args+=(--json)
+  # --yes: доставить curl/jq без вопроса; debug-лог остаётся локальным (upload вырезан)
+  args+=(--yes)
+  xkit_test_run_script ipregion "$rec" "${args[@]}"
+}
+
+xkit_test_freeze() { # [имя|all] [--tries N] ... — алиас nodes_freeze
+  nodes_freeze "$@"
+}
+
+xkit_test_cmd() { # xkit test bench|ipregion|freeze [цель]
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    bench) xkit_test_bench "$@" ;;
+    ipregion) xkit_test_ipregion "$@" ;;
+    freeze) xkit_test_freeze "$@" ;;
+    ""|-h|--help)
+      cat <<EOF
+xkit test — проверка САМОГО сервера (не VPN-туннеля)
+  xkit test bench [master|имя ноды]      паспорт VPS: система, диск, скорость канала
+  xkit test ipregion [master|имя ноды] [--json]  в какой стране сервисы видят IP
+  xkit test freeze [имя|all] [--tries N] замер «заморозки» ТСПУ на леге мастер->нода
+Без цели — интерактивный выбор машины (мастер или нода). Запуск напрямую.
+Результаты: ${XKIT_TEST_RESULTS_DIR}/
+EOF
+      ;;
+    *) err "xkit test bench|ipregion|freeze [цель]"; return 1 ;;
+  esac
 }
 #=========================== ДИСПЕТЧЕР (v7.2.5) ================================
 # `main "$@"` — ПОСЛЕДНИЙ модуль сборки (build.sh склеивает src/[0-9][0-9]_*.sh

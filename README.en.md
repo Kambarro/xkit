@@ -4,7 +4,7 @@
 
 **Your turnkey VPN server: 3X-UI panel behind nginx, all protocols, one subscription per user — managed from Telegram.**
 
-![Version](https://img.shields.io/badge/version-8.2.5-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-9.0.0-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -261,6 +261,12 @@ xkit nodes profile list|switch|benchmark  # master→node channel
 xkit nodes readdress NAME IP      # change IP
 xkit nodes freeze NAME            # TCP freeze measurement
 xkit nodes repair|repin|relogin   # maintenance
+
+# Testing the SERVER itself (not the VPN tunnel) — directly on master or a node
+xkit test bench [master|NAME]     # VPS passport: system, disk, raw channel speed (~6 GB load)
+xkit test ipregion [master|NAME]  # how ~45 services see this IP's country (exposes the IP)
+xkit test freeze [NAME|all]       # TSPU freeze measurement (alias of nodes freeze)
+# results: /var/lib/xkit/test-results/; in TUI/bot — "Server testing" section
 
 # Telegram
 xkit telegram setup|check|test    # notifications setup & check

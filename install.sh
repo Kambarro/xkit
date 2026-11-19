@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  XKIT installer — установка xkit.sh одной командой (XKIT v8.2.5)
+#  XKIT installer — установка xkit.sh одной командой (XKIT v9.0.0)
 #
 #  GitHub (рекомендуемый вариант, все компоненты релиза в одном репо):
 #    curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
@@ -26,13 +26,15 @@ XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kambarro/xkit/main}"
 
 # (K-02, аудит №2) pin-хэши релиза: подставляются при сборке. Placeholder =
 # dev-режим — тогда сумма берётся из xkit.sh.sha256; нет ни того ни другого — отказ
-XKIT_PIN_SHA256="750ca3542b77621a64fd943605b89e5a5df390fbb47df73dd41a0c2d831e5f77"
-XKIT_PIN_MENU_SHA256="9df401f8ab213b9262868015e3698d21c2e01a295de3dc9242bba74da4d1cf82"
-XKIT_PIN_PROTOCOLS_SHA256="c9415012203696b62d73f8322c62b2d4dafe6dc1713c891c937d7e02d516e2a8"
-XKIT_PIN_TUI_AMD64_SHA256="7b6ef442b7d5815bc71ccb4f30c90d710e1890913e32abea053f64a7691acda1"
-XKIT_PIN_TUI_ARM64_SHA256="42b28be11752978592f34ff5714d6880ec43d4f95585682c1122d44ed9114b6f"
+XKIT_PIN_SHA256="3791eb3f1b3c5684b2ec7602c72534e06bfb7ffd948bb39550933f20655685cd"
+XKIT_PIN_MENU_SHA256="30afd95204641019a5c731b11aa606316347a1dfeee770c840dc25b432894e46"
+XKIT_PIN_PROTOCOLS_SHA256="1714b6442c352a1c63b33191ea3d268a0d2525abca3c1192a090ae8ee4a83719"
+XKIT_PIN_TUI_AMD64_SHA256="71406325e21596749b3106dd7284dda51ec3887ce2f03e22f1f146131e508d90"
+XKIT_PIN_TUI_ARM64_SHA256="8a6f5b9a875ffb162cdf71b118505bd921cff89cd5e2829ece926e70bf00c37a"
 XKIT_PIN_SITEGEN_SHA256="84f82f4b28463a7891eca56d2f4fc7446bb7959d226dfa50fa7e0fbf71c3aa37"
 XKIT_PIN_CAMO_SITEGEN_SHA256="027d25c44a0a4f80afb9129cf3dc09dd4202238afa3d77ded0e084def76f8026"
+XKIT_PIN_BENCH_SHA256="fbc7d7ec27f59939ba798f456ed3d31931c6d3d4604a63e6d563b19a4974ae04"
+XKIT_PIN_IPREGION_SHA256="14d0ced7771aba1e721054fec3dfbfcb0a8455158e0b7966125345d0d05c0770"
 
 # v6.0.0: Ed25519-подпись релиза (ssh-keygen -Y, namespace xkit-release).
 # Подставляется сборкой из ключей релиза; placeholder = dev-режим (фолбэк на пин-книгу).
@@ -322,33 +324,51 @@ fi
 # --- v5.2: модуль протоколов и TUI. Каждый файл проверяется отдельно.
 # В WORK они нужны одношаговому установщику; при V-02-запрете /tmp ядро
 # повторно скачает их через xkit_component_fetch с той же пломбой.
+# v9.0.0: культурная раскладка репо — инструменты в tools/, TUI-бинари в bin/,
+# остальное (ядро/меню/протоколы/пломба/подпись) в корне. Пломба xkit.sh.sha256
+# хранит имена С путями (tools/sitegen.py, bin/xkit-tui-linux-amd64).
+xkit_repo_relpath() { # $1 имя компонента -> относительный путь в репо
+  case "$1" in
+    sitegen.py|camo_sitegen.py|bench.sh|ipregion.sh) printf 'tools/%s' "$1" ;;
+    xkit-tui-linux-*) printf 'bin/%s' "$1" ;;
+    *) printf '%s' "$1" ;;
+  esac
+}
 fetch_release_component() { # $1 имя, $2 pin
-  local name="$1" pin="$2" want="" got=""
-  if [ -n "$SRCDIR" ] && [ -f "$SRCDIR/$name" ] && install_trust "$SRCDIR" "$SRCDIR/$name"; then
+  local name="$1" pin="$2" want="" got="" rel
+  # v9.0.0: культурная раскладка репо — инструменты в tools/, TUI-бинари в bin/.
+  rel="$(xkit_repo_relpath "$name")"
+  if [ -n "$SRCDIR" ] && [ -f "$SRCDIR/$rel" ] && install_trust "$(dirname "$SRCDIR/$rel")" "$SRCDIR/$rel"; then
     if [[ "$pin" != @@*@@ ]]; then
-      got="$(sha256sum "$SRCDIR/$name" | awk '{print $1}')"
+      got="$(sha256sum "$SRCDIR/$rel" | awk '{print $1}')"
       [ "$got" = "$pin" ] || { err "Локальный $name не совпал с pin-хэшем — установка отменена"; exit 1; }
     fi
-    cp -f "$SRCDIR/$name" "$WORK/$name" || exit 1
+    mkdir -p "$(dirname "$WORK/$rel")"
+    cp -f "$SRCDIR/$rel" "$WORK/$rel" || exit 1
   else
-    log "Скачиваю: ${REPO}/${name}"
-    curl -fsSL "${REPO}/${name}" -o "$WORK/$name" || { err "Не удалось скачать $name"; exit 1; }
+    log "Скачиваю: ${REPO}/${rel}"
+    mkdir -p "$(dirname "$WORK/$rel")"
+    curl -fsSL "${REPO}/${rel}" -o "$WORK/$rel" || { err "Не удалось скачать $name"; exit 1; }
     if [[ "$pin" != @@*@@ ]]; then want="$pin"; fi
     if [ -z "$want" ]; then
       [ -s "$WORK/xkit.sh.sha256" ] || curl -fsSL "${REPO}/xkit.sh.sha256" -o "$WORK/xkit.sh.sha256" || true
-      want="$(awk -v n="$name" '$2==n{print $1;exit}' "$WORK/xkit.sh.sha256" 2>/dev/null)"
+      want="$(awk -v n="$rel" '$2==n{print $1;exit}' "$WORK/xkit.sh.sha256" 2>/dev/null)"
     fi
-    got="$(sha256sum "$WORK/$name" | awk '{print $1}')"
+    got="$(sha256sum "$WORK/$rel" | awk '{print $1}')"
     if [ -n "$want" ] && [ "$want" != "$got" ]; then err "SHA-256 $name не совпал — установка отменена"; exit 1; fi
     if [ -z "$want" ] && [ "${XKIT_ALLOW_UNVERIFIED:-0}" != 1 ]; then err "Нет SHA-256 для $name (K-02)"; exit 1; fi
   fi
-  case "$name" in *.sh) bash -n "$WORK/$name" || exit 1 ;; esac
-  chmod 700 "$WORK/$name"
+  case "$name" in *.sh) bash -n "$WORK/$rel" || exit 1 ;; esac
+  chmod 700 "$WORK/$rel"
 }
 fetch_release_component xkit_protocols.sh "$XKIT_PIN_PROTOCOLS_SHA256"
 # v8.2.0: camo-движок sitegen (движок + обёртка кластера). SHA из пломбы xkit.sh.sha256.
 fetch_release_component sitegen.py "${XKIT_PIN_SITEGEN_SHA256:-@@sitegen@@}"
 fetch_release_component camo_sitegen.py "${XKIT_PIN_CAMO_SITEGEN_SHA256:-@@camo_sitegen@@}"
+# v8.3.0: вендоренные утилиты тестирования сервера (bench.sh / ipregion.sh).
+# SHA из пломбы; ipregion — копия XKIT с вырезанной отправкой debug-лога.
+fetch_release_component bench.sh "${XKIT_PIN_BENCH_SHA256:-@@bench@@}"
+fetch_release_component ipregion.sh "${XKIT_PIN_IPREGION_SHA256:-@@ipregion@@}"
 case "$(uname -m)" in
   x86_64) fetch_release_component xkit-tui-linux-amd64 "$XKIT_PIN_TUI_AMD64_SHA256" ;;
   aarch64|arm64) fetch_release_component xkit-tui-linux-arm64 "$XKIT_PIN_TUI_ARM64_SHA256" ;;
