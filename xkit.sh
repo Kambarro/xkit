@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.2"
+XKIT_VERSION="9.1.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6104,15 +6104,20 @@ if pool_tag and nodes:
     # Служебные inbound (api) и node-туннели НЕ включаем — только клиентские.
     cascade_tags = [pool_tag] + [t for t in client_tags if t != pool_tag]
     rules.insert(1, {"inboundTag": cascade_tags, "balancerTag": "XKIT_POOL"})
-# v7.7.1: catch-all "blocked" из дефолтного шаблона 3X-UI молча убивал
-# весь не-RU трафик соло-мастера (и всё вне pool). Остаточный трафик -> direct.
+# v9.1.3 (живой баг, эталон Сергея): catch-all зависит от режима.
+# КАСКАД (есть ноды): catch-all = blocked. Иначе при «мёртвой» ноде (observatory
+# не может пропинговать ноду — напр. IPv6 на ноде не работает) leastLoad не
+# выбирает ноду и не-RU трафик УТЕКАЛ в direct с РФ-IP мастера («трафик не туда»).
+# Эталон: catch-all blocked — не-RU вне каскада честно блокируется, а не уходит
+# с российского IP. СОЛО (0 нод): catch-all = direct (сервер в RU отдаёт не-RU
+# с себя — блокировать нечего, нод нет).
 # xray 26.x отвергает правила без полей ("no effective fields"), а панель
 # выкидывает port без type:field — catch-all = type:field + port 0-65535.
-rules = [x for x in rules if not (x.get("outboundTag") == "blocked"
-         and not x.get("inboundTag") and not x.get("domain") and not x.get("ip"))]
-if not any(x.get("outboundTag") == "direct" and not x.get("inboundTag")
-           and not x.get("domain") and not x.get("ip") for x in rules):
-    rules.append({"type": "field", "port": "0-65535", "outboundTag": "direct"})
+rules = [x for x in rules if not (not x.get("inboundTag") and not x.get("domain")
+         and not x.get("ip") and x.get("outboundTag") in ("direct", "blocked")
+         and (x.get("port") == "0-65535" or not x.get("port")))]
+_catch = "blocked" if (pool_tag and nodes) else "direct"
+rules.append({"type": "field", "port": "0-65535", "outboundTag": _catch})
 r["rules"] = rules
 
 bal = r.get("balancers") or []
@@ -6136,12 +6141,47 @@ if nodes and strategy == "leastPing" and not _hy:
                           "probeUrl": "https://www.google.com/generate_204",
                           "probeInterval": "1m", "enableConcurrency": True}
 if nodes and strategy == "leastLoad" and not _hy:
+    # v9.1.3: timeout 3s / sampling 10 (как эталон Сергея) — быстрее детект
+    # мёртвой ноды; connectivity пустой (HEAD destination достаточно).
     tpl["burstObservatory"] = {"subjectSelector": ["node-"],
                                "pingConfig": {"destination": "https://www.google.com/generate_204",
-                                              "connectivity": "http://www.google.com/generate_204",
-                                              "interval": "15s", "timeout": "5s", "sampling": 20}}
+                                              "connectivity": "",
+                                              "interval": "15s", "timeout": "3s", "sampling": 10,
+                                              "httpMethod": "HEAD"}}
 print(json.dumps(tpl, ensure_ascii=False, separators=(",", ":")))
 PY
+}
+
+# v9.1.3 (живой баг): freedom-direct ноды резолвит домены в IPv6 первым, а IPv6
+# на ноде часто не работает -> observatory-пинг мастера (HEAD google/204 через
+# ноду) виснет в IPv6 -> balancer считает ноду мёртвой -> не-RU утекает в
+# catch-all. Фикс: domainStrategy=UseIPv4 у freedom-direct ноды (пинг и трафик
+# идут в рабочий IPv4). Идемпотентно: правим только freedom без UseIPv4.
+# Применяется через панельный API ноды (Bearer-токен), xray ноды рестартится.
+node_fix_freedom_ipv4() { # $1 rec -> 0 если применено/уже ок, 1 если не удалось
+  local rec="$1" ck resp tpl merged
+  ck="$(mktemp /tmp/.xkit-node-ipv4.XXXXXX)" || return 1
+  if ! node_login "$rec" "$ck" >/dev/null 2>&1; then rm -f "$ck"; return 1; fi
+  resp="$(node_api "$rec" "panel/api/xray/" POST "{}" "$ck" 2>/dev/null)"
+  tpl="$(jq -c '.obj | if type=="string" then fromjson else . end
+                | .xraySetting // {} | if type=="string" then fromjson else . end' \
+                <<<"$resp" 2>/dev/null)"
+  if ! jq -e . >/dev/null 2>&1 <<<"$tpl"; then rm -f "$ck"; return 1; fi
+  # уже UseIPv4 у всех freedom — нечего делать (идемпотентность, без рестарта)
+  if [ "$(jq '[.outbounds[]? | select(.protocol=="freedom"
+              and (.settings.domainStrategy // "") != "UseIPv4")] | length' <<<"$tpl")" = "0" ]; then
+    rm -f "$ck"; return 0
+  fi
+  merged="$(jq -c '(.outbounds[]? | select(.protocol=="freedom") | .settings.domainStrategy) = "UseIPv4"' <<<"$tpl")"
+  # панель v3 принимает xraySetting формой (как master_xray_template_set);
+  # node_api с Content-Type: application/json — шлём JSON {"xraySetting": "..."}
+  local body upd
+  body="$(jq -nc --arg x "$merged" '{xraySetting:$x}')"
+  upd="$(node_api "$rec" "panel/api/xray/update" POST "$body" "$ck" 2>/dev/null)"
+  jq -e '.success == true' <<<"$upd" >/dev/null 2>&1 || { rm -f "$ck"; return 1; }
+  node_api "$rec" "panel/api/server/restartXrayService" POST "{}" "$ck" >/dev/null 2>&1 || true
+  rm -f "$ck"
+  return 0
 }
 
 # v8.0.7: синхронизация каскада после создания клиентского инбаунда — новый
@@ -6965,6 +7005,12 @@ nodes_repair() {
         else
           err "${nm}: туннельного inbound (${ttag}) НЕТ на ноде — переподключите ноду (удалить + добавить)"
           bad=1
+        fi
+        # v9.1.3: freedom-direct ноды -> UseIPv4 (observatory-пинг не виснет в IPv6)
+        if node_fix_freedom_ipv4 "$rec"; then
+          ok "${nm}: freedom-direct UseIPv4 (пинг ноды не виснет в мёртвом IPv6)"
+        else
+          warn "${nm}: не удалось применить UseIPv4 к freedom — пинг ноды может виснуть (IPv6)"
         fi
       else
         warn "${nm}: панель ноды недоступна — inbound проверить не смог"
@@ -8832,6 +8878,18 @@ xkit_self_update() { # $1 base-url (необязательно; иначе XKIT_
   fi
   ok "Обновлено: v${XKIT_VERSION} -> v${nv} ($XKIT_BIN); резервная копия: ${XKIT_BIN}.bak"
   ok "Конфиг nginx, состояние и подписки не тронуты"
+  # v9.1.3: применяем фиксы маршрутизации к ЖИВОМУ конфигу (catch-all blocked
+  # при каскаде + freedom нод UseIPv4), чтобы не ждать ручного repair. Только
+  # если есть ноды/панель; ошибка не срывает обновление (код уже стоит).
+  if declare -F nodes_apply_template >/dev/null 2>&1; then
+    local _ncnt; _ncnt="$(nodes_load 2>/dev/null | jq 'length' 2>/dev/null || echo 0)"
+    if [ "${_ncnt:-0}" -gt 0 ]; then
+      log "Применяю фиксы маршрутизации v9.1.3 (catch-all + UseIPv4 нод)..."
+      nodes_repair >/dev/null 2>&1 \
+        && ok "Маршрутизация обновлена (catch-all blocked при каскаде, freedom нод UseIPv4)" \
+        || warn "Маршрутизация не применена автоматически — выполните: xkit nodes repair"
+    fi
+  fi
   return 0
 }
 
@@ -14731,44 +14789,40 @@ tg_bot_do_confirm() { # $1 chat, $2 action-key
 tg_bot_user_sub() { # $1 chat, $2 email
   load_xkit_env >/dev/null 2>&1 || true
   kit_session >/dev/null 2>&1 || { tg_bot_reply "$1" "Нет сессии панели"; return; }
-  local subid sp out
+  local subid sp
   subid="$(jq -r --arg email "$2" '[.[].settings|if type=="string" then fromjson? else . end|.clients[]?|select(.email==$email)|.subId // empty][0] // empty' <<<"${INBOUNDS:-[]}" 2>/dev/null)"
-  if [ -n "$subid" ]; then
-    sp="$(sub_path)"
-    out=""
-    # v8.1.1: каждая ссылка в <pre> — кнопка «копировать» в один тап
-    if [ -n "${XKIT_PANEL_SUB_PATH:-}" ] && [ -n "${XKIT_PANEL_SUB_PORT:-}" ]; then
-      out="🌐 Страница подписки (браузер: QR, ссылки, импорт):
-<pre>https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}${subid}</pre>
-
-"
-    fi
-    out="${out}Прямой импорт в приложение:
-<pre>https://${XKIT_HOST}${sp}${subid}</pre>
-Clash:
-<pre>https://${XKIT_HOST}${sp}${subid}.yaml</pre>
-sing-box:
-<pre>https://${XKIT_HOST}${sp}${subid}.json</pre>"
-  else
-    out="Подписка не найдена (создайте пользователя и обновите подписки: xkit sub)"
+  if [ -z "$subid" ]; then
+    tg_bot_reply "$1" "Подписка не найдена (создайте пользователя и обновите подписки: xkit sub)" "$(tg_bot_main_menu)"
+    return
   fi
+  sp="$(sub_path)"
   # v8.0.11: QR-картинкой прямо в чат + кнопка QR Amnezia (если есть AWG)
   local qrf kb has_awg=0
-  if [ -n "$subid" ]; then
-    has_awg="$(jq -r --arg sub "$subid" '[.[] | select(.protocol=="amneziawg") | (.settings|if type=="string" then fromjson? else . end|.clients[]?|select(.subId==$sub))]|length' <<<"${INBOUNDS:-[]}" 2>/dev/null || echo 0)"
-    qrf="$(sub_qr_png "$subid" "$XKIT_DIR" 2>/dev/null)" || qrf=""
-    if [ -n "$qrf" ]; then
-      tg_api_file sendPhoto "$1" "$qrf" "🔗 Подписка ${2} — сканируйте в приложении" >/dev/null 2>&1 || true
-      rm -f "$qrf"
-    fi
+  has_awg="$(jq -r --arg sub "$subid" '[.[] | select(.protocol=="amneziawg") | (.settings|if type=="string" then fromjson? else . end|.clients[]?|select(.subId==$sub))]|length' <<<"${INBOUNDS:-[]}" 2>/dev/null || echo 0)"
+  qrf="$(sub_qr_png "$subid" "$XKIT_DIR" 2>/dev/null)" || qrf=""
+  if [ -n "$qrf" ]; then
+    tg_api_file sendPhoto "$1" "$qrf" "🔗 Подписка ${2} — сканируйте в приложении" >/dev/null 2>&1 || true
+    rm -f "$qrf"
   fi
   if [ "$has_awg" != "0" ] && [ -n "$has_awg" ]; then
     kb="$(jq -nc --arg e "$2" '[[{text:"📱 QR Amnezia",callback_data:("aqr:"+$e)}],[{text:"🏠 Меню",callback_data:"m:main"}]]' | _tg_kb)"
   else
     kb="$(tg_bot_main_menu)"
   fi
-  tg_bot_reply_html "$1" "🔗 Подписка $(tg_html_escape "$2"):
-${out}" "$kb"
+  # v9.1.3: КАЖДАЯ ссылка — ОТДЕЛЬНОЕ сообщение с одним <pre>. В одном сообщении
+  # с несколькими <pre> Telegram на мобильном копирует ВСЁ сообщение целиком,
+  # а не выбранную ссылку. Отдельное сообщение = тап-копирование именно этой ссылки.
+  tg_bot_reply_html "$1" "🔗 Подписка $(tg_html_escape "$2") — ссылки ниже, каждая копируется отдельным тапом:" "$kb"
+  if [ -n "${XKIT_PANEL_SUB_PATH:-}" ] && [ -n "${XKIT_PANEL_SUB_PORT:-}" ]; then
+    tg_bot_reply_html "$1" "🌐 Страница подписки (браузер: QR, ссылки, импорт):
+<pre>https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}${subid}</pre>"
+  fi
+  tg_bot_reply_html "$1" "📲 Прямой импорт в приложение:
+<pre>https://${XKIT_HOST}${sp}${subid}</pre>"
+  tg_bot_reply_html "$1" "Clash:
+<pre>https://${XKIT_HOST}${sp}${subid}.yaml</pre>"
+  tg_bot_reply_html "$1" "sing-box:
+<pre>https://${XKIT_HOST}${sp}${subid}.json</pre>"
 }
 
 tg_bot_user_awg_qr() { # $1 chat, $2 email — GIF из QR-фрагментов Amnezia (или PNG)
