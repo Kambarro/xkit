@@ -4,7 +4,7 @@
 
 **Ваш VPN-сервер под ключ: панель 3X-UI за nginx, все протоколы, одна подписка на пользователя — и управление из Telegram.**
 
-![Version](https://img.shields.io/badge/version-9.1.5-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-9.1.6-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -261,6 +261,9 @@ xkit nodes profile list|switch|benchmark  # канал мастер→нода
 xkit nodes readdress ИМЯ IP       # смена IP
 xkit nodes freeze ИМЯ             # замер «заморозки» TCP
 xkit nodes repair|repin|relogin   # обслуживание
+# relogin: обновить API-токен ноды в реестре мастера. Делайте после переустановки
+# ноды или смены её токенов — иначе мастер не достучится до панели (401), а
+# repair/update не смогут проверить ноду. Меню нод → п.14, TUI → «Обновить доступ».
 
 # Тестирование САМОГО сервера (не VPN-туннеля) — напрямую с мастера или ноды
 xkit test bench [master|ИМЯ]      # паспорт VPS: система, диск, скорость канала (~6 ГБ нагрузка)

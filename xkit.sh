@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.5"
+XKIT_VERSION="9.1.6"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6086,6 +6086,20 @@ for n in nodes:
                 "streamSettings": stream, "mux": {"enabled": False, "concurrency": -1}})
 tpl["outbounds"] = generated + outb
 
+# v9.1.6 (живой баг): мастер резолвит домены в IPv6 первым (DNS отдаёт AAAA),
+# а IPv6 на РФ-мастере часто мёртв -> IPIfNonMatch резолвит в IPv6 -> geo-правила
+# не срабатывают / соединения виснут -> не-RU падает в catch-all blocked («всё
+# встало»), RU-сайты могут уезжать через ноду. Фикс: явный DNS с queryStrategy
+# UseIPv4 + freedom-direct UseIPv4 (резолв и direct-трафик только в рабочий IPv4).
+dns = tpl.get("dns") or {}
+dns["queryStrategy"] = "UseIPv4"
+if not dns.get("servers"):
+    dns["servers"] = ["1.1.1.1", "8.8.8.8"]
+tpl["dns"] = dns
+for o in tpl["outbounds"]:
+    if o.get("protocol") == "freedom":
+        o.setdefault("settings", {})["domainStrategy"] = "UseIPv4"
+
 r = tpl.setdefault("routing", {})
 # v7.7.1: AsIs не проверяет geoip для доменов — RU-IP, пришедшие доменом,
 # уезжали через ноду. IPIfNonMatch: домен без совпадения резолвится и
@@ -7020,7 +7034,7 @@ nodes_repair() {
           warn "${nm}: не удалось применить UseIPv4 к freedom — пинг ноды может виснуть (IPv6)"
         fi
       else
-        warn "${nm}: панель ноды недоступна — inbound проверить не смог"
+        warn "${nm}: панель ноды недоступна (возможно, устарел API-токен после переустановки/ротации). Обновите доступ: xkit nodes relogin ${nm} (меню нод → п.14, TUI → «Обновить доступ к панелям серверов»)"
         bad=1
       fi
       rm -f "$ck"
@@ -7337,6 +7351,7 @@ nodes_menu() {
     echo "12) Показать отличия настроек / проверить на одном / применить ко всем"
     echo "13) Ограниченный ключ доступа к панели: задать / проверить срок"
     echo "14) Получить новый ключ доступа и обновить список в 3X-UI"
+    echo "    (делайте после переустановки ноды/смены токенов — иначе мастер не достучится до панели, 401)"
     echo "15) Добавить/обновить сервер в «Узлах» 3X-UI (без импорта)"
     echo "16) Спрятать панель сервера за nginx 443 (loopback + секретный путь)"
     echo "17) Версии 3X-UI/Xray на серверах и обновление"
@@ -14825,20 +14840,21 @@ tg_bot_user_sub() { # $1 chat, $2 email
   else
     kb="$(tg_bot_main_menu)"
   fi
-  # v9.1.3: КАЖДАЯ ссылка — ОТДЕЛЬНОЕ сообщение с одним <pre>. В одном сообщении
-  # с несколькими <pre> Telegram на мобильном копирует ВСЁ сообщение целиком,
-  # а не выбранную ссылку. Отдельное сообщение = тап-копирование именно этой ссылки.
-  tg_bot_reply_html "$1" "🔗 Подписка $(tg_html_escape "$2") — ссылки ниже, каждая копируется отдельным тапом:" "$kb"
+  # v9.1.6 (D1): каждая ссылка — ОТДЕЛЬНОЕ сообщение, содержащее ТОЛЬКО URL
+  # (без подписи). Telegram на мобильном «Копировать» копирует ВСЁ сообщение;
+  # если в сообщении подпись+URL — копируется и подпись. Сообщение = только URL
+  # -> тап-копирование даёт чистую ссылку. Подписи — в заголовке выше.
+  tg_bot_reply_html "$1" "🔗 Подписка $(tg_html_escape "$2") — ниже ссылки, каждая отдельным сообщением (копируется чистый URL):" "$kb"
   if [ -n "${XKIT_PANEL_SUB_PATH:-}" ] && [ -n "${XKIT_PANEL_SUB_PORT:-}" ]; then
-    tg_bot_reply_html "$1" "🌐 Страница подписки (браузер: QR, ссылки, импорт):
-<pre>https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}${subid}</pre>"
+    tg_bot_reply_html "$1" "🌐 Страница подписки (браузер: QR, ссылки, импорт):"
+    tg_bot_reply_html "$1" "<pre>https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}${subid}</pre>"
   fi
-  tg_bot_reply_html "$1" "📲 Прямой импорт в приложение:
-<pre>https://${XKIT_HOST}${sp}${subid}</pre>"
-  tg_bot_reply_html "$1" "Clash:
-<pre>https://${XKIT_HOST}${sp}${subid}.yaml</pre>"
-  tg_bot_reply_html "$1" "sing-box:
-<pre>https://${XKIT_HOST}${sp}${subid}.json</pre>"
+  tg_bot_reply_html "$1" "📲 Прямой импорт в приложение:"
+  tg_bot_reply_html "$1" "<pre>https://${XKIT_HOST}${sp}${subid}</pre>"
+  tg_bot_reply_html "$1" "Clash:"
+  tg_bot_reply_html "$1" "<pre>https://${XKIT_HOST}${sp}${subid}.yaml</pre>"
+  tg_bot_reply_html "$1" "sing-box:"
+  tg_bot_reply_html "$1" "<pre>https://${XKIT_HOST}${sp}${subid}.json</pre>"
 }
 
 tg_bot_user_awg_qr() { # $1 chat, $2 email — GIF из QR-фрагментов Amnezia (или PNG)
