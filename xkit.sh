@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.1"
+XKIT_VERSION="9.1.2"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -5858,9 +5858,18 @@ node_login() { # $1 rec, $2 cookie — v7.2.9: двухфазный CSRF фор�
 # токен не зависит от пароля/2FA — предпочтительный путь. Источники:
 # авто-сбор в node_add из install-result.env по SSH (node_token_fetch),
 # ручной «xkit nodes token set» (v7.x), обновление «xkit nodes relogin».
-node_token_fetch() { # $1 rec -> stdout: XUI_API_TOKEN из install-result.env (пусто = нет токена)
-  # парсинг БЕЗ source (файл пишет инсталлятор, аудит №8 у мастера): awk с
-  # точным сравнением ключа, снятие \r и парных кавычек
+node_token_fetch() { # $1 rec -> stdout: рабочий API-токен панели ноды (пусто = нет)
+  # v9.1.2 (живой баг): install-result.env содержит токен, который панель v3.11
+  # НЕ принимает (хешируется иначе / ротируется при миграции) — Bearer давал 401.
+  # Надёжный источник — свежая генерация CLI: `x-ui setting -getApiToken` печатает
+  # рабочий токен (панель хранит только хеши, plaintext отдаёт лишь при генерации).
+  # Именованный токен xkit-managed: повторная генерация ротирует ТОЛЬКО его,
+  # install-токен панели не трогаем. Фолбэк — install-result.env (старые панели).
+  local t
+  t="$(node_ssh "$1" "/usr/local/x-ui/x-ui setting -getApiToken -tokenName xkit-managed 2>/dev/null" 2>/dev/null \
+    | awk '/apiToken:/{print $2; exit}' | tr -d '\r[:space:]')"
+  if [[ "$t" =~ ^[A-Za-z0-9._~-]{20,512}$ ]]; then printf '%s' "$t"; return 0; fi
+  # фолбэк: install-result.env (панели без CLI getApiToken / v2)
   node_ssh "$1" "cat /etc/x-ui/install-result.env 2>/dev/null" 2>/dev/null \
     | awk -F= -v k="XUI_API_TOKEN" '$1==k { sub(/^[^=]*=/, ""); print; exit }' \
     | tr -d '\r' | sed -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'\$//"
@@ -6586,6 +6595,15 @@ EOS
   nbase="$(normalize_panel_path "${nbase:-/}")"
   rec="$(jq -c --argjson pp "$np_port" --arg u "$np_user" --arg p "$np_pass" --arg b "$nbase" \
         '.panel = {port:$pp, user:$u, pass:$p, base:$b, tls:true}' <<<"$rec")"
+  # v9.1.2 (живой баг): UFW ноды может быть уже активен (от прошлой установки)
+  # с политикой deny incoming — новый порт панели ЗАКРЫТ, и логин/токен с мастера
+  # (снаружи) падали в таймаут, хотя локально панель исправна. Разрешаем порт
+  # панели для IP мастера ДО логина — тот же порядок, что в node_reconnect_one.
+  local early_myip; early_myip="$(pubip)"
+  if is_ip "$early_myip" && node_ssh "$rec" "command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'" >/dev/null 2>&1; then
+    node_ssh "$rec" "ufw allow from '${early_myip}' to any port '${np_port}' proto tcp comment 'XKIT:node-panel'" >/dev/null 2>&1 \
+      || warn "Не удалось заранее разрешить порт панели в UFW — логин может не пройти"
+  fi
   # v7.2.11: авто-сбор API-токена панели ноды (3X-UI v3.11+ пишет XUI_API_TOKEN
   # в /etc/x-ui/install-result.env): Bearer-путь node_api не зависит от пароля
   # и CSRF — то, что у мастера с v7.2.5, но автоматом. Верифицируем живой
