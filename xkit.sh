@@ -14744,6 +14744,9 @@ $(printf '%s' "$err" | tail -c 500)"
 # отправка результата длинной операции (вызывается ExecStartPost)
 tg_bot_notify_result() { # $1 chat, $2 result-file
   local chat="$1" f="$2" out
+  # v9.1.8: CLI-путь (ExecStartPost) не загружает env — без токена tg_api
+  # крутил цикл retry до таймаута systemd (90с) и отчёт терялся. Грузим сами.
+  load_xkit_env >/dev/null 2>&1 || true
   out="$(tail -c 3500 "$f" 2>/dev/null || echo '(нет вывода)')"
   tg_send_message "$chat" "📋 Результат:
 ${out}"
