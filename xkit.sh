@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.2.0"
+XKIT_VERSION="9.2.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6169,23 +6169,32 @@ _hy = any((n.get("tunnel") or {}).get("proto") == "hysteria2" for n in nodes)
 if _hy and strategy in ("leastLoad", "leastPing"):
     strategy = "roundRobin"
 if nodes:
-    bal.append({"tag": "XKIT_POOL", "selector": ["node-"], "strategy": {"type": strategy,
-                **({"expected": 1} if strategy == "leastLoad" else {})}})
+    # v9.2.1 (живой фикс Сергея): leastLoad без maxRTT/baselines панель ставит
+    # maxRTT=1s/baselines=["150"] — живая нода с RTT ~0.7s отбраковывалась как
+    # «медленная» при живом транспорте. Рабочий набор: maxRTT 3s, baselines [],
+    # tolerance 0.1 (запас 4x к RTT, нет искусственного порога, допуск 10%).
+    _st = {"type": strategy}
+    if strategy == "leastLoad":
+        _st["settings"] = {"expected": 1, "maxRTT": "3s", "tolerance": 0.1,
+                           "baselines": [], "costs": []}
+    bal.append({"tag": "XKIT_POOL", "selector": ["node-"], "strategy": _st})
 r["balancers"] = bal
 
 tpl.pop("observatory", None)
 tpl.pop("burstObservatory", None)
 if nodes and strategy == "leastPing" and not _hy:
     tpl["observatory"] = {"subjectSelector": ["node-"],
-                          "probeUrl": "https://www.google.com/generate_204",
-                          "probeInterval": "1m", "enableConcurrency": True}
+                          "probeUrl": "https://cp.cloudflare.com/generate_204",
+                          "probeInterval": "30s", "enableConcurrency": True}
 if nodes and strategy == "leastLoad" and not _hy:
-    # v9.1.3: timeout 3s / sampling 10 (как эталон Сергея) — быстрее детект
-    # мёртвой ноды; connectivity пустой (HEAD destination достаточно).
+    # v9.2.1 (рабочий набор Сергея, подтверждён живьём): cloudflare доступнее
+    # google из РФ-сегмента; interval 30s (детект смерти за полминуты), sampling 10
+    # сглаживает случайный лаг (нода не «моргает» от одной медленной пробы),
+    # timeout 3s, HEAD. connectivity пустой (HEAD destination достаточно).
     tpl["burstObservatory"] = {"subjectSelector": ["node-"],
-                               "pingConfig": {"destination": "https://www.google.com/generate_204",
+                               "pingConfig": {"destination": "https://cp.cloudflare.com/generate_204",
                                               "connectivity": "",
-                                              "interval": "15s", "timeout": "3s", "sampling": 10,
+                                              "interval": "30s", "timeout": "3s", "sampling": 10,
                                               "httpMethod": "HEAD"}}
 print(json.dumps(tpl, ensure_ascii=False, separators=(",", ":")))
 PY
@@ -6961,7 +6970,7 @@ EOS
   fi
   # v7.7.4: URL панели ноды показывается ОДИН раз — в реквизитах ниже (раньше
   # дублировался здесь с UFW-статусом, который к маскировке уже не относится).
-  ok "Стратегия: ${XKIT_BAL_STRATEGY:-leastLoad} (сменить: Ноды -> стратегия)"
+  ok "Стратегия: $(bal_strategy_live) (сменить: Ноды -> стратегия)"
   # (7.4.0): реквизиты панели ноды показываем в конце установки — пользователь
   # должен видеть логин/пароль один раз глазами, не выковыривая их из реестра
   echo ""
@@ -7166,6 +7175,14 @@ node_relogin() { # $1 имя|all, [$2 = none]
   return 0
 }
 
+# v9.2.1: РЕАЛЬНАЯ стратегия из живого xray-конфига (панель могла сменить вручную;
+# XKIT_BAL_STRATEGY — лишь последний выбор xkit, не истина). Фолбэк на env.
+bal_strategy_live() {
+  local s=""
+  [ -r /usr/local/x-ui/bin/config.json ] && s="$(jq -r '.routing.balancers[0].strategy.type // empty' /usr/local/x-ui/bin/config.json 2>/dev/null)"
+  printf '%s' "${s:-${XKIT_BAL_STRATEGY:-leastLoad}}"
+}
+
 nodes_list() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   local arr cnt
@@ -7178,7 +7195,7 @@ nodes_list() {
   while IFS=$'\t' read -r n h sp tp sni pp; do
     printf '%-10s %-22s %-6s %-9s %-24s %-8s\n' "$n" "$h" "$sp" "$tp" "$sni" "$pp"
   done < <(jq -r '.[] | [.name, .host, (.ssh_port|tostring), (.tunnel.port|tostring), .tunnel.sni, (.panel.port|tostring)] | @tsv' <<<"$arr")
-  ok "Стратегия: ${XKIT_BAL_STRATEGY:-leastLoad}"
+  ok "Стратегия: $(bal_strategy_live)"
   return 0
 }
 
@@ -9200,7 +9217,11 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
     node_names="$(jq -c '[.[].name]' "$XKIT_NODES" 2>/dev/null || echo '[]')"
   fi
   # v7.7.8: ссылка каскада в snapshot (TUI показывает «Ссылка каскада» без CLI)
-  if [ -n "${XKIT_POOL_INBOUND:-}" ] && kit_session >/dev/null 2>&1; then
+  # v9.2.1: ОДИН kit_session на snapshot (раньше два: pool_link + inbounds —
+  # каждый detect_panel_scheme/api_token_ok ~1с, суммарно >5с -> TUI timeout).
+  local _sess_ok=false
+  kit_session >/dev/null 2>&1 && _sess_ok=true
+  if [ -n "${XKIT_POOL_INBOUND:-}" ] && [ "$_sess_ok" = true ]; then
     local _pib _pcl
     _pib="$(api_get_inbound "$XKIT_POOL_INBOUND" 2>/dev/null || true)"
     _pcl="$(jq -c '.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[0] // empty' <<<"${_pib:-}" 2>/dev/null)"
@@ -9226,8 +9247,8 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
   fi
   local latest; latest="$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'xkit-*.tar.gz' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n1 | cut -d' ' -f2-)"
   if [ -n "$latest" ]; then backup_hours=$(( ($(date +%s)-$(stat -c %Y "$latest" 2>/dev/null || date +%s))/3600 )); fi
-  if kit_session >/dev/null 2>&1; then
-    inbounds="$(api_list 2>/dev/null || true)"
+  if [ "$_sess_ok" = true ]; then
+    inbounds="${INBOUNDS:-$(api_list 2>/dev/null || true)}"
     # v8.0.7: технический pool (email pool-XXXX) не считаем клиентом
     client_names="$(jq -c '[.[]? | select((.id|tostring) != ("'"${XKIT_POOL_INBOUND:-}"'"))
                            | (.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?)
@@ -9249,13 +9270,17 @@ xkit_snapshot() { # только агрегаты; без UUID, privateKey, па
             then . + {freeze:{verdict:$r.verdict, at:($r.at // 0)}}
             else . end)' <<<"$nodes_metrics" 2>/dev/null || echo "$nodes_metrics")"
   fi
+  # v9.2.1: реальная стратегия из живого конфига (панель могла сменить вручную)
+  local strategy=""
+  [ -r /usr/local/x-ui/bin/config.json ] && strategy="$(jq -r '.routing.balancers[0].strategy.type // empty' /usr/local/x-ui/bin/config.json 2>/dev/null)"
+  strategy="${strategy:-${XKIT_BAL_STRATEGY:-leastLoad}}"
   jq -nc --arg host "$host" --arg mode "$mode" --arg generated "$(date -Iseconds)" \
     --argjson nodes "$nodes" --argjson nodes_ok "$nodes_ok" --argjson clients "$clients" \
     --argjson nginx "$nginx" --argjson xui "$xui" --argjson xray "$xray" \
     --argjson cert_days "$cert_days" --argjson backup_hours "$backup_hours" --argjson protocols "$protocols" \
     --argjson nodes_metrics "$nodes_metrics" --argjson metrics_generated "$metrics_generated" --argjson client_names "$client_names" \
-    --argjson node_names "$node_names" --arg pool_link "$pool_link" \
-    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,client_names:$client_names,node_names:$node_names,pool_link:$pool_link,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,nodes_metrics:$nodes_metrics,metrics_generated:$metrics_generated,generated:$generated}'
+    --argjson node_names "$node_names" --arg pool_link "$pool_link" --arg strategy "$strategy" \
+    '{host:$host,mode:$mode,nodes:$nodes,nodes_ok:$nodes_ok,clients:$clients,client_names:$client_names,node_names:$node_names,pool_link:$pool_link,strategy:$strategy,nginx:$nginx,xui:$xui,xray:$xray,cert_days:$cert_days,backup_hours:$backup_hours,protocols:$protocols,nodes_metrics:$nodes_metrics,metrics_generated:$metrics_generated,generated:$generated}'
 }
 
 #=========================== ФАЙЛ ОТВЕТОВ (v7.2.0) ============================
