@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.2.4"
+XKIT_VERSION="9.2.5"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -2139,6 +2139,16 @@ api_update_client() { # $1 id инбаунда, $2 email, $3 полный JSON �
 # клиенты остаются; выключенный не слушает порт и пропадает из подписок.
 api_set_inbound_enable() { # $1 id, $2 true|false
   local id="$1" en="$2" cur resp
+  # v9.2.5 (живой баг Сергея): панель v3 (3.11+) ИГНОРИРУЕТ поле enable в
+  # inbounds/update/:id — update возвращает success, но enable в БД не меняется.
+  # Отключение протокола через TUI «работало» (success), но инбаунд оставался
+  # включённым и в подписке. Правильный endpoint — inbounds/setEnable/:id.
+  # Для v2 (старая панель) setEnable может отсутствовать — фолбэк на update.
+  if [ "${API_V3:-0}" = "1" ]; then
+    resp="$(api_post "setEnable/$id" "$(jq -nc --argjson e "$en" '{enable:$e}')")" || return 1
+    if jq -e '.success == true' <<<"$resp" >/dev/null 2>&1; then return 0; fi
+    # setEnable не принят — фолбэк на update (ниже)
+  fi
   cur="$(api_get_inbound "$id")" || return 1
   cur="$(jq -c --argjson e "$en" '.enable=$e' <<<"$cur")" || return 1
   api_update_inbound "$id" "$cur"
