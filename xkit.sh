@@ -14354,7 +14354,15 @@ _tg_curl_via() { # $1 transport-json, $2 method, $3 data, [$4 extra-curl-args \x
   local -a ex=()
   [ -n "$extra" ] && IFS=$'\x1f' read -r -a ex <<<"$extra"
   out="$({ printf 'request = "POST"\nurl = "https://api.telegram.org/bot%s/%s"\n' "$token" "$method"
-    [ -n "$data" ] && printf 'data = "%s"\n' "$data"
+    # v9.1.8: JSON-тело — data-binary + Content-Type (curl -K "data=" шлёт
+    # form-urlencoded: Telegram молча игнорировал JSON-поля — setMyCommands
+    # возвращал ok:true, но список оставался пустым; menu_button тоже не применялся).
+    if [ -n "$data" ]; then
+      case "$data" in
+        \{*|\[*) printf 'header = "Content-Type: application/json"\ndata-binary = "%s"\n' "$(printf '%s' "$data" | sed 's/\\/\\\\/g; s/"/\\"/g')" ;;
+        *) printf 'data = "%s"\n' "$data" ;;
+      esac
+    fi
     true
   } | curl -sf --connect-timeout 3 --max-time 30 ${px[@]+"${px[@]}"} ${ex[@]+"${ex[@]}"} -K - 2>/dev/null)"
   rc=$?
