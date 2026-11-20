@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.2.1"
+XKIT_VERSION="9.2.2"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -10875,7 +10875,7 @@ xui_install_url() {
 #--- списки релизов GitHub с кэшем 6ч -----------------------------------------
 # _releases_cached <repo> <n> -> теги (новые сверху). Кэш в файле; при свежем
 # кэше API не дёргается. Пустой результат = сеть/лимит недоступны (фолбэк ручной).
-_releases_cached() { # $1 repo (MHSanaei/3x-ui), $2 сколько
+_releases_cached() { # $1 repo (MHSanaei/3x-ui), $2 сколько; формат кэша: tag<TAB>stable|pre
   local repo="$1" n="${2:-5}" cf now mt tags
   mkdir -p "$XKIT_RELEASES_CACHE" 2>/dev/null || true
   cf="${XKIT_RELEASES_CACHE}/$(echo "$repo" | tr '/' '_').tags"
@@ -10883,22 +10883,40 @@ _releases_cached() { # $1 repo (MHSanaei/3x-ui), $2 сколько
   if [ -r "$cf" ]; then
     mt="$(stat -c %Y "$cf" 2>/dev/null || echo 0)"
     if [ $((now-mt)) -lt "$XKIT_RELEASES_TTL" ] && [ -s "$cf" ]; then
-      head -n "$n" "$cf"; return 0
+      head -n "$n" "$cf" | cut -f1; return 0
     fi
   fi
-  tags="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=${n}" 2>/dev/null \
-    | jq -r '.[].tag_name' 2>/dev/null | grep -E '^v[0-9]+(\.[0-9]+)+$' | head -n "$n")"
+  # v9.2.2: prerelease/draft помечаются (живой баг: dev-latest/предрелиз Xray
+  # выглядел как обычная версия — пользователь ставил nightly случайно).
+  # Берём с запасом (n*3), чтобы после фильтрации draft осталось >= n.
+  tags="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${repo}/releases?per_page=$((n*3))" 2>/dev/null \
+    | jq -r '.[] | select(.draft != true) | [.tag_name, (if .prerelease then "pre" else "stable" end)] | @tsv' 2>/dev/null \
+    | grep -E '^v[0-9]+(\.[0-9]+)+' | head -n "$n")"
   if [ -n "$tags" ]; then
     printf '%s\n' "$tags" > "$cf" 2>/dev/null || true
-    printf '%s\n' "$tags"
+    printf '%s\n' "$tags" | cut -f1
   elif [ -r "$cf" ] && [ -s "$cf" ]; then
-    head -n "$n" "$cf"   # устаревший кэш лучше пустоты
+    head -n "$n" "$cf" | cut -f1   # устаревший кэш лучше пустоты
   fi
+}
+# v9.2.2: статус релиза (stable/pre) по тегу из кэша; нет в кэше — stable (не пугаем).
+_release_status() { # $1 repo, $2 tag -> stable|pre
+  local cf="${XKIT_RELEASES_CACHE}/$(echo "$1" | tr '/' '_').tags" s=""
+  [ -r "$cf" ] && s="$(awk -F'\t' -v t="$2" '$1==t{print $2; exit}' "$cf" 2>/dev/null)"
+  printf '%s' "${s:-stable}"
 }
 xui_releases_list() { _releases_cached "MHSanaei/3x-ui" "${1:-5}"; }
 xray_releases_list() { _releases_cached "XTLS/Xray-core" "${1:-5}"; }
-xui_tag_latest() { xui_releases_list 1 | head -n1; }
-xray_tag_latest() { xray_releases_list 1 | head -n1; }
+# v9.2.2: «последняя» = последний СТАБИЛЬНЫЙ (pre пропускаем; если все pre — первый).
+_tag_latest_stable() { # $1 repo
+  local cf="${XKIT_RELEASES_CACHE}/$(echo "$1" | tr '/' '_').tags" t=""
+  _releases_cached "$1" 5 >/dev/null 2>&1
+  [ -r "$cf" ] && t="$(awk -F'\t' '$2=="stable"{print $1; exit}' "$cf" 2>/dev/null)"
+  [ -n "$t" ] || t="$(_releases_cached "$1" 1)"
+  printf '%s' "$t"
+}
+xui_tag_latest() { _tag_latest_stable "MHSanaei/3x-ui"; }
+xray_tag_latest() { _tag_latest_stable "XTLS/Xray-core"; }
 
 #--- базовые хелперы версий ---------------------------------------------------
 version_norm() { local v="${1#v}"; [[ "$v" =~ ^[0-9]+(\.[0-9]+)+$ ]] || return 1; printf '%s' "$v"; }
@@ -11033,10 +11051,14 @@ version_pick() { # $1 kind, $2 default-tag (необязательно)
   echo "" >&2
   if [ -n "$rel" ]; then
     echo "Доступные версии ${hint} (новые сверху):" >&2
+    local _repo _st _mark
+    case "$kind" in xui) _repo="MHSanaei/3x-ui" ;; xray) _repo="XTLS/Xray-core" ;; esac
     while IFS= read -r t; do
       [ -n "$t" ] || continue
-      if [ "$i" = 1 ]; then printf '  %d) %s  (последняя)\n' "$i" "$t" >&2
-      else printf '  %d) %s\n' "$i" "$t" >&2; fi
+      _st="$(_release_status "$_repo" "$t")"; _mark=""
+      [ "$_st" = "pre" ] && _mark="  ⚠ ПРЕДРЕЛИЗ (не стабильная)"
+      if [ "$i" = 1 ]; then printf '  %d) %s  (последняя)%s\n' "$i" "$t" "$_mark" >&2
+      else printf '  %d) %s%s\n' "$i" "$t" "$_mark" >&2; fi
       i=$((i+1))
     done <<<"$rel"
     echo "  0) ввести версию вручную" >&2
@@ -11105,11 +11127,11 @@ versions_installer_select() {
 #--- список/статус/установка/откат (мастер) -----------------------------------
 versions_list() { # доступные релизы (не манифест — его больше нет)
   echo "3X-UI (GitHub, последние 5):"
-  local t i=1 x; t="$(xui_releases_list 5)"
-  if [ -n "$t" ]; then while IFS= read -r x; do printf '  %d) %s\n' "$i" "$x"; i=$((i+1)); done <<<"$t"; else echo "  (список недоступен — GitHub API лимит/сеть)"; fi
+  local t i=1 x _m; t="$(xui_releases_list 5)"
+  if [ -n "$t" ]; then while IFS= read -r x; do _m=""; [ "$(_release_status MHSanaei/3x-ui "$x")" = "pre" ] && _m="  ⚠ ПРЕДРЕЛИЗ"; printf '  %d) %s%s\n' "$i" "$x" "$_m"; i=$((i+1)); done <<<"$t"; else echo "  (список недоступен — GitHub API лимит/сеть)"; fi
   echo "Xray (GitHub, последние 5):"
   i=1; t="$(xray_releases_list 5)"
-  if [ -n "$t" ]; then while IFS= read -r x; do printf '  %d) %s\n' "$i" "$x"; i=$((i+1)); done <<<"$t"; else echo "  (список недоступен — GitHub API лимит/сеть)"; fi
+  if [ -n "$t" ]; then while IFS= read -r x; do _m=""; [ "$(_release_status XTLS/Xray-core "$x")" = "pre" ] && _m="  ⚠ ПРЕДРЕЛИЗ"; printf '  %d) %s%s\n' "$i" "$x" "$_m"; i=$((i+1)); done <<<"$t"; else echo "  (список недоступен — GitHub API лимит/сеть)"; fi
   echo "Подсказка: Xray 26.6.27 — последнее ядро, совместимое со всеми клиентами (Mihomo/sing-box); новее — проверяйте сами."
   echo "Установка: xkit versions install (выбор номером) | xkit versions latest | xkit versions install <3xui> <xray>"
 }
@@ -11153,6 +11175,13 @@ versions_install() { # [xui xray] [--allow-downgrade]; без аргументо
   if [ "$uv" = "$u" ] && [ "$xcur" = "$x" ]; then
     ok "Связка 3X-UI $u + Xray $x уже установлена — пропускаю скачивание/переустановку"
     return 0
+  fi
+  # v9.2.2: явное предупреждение при установке ПРЕДРЕЛИЗА (не стабильная сборка).
+  local _pu _px
+  _pu="$(_release_status MHSanaei/3x-ui "v$u")"; _px="$(_release_status XTLS/Xray-core "v$x")"
+  if [ "$_pu" = "pre" ] || [ "$_px" = "pre" ]; then
+    warn "ВНИМАНИЕ: выбран ПРЕДРЕЛИЗ (3X-UI v$u=$_pu, Xray v$x=$_px) — не стабильная сборка, возможны баги."
+    confirm "Точно установить предрелиз? [y/N] " n || return 1
   fi
   confirm "Установить связку 3X-UI $u + Xray $x с backup и автоматическим rollback? [y/N]" || return 1
   version_arch || return 1
