@@ -71,7 +71,7 @@ Unattended: append `-s -- -y` (over an existing install: `--force`).
 
 ### Migrating from a backup
 
-Put an `xkit-*.tar.gz` archive into `/root/xkit-restore/` and run the installer — it offers a full or partial restore (certificates, users & panel, nodes). Nodes reconnect on their own; clients keep their subscriptions.
+Put an `xkit-*.tar.gz` archive into `/root/xkit-restore/` and run the installer — it offers a full or partial restore (certificates, users & panel, nodes). Nodes reconnect on their own; clients keep their subscriptions. Step-by-step master migration with nodes — see [🚚 Migrating the master](#-migrating-the-master-to-another-server-with-nodes).
 
 ### Run
 
@@ -222,6 +222,98 @@ Per-node credentials live in `/root/xkit-node-NAME.txt` (mode 600).
 | Lease expiry | `xkit expiry set / list` — Telegram reminders |
 | Action log | `xkit audit` |
 | Diagnostic bundle | `xkit doctor export` — secrets stripped, safe to share |
+
+---
+
+## 🚚 Migrating the master to another server (with nodes)
+
+Full migration of the main server to a new machine **without reinstalling nodes
+and without changing client subscriptions**. Nodes stay where they are — only
+the master moves; clients keep using the same links (same domain).
+
+### What is preserved
+- **Panel & users** — the 3X-UI DB (inbounds, UUIDs, quotas, expiry) from backup.
+- **Subscriptions** — same `SUB_TOKEN` and paths: client links do not change.
+- **Certificates** — Let's Encrypt / IP / self-signed from backup (no reissue
+  if the domain and type are unchanged).
+- **Nodes** — the `nodes.json` registry, SSH keys, rental expiry; tunnels and
+  inbounds on nodes are **untouched**. The new master reconnects to existing panels.
+
+### Step 1. Backup on the old master
+```bash
+xkit backup            # creates /var/backups/xkit/xkit-YYYYMMDD-HHMMSS.tar.gz
+xkit backup verify     # verify the archive
+```
+The archive includes: `/etc/xkit` (state, nodes, keys), panel DB, subscriptions,
+nginx config, certificates (`/etc/nginx/ssl`, `/etc/letsencrypt`), AWG/Hysteria2
+services. **PostgreSQL**: `x-ui.db` is not included — back up the panel first
+(Panel Settings → Backup). For transfer over an untrusted channel:
+`xkit backup export` (age encryption to a public recipient; keep the private key separately).
+
+Copy the archive to the new server (scp/rsync) into `/root/xkit-restore/`:
+```bash
+scp /var/backups/xkit/xkit-*.tar.gz root@NEW_IP:/root/xkit-restore/
+```
+
+### Step 2. DNS (if using a domain)
+Point the domain's **A record to the new server IP** in advance. The domain must
+resolve to the new IP before certificate issuance/verification. Lower the TTL
+ahead of time. Nodes use their own subdomains (api./dev.) — their A records
+**do not change** (nodes stay on their IPs).
+
+### Step 3. Install on the new server
+```bash
+curl -fsSL https://raw.githubusercontent.com/kambarro/xkit/main/install.sh | sudo bash
+```
+The installer finds the archive in `/root/xkit-restore/` and offers a restore:
+- **5) Full master migration** — certificates + panel/users + subscriptions +
+  nodes (recommended for migration).
+- Partial: 1) certs only, 2) panel/users, 3) + subscriptions, 4) nodes.
+
+Enter the **same domain/address** as on the old master. The certificate from the
+backup is reused without reissue (CERT_MODE 0). If the domain changed — choose
+issuance of a new one (LE/IP/self-signed).
+
+### Step 4. Nodes reconnect automatically
+On full migration the installer runs `nodes_restore_reconnect`: for each node —
+SSH check, **allowing the new master IP in the node's UFW** (panel port), login
+to the existing panel, `nodes repair` (tunnels/routes), `panel-sync` (3X-UI
+"Nodes"). **No node reinstall.**
+
+If something did not come up:
+```bash
+xkit nodes check all --deep    # SSH/API/resources of each node
+xkit nodes relogin all         # refresh API tokens (after rotation/reinstall)
+xkit nodes repair              # reapply tunnels and routing
+```
+
+### Step 5. Verify
+```bash
+xkit health deep       # probe as a real client via our links
+xkit status            # services, ports, what is exposed
+xkit nodes metrics     # node traffic/speed
+```
+Connect a client with the **old subscription** — links are unchanged, traffic
+should flow through the nodes. Telegram bot: `xkit telegram setup` — re-enter token/chat
+(they are not part of the state backup); transports via nodes come up on their own.
+
+### Notes
+- **IP certificate (CERT_MODE 3)** is bound to the IP: changing the IP requires
+  reissue for the new address (the installer offers it). A domain LE cert from
+  backup works on the new IP once the A record is switched.
+- **Node UFW**: the old master IP remains in allow rules — harmless, but you can
+  clean it (`xkit nodes ufw <name> status`). The new IP is added automatically.
+- **Camo site**: the seed is in the backup — same brand on the new master; nodes
+  keep their variations.
+- **Old master**: do not shut it down immediately; make sure clients and nodes
+  work on the new one, then `xkit uninstall --full` on the old (backup mandatory).
+- **Rollback**: if the new server fails — DNS back to the old IP, the old master
+  is still intact. On the new one: `xkit restore --dry-run` before applying.
+
+### Migrating a single node (not the master)
+Change a node's IP without reinstall: `xkit nodes readdress <name> <new-IP>`
+(`--dry-run` first). The master updates the registry, tunnel and UFW; clients
+won't notice.
 
 ---
 
