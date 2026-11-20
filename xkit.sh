@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.2.3"
+XKIT_VERSION="9.2.4"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6160,6 +6160,10 @@ new_rules.append({"type": "field", "port": "0-65535", "outboundTag": _catch})
 r["rules"] = new_rules
 
 bal = r.get("balancers") or []
+# v9.2.4: сохраняем СУЩЕСТВУЮЩИЙ XKIT_POOL (стратегия + settings maxRTT/baselines/
+# tolerance — владелец мог настроить через UI панели осознанно). Пересобираем
+# только selector/теги; стратегию берём из существующего, если не передана явно.
+_old_pool = next((b for b in bal if b.get("tag") == "XKIT_POOL"), None)
 bal = [b for b in bal if b.get("tag") != "XKIT_POOL"]
 # v7.7.3: xray 26.x паникует (SIGSEGV в tls.WithDestination) при hysteria-outbound +
 # burstObservatory (leastLoad). x-ui добавляет observatory при leastLoad сам, из шаблона
@@ -6169,33 +6173,46 @@ _hy = any((n.get("tunnel") or {}).get("proto") == "hysteria2" for n in nodes)
 if _hy and strategy in ("leastLoad", "leastPing"):
     strategy = "roundRobin"
 if nodes:
-    # v9.2.1 (живой фикс Сергея): leastLoad без maxRTT/baselines панель ставит
-    # maxRTT=1s/baselines=["150"] — живая нода с RTT ~0.7s отбраковывалась как
-    # «медленная» при живом транспорте. Рабочий набор: maxRTT 3s, baselines [],
-    # tolerance 0.1 (запас 4x к RTT, нет искусственного порога, допуск 10%).
+    # v9.2.4: существующая стратегия пула (выбор владельца через UI панели) —
+    # сохраняем тип И settings (maxRTT/baselines/tolerance/costs). Дефолтный
+    # рабочий набор (v9.2.1) применяется только к НОВОМУ пулу без settings.
     _st = {"type": strategy}
+    _old_st = (_old_pool or {}).get("strategy") or {}
+    _old_settings = _old_st.get("settings")
     if strategy == "leastLoad":
-        _st["settings"] = {"expected": 1, "maxRTT": "3s", "tolerance": 0.1,
-                           "baselines": [], "costs": []}
+        if isinstance(_old_settings, dict) and _old_settings:
+            _st["settings"] = _old_settings   # сохраняем ручной тюнинг владельца
+        else:
+            _st["settings"] = {"expected": 1, "maxRTT": "3s", "tolerance": 0.1,
+                               "baselines": [], "costs": []}
     bal.append({"tag": "XKIT_POOL", "selector": ["node-"], "strategy": _st})
 r["balancers"] = bal
 
-tpl.pop("observatory", None)
-tpl.pop("burstObservatory", None)
+# v9.2.4: observatory/burstObservatory — сохраняем существующие настройки владельца
+# (destination/interval/timeout/sampling), если они уже есть; дефолтный рабочий
+# набор (v9.2.1) — только когда observatory отсутствует. Стратия roundRobin/random
+# не требует observatory — убираем (как раньше).
+_old_obs = tpl.pop("observatory", None)
+_old_burst = tpl.pop("burstObservatory", None)
 if nodes and strategy == "leastPing" and not _hy:
-    tpl["observatory"] = {"subjectSelector": ["node-"],
-                          "probeUrl": "https://cp.cloudflare.com/generate_204",
-                          "probeInterval": "30s", "enableConcurrency": True}
+    if isinstance(_old_obs, dict) and _old_obs.get("probeUrl"):
+        tpl["observatory"] = _old_obs
+    else:
+        tpl["observatory"] = {"subjectSelector": ["node-"],
+                              "probeUrl": "https://cp.cloudflare.com/generate_204",
+                              "probeInterval": "30s", "enableConcurrency": True}
 if nodes and strategy == "leastLoad" and not _hy:
     # v9.2.1 (рабочий набор Сергея, подтверждён живьём): cloudflare доступнее
-    # google из РФ-сегмента; interval 30s (детект смерти за полминуты), sampling 10
-    # сглаживает случайный лаг (нода не «моргает» от одной медленной пробы),
-    # timeout 3s, HEAD. connectivity пустой (HEAD destination достаточно).
-    tpl["burstObservatory"] = {"subjectSelector": ["node-"],
-                               "pingConfig": {"destination": "https://cp.cloudflare.com/generate_204",
-                                              "connectivity": "",
-                                              "interval": "30s", "timeout": "3s", "sampling": 10,
-                                              "httpMethod": "HEAD"}}
+    # google из РФ-сегмента; interval 30s, sampling 10, timeout 3s, HEAD.
+    # v9.2.4: существующий burst владельца сохраняем (не перетираем при repair/update).
+    if isinstance(_old_burst, dict) and (_old_burst.get("pingConfig") or {}).get("destination"):
+        tpl["burstObservatory"] = _old_burst
+    else:
+        tpl["burstObservatory"] = {"subjectSelector": ["node-"],
+                                   "pingConfig": {"destination": "https://cp.cloudflare.com/generate_204",
+                                                  "connectivity": "",
+                                                  "interval": "30s", "timeout": "3s", "sampling": 10,
+                                                  "httpMethod": "HEAD"}}
 print(json.dumps(tpl, ensure_ascii=False, separators=(",", ":")))
 PY
 }
@@ -6267,7 +6284,14 @@ nodes_apply_template() {
   chmod 600 "$nodes_file" 2>/dev/null || true
   printf '%s' "$nodes_json" > "$nodes_file"
   local mrc=0
-  merged="$(nodes_merge_template "$cur" "$nodes_file" "${XKIT_POOL_TAG:-}" "${XKIT_BAL_STRATEGY:-leastLoad}" "$client_tags")" || mrc=$?
+  # v9.2.4: стратегия балансера — СОХРАНЯЕМ выбор из текущего шаблона панели
+  # (владелец мог сменить через UI панели осознанно). env XKIT_BAL_STRATEGY —
+  # только фолбэк для НОВОГО пула (в шаблоне ещё нет XKIT_POOL). Раньше merge
+  # всегда брал env и перетирал ручной выбор панели при repair/update.
+  local _bal_strategy
+  _bal_strategy="$(jq -r --arg t "${XKIT_POOL_TAG:-XKIT_POOL}" '.routing.balancers[]? | select(.tag==$t) | .strategy.type // empty' <<<"$cur" 2>/dev/null | head -n1)"
+  case "$_bal_strategy" in roundRobin|random|leastPing|leastLoad) ;; *) _bal_strategy="${XKIT_BAL_STRATEGY:-leastLoad}" ;; esac
+  merged="$(nodes_merge_template "$cur" "$nodes_file" "${XKIT_POOL_TAG:-}" "$_bal_strategy" "$client_tags")" || mrc=$?
   rm -f "$nodes_file"
   [ "$mrc" -eq 0 ] || { err "Не удалось собрать шаблон xray"; return 1; }
   master_xray_template_set "$merged"
