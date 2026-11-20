@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.2.2"
+XKIT_VERSION="9.2.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6964,6 +6964,14 @@ EOS
     warn "Выполните: xkit (меню) -> пункт 2 (автопроброс), затем НОДЫ -> health"
   fi
   ok "Туннель: мастер -> ${nhost}:${tport} (VLESS+Reality, SNI ${nsni})"
+  # v9.2.3: BBR+fq на ноде ПО УМОЛЧАНИЮ при добавлении (живой замер: cubic при
+  # RTT ~70мс резал каскад до ~1 Mbps, bbr дал ~50 Mbps — в 30 раз). Мастер уже
+  # включает bbr при install; нода должна симметрично. Откат: nodes tune <имя> safe.
+  if node_tune "$nname" balanced >/dev/null 2>&1; then
+    ok "Сетевой тюнинг ноды: BBR + fq + буферы (nodes tune ${nname} safe — откатить)"
+  else
+    warn "Не удалось применить BBR на ноде (ядро без модуля?) — каскад может быть медленнее; nodes tune ${nname} balanced"
+  fi
   # v7.7.7: напоминание про firewall — если UFW ноды не включён, её порты открыты всем
   if [ "${node_ufw:-0}" != "1" ]; then
     warn "UFW на ноде не активен — её порты открыты всем. Включить: xkit nodes ufw ${nname} on"
@@ -7067,6 +7075,11 @@ nodes_repair() {
         else
           warn "${nm}: не удалось применить UseIPv4 к freedom — пинг ноды может виснуть (IPv6)"
         fi
+        # v9.2.3: BBR+fq на ноде (идемпотентно; cubic при RTT ~70мс резал каскад
+        # в 30 раз). Для уже добавленных нод repair/update донастраивает тюнинг.
+        node_tune "$nm" balanced >/dev/null 2>&1 \
+          && ok "${nm}: сетевой тюнинг BBR + fq" \
+          || warn "${nm}: BBR не применён (ядро без модуля?) — nodes tune ${nm} balanced"
       else
         warn "${nm}: панель ноды недоступна (возможно, устарел API-токен после переустановки/ротации). Обновите доступ: xkit nodes relogin ${nm} (меню нод → п.14, TUI → «Обновить доступ к панелям серверов»)"
         bad=1
@@ -12745,7 +12758,11 @@ node_tune() {
     show) node_ssh "$rec" 'sysctl net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max 2>/dev/null' ;;
     safe) node_ssh "$rec" 'rm -f /etc/sysctl.d/90-xkit-node.conf; systemctl restart systemd-sysctl >/dev/null 2>&1 || true' ;;
     balanced)
-      node_ssh "$rec" 'set -e; grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; printf "%s\n" "net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr" "net.core.rmem_max=16777216" "net.core.wmem_max=16777216" "net.core.netdev_max_backlog=4096" > /etc/sysctl.d/90-xkit-node.conf; chmod 644 /etc/sysctl.d/90-xkit-node.conf; sysctl --system >/dev/null' ;;
+      # v9.2.3: bbr может быть не загружен (tcp_available без bbr) — modprobe +
+      # modules-load.d для персистентности после ребута; иначе grep -qw bbr падал
+      # и тюнинг молча не применялся (живой баг: нода на cubic, каскад ~0.1 МБ/с
+      # вместо ~6 МБ/с после bbr).
+      node_ssh "$rec" 'set -e; grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control || { modprobe tcp_bbr; echo tcp_bbr > /etc/modules-load.d/xkit-bbr.conf; }; grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control; printf "%s\n" "net.core.default_qdisc=fq" "net.ipv4.tcp_congestion_control=bbr" "net.core.rmem_max=16777216" "net.core.wmem_max=16777216" "net.core.netdev_max_backlog=4096" > /etc/sysctl.d/90-xkit-node.conf; chmod 644 /etc/sysctl.d/90-xkit-node.conf; sysctl --system >/dev/null' ;;
     *) err "nodes tune <имя> show|safe|balanced"; return 1 ;;
   esac
   audit_event nodes.tune "$want" ok "$mode"
