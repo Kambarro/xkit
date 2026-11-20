@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.8"
+XKIT_VERSION="9.1.9"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -14732,6 +14732,7 @@ tg_bot_run_long() { # $1 chat, $2 unit-name, $3 cmd (целиком), $4 label
   tg_bot_reply "$chat" "⏳ Запускаю: $label (результат по готовности)…"
   local result_file="/run/xkit-tg-${unit}.out"
   err="$(systemd-run --unit="xkit-tg-${unit}" --collect \
+    -p Type=oneshot \
     -p "ExecStartPost=/bin/bash -c '${XKIT_BIN} telegram bot-notify ${chat} ${result_file}'" \
     /bin/bash -c "$cmd > ${result_file} 2>&1" 2>&1)"; rc=$?
   if [ "$rc" != 0 ]; then
