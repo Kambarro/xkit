@@ -4,7 +4,7 @@
 
 **Your turnkey VPN server: 3X-UI panel behind nginx, all protocols, one subscription per user — managed from Telegram.**
 
-![Version](https://img.shields.io/badge/version-9.1.7-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-9.1.8-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -282,6 +282,55 @@ xkit expiry set|list|check
 xkit camo status|regenerate
 xkit audit | doctor export | info | status
 ```
+
+---
+
+## 🗺️ Command map: where each command lives
+
+No need to type commands by hand — almost everything is in the TUI (`xkit`),
+the classic menu (`xkit --classic`) and the Telegram bot. ✅ = a menu item /
+button exists, — = CLI only. Rare service commands are intentionally CLI-only.
+
+| Command | Purpose | TUI | Menu | Bot |
+|---|---|---|---|---|
+| `client add / list / show / del / reset / bind / toggle` | Users: create, list, links, delete, reset, bind, enable/disable | ✅ | ✅ | ✅ |
+| `sub / sub qr` | Subscriptions: rebuild, QR (SVG/PNG/Amnezia) | ✅ | ✅ | ✅ |
+| `reality / reality scan / scan-csv` | REALITY: wizard, decoy-site scan, CSV report | ✅ | ✅ | — |
+| `protocols xhttp / ws / awg / hy2 / panel` | Protocol wizards | ✅ | ✅ | — |
+| `protocols list / toggle / remove / ports` | Protocols: summary, toggle, remove, ports | ✅ | ✅ | — |
+| `nodes / nodes add / list / del / health / strategy` | Nodes: add, list, delete, health, balancing | ✅ | ✅ | — |
+| `nodes check / metrics` | Nodes: SSH/API/resource check, metrics | ✅ | ✅ | — |
+| `nodes repair / repin / relogin / panel-sync / token` | Nodes: repair, cert trust, tokens, 3X-UI "Nodes" | ✅ | ✅ | — |
+| `nodes plan / apply` | Nodes: drift plan, canary apply | — | ✅ | — |
+| `nodes cert / cert-renew / hide / ufw` | Nodes: certs, renewal, panel hiding, firewall | ✅ | ✅ | ✅ |
+| `nodes camo / camo-off` | Nodes: camo site | ✅ | ✅ | ✅ |
+| `nodes versions / upgrade / latest` | Nodes: 3X-UI/Xray versions, upgrade | ✅ | ✅ | ✅ |
+| `nodes profile / tune / readdress` | Nodes: transport profile, TCP tuning, IP change | ✅ | ✅ | ✅ |
+| `nodes freeze (alias of test freeze)` | TSPU "freeze" measurement | ✅ | ✅ | ✅ |
+| `nodes pool-link / credentials` | Cascade pool link, node credentials to file | ✅* | — | — |
+| `health / health deep / status` | Diagnostics: services, ports, client test | ✅ | ✅ | ✅ |
+| `test bench / ipregion / freeze` | Server benchmark (not the tunnel) | ✅ | ✅ | ✅ |
+| `backup / backup settings / restore` | Backups: create, schedule, restore | ✅ | ✅ | ✅ |
+| `versions list / install / latest / rollback` | 3X-UI + Xray version pairs | ✅ | ✅ | — |
+| `update / update --check` | xkit self-update | ✅ | ✅ | ✅ |
+| `camo status / files / regenerate` | Master camo site | ✅ | ✅ | — |
+| `route / extfix` | nginx routing / panel link fix | ✅ | ✅ | — |
+| `sockopt / bbr` | TCP Fast Open / BBR+fq | ✅ | ✅ | — |
+| `services restart / reboot` | Stack / server restart | ✅ | ✅ | ✅ |
+| `restart defer / apply / status` | Deferred restarts | ✅ | ✅ | — |
+| `expiry set / list / check / del` | Server rental expiry | ✅ | ✅ | ✅ |
+| `telegram setup / bot / transport / check / off` | Control bot, alerts, transports | ✅ | ✅ | ✅ |
+| `telegram-proxy mtproto / web / list / link` | Telegram proxies for clients | ✅ | ✅ | — |
+| `ledger collect / show / quota-check` | Monotonic traffic ledger | ✅ | ✅ | — |
+| `audit / doctor export / info` | Audit log, support bundle, credentials | ✅ | ✅ | — |
+| `maintenance install / run` | Logrotate + daily timer | ✅ | ✅ | — |
+| `geodata update / auto / timer` | Geo files with SHA pins (CLI only) | — | — | — |
+| `core-pin [версия]` | Pin Xray core (CLI only) | — | — | — |
+| `install / reinstall / uninstall` | Install / reinstall / uninstall | — | ✅ | — |
+
+*TUI has credentials only; pool-link is CLI-only (technical cascade link).
+
+Full syntax of every command: `xkit help`.
 
 ---
 

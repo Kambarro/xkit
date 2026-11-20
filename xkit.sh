@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.7"
+XKIT_VERSION="9.1.8"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -8563,6 +8563,7 @@ telegram_setup() {
     warn "(xkit telegram transport add socks5 <url>), затем: xkit telegram check"
   fi
   xkit_summary_save >/dev/null 2>&1 || true
+  tg_bot_menu_button >/dev/null 2>&1 || true   # v9.1.8: кнопка «Меню» внизу чата
   return 0
 }
 
@@ -9300,7 +9301,9 @@ xkit_menu_json() {
         {title:"Hysteria 2", desc:"QUIC/UDP 443, TLS и ссылка", args:["protocols","hy2"], mode:"exec"},
         {title:"Добавить AWG/Hysteria2 в панель", desc:"Инбаунды для единой подписки", args:["protocols","panel"], mode:"exec"},
         {title:"Выключить / включить протокол", desc:"Инбаунд остаётся в панели, уходит из подписок (как ползунок)", args:["protocols","toggle"], mode:"exec"},
-        {title:"REALITY: ключи и ссылки", desc:"Показать параметры существующего inbound", args:[], fn:"reality_show_keys", mode:"exec"}
+        {title:"Удалить протокол", desc:"Удалить выбранный inbound + обновить nginx/подписки (с подтверждением)", args:["protocols","remove"], mode:"exec"},
+        {title:"REALITY: ключи и ссылки", desc:"Показать параметры существующего inbound", args:[], fn:"reality_show_keys", mode:"fn"},
+        {title:"REALITY: найти сайты-прикрытия рядом", desc:"Тихий скан подсети: TLS/ALPN/задержка, выбор dest", args:["reality","scan"], mode:"exec"}
       ]},
       {id:"nodes", title:"Дополнительные серверы", items:[
         {title:"Добавить сервер и распределить нагрузку", desc:"Установка, туннель и проверка подключения", args:["nodes"], mode:"exec"},
@@ -9314,10 +9317,19 @@ xkit_menu_json() {
         {title:"UFW на сервере (firewall)", desc:"Статус или включить: SSH/80/443/туннель открыты, остальное закрыто", args:["nodes","ufw"], mode:"exec"},
         {title:"Сайт-прикрытие сервера (camo)", desc:"Сайт и страница входа; снять или перегенерировать", args:["nodes","camo"], mode:"exec"},
         {title:"Сменить IP сервера", desc:"Без переустановки; сначала проверка", args:["nodes","readdress"], mode:"exec"},
+        {title:"Проверить серверы: SSH, панель, ресурсы", desc:"TCP/SSH/API/служба; --deep: CPU/RAM/диск/версии", args:["nodes","check","all"], mode:"exec"},
+        {title:"Восстановить настройки серверов", desc:"Переприменить конфигурацию нод после сбоя (repair)", args:["nodes","repair"], mode:"exec"},
+        {title:"Обновить доступ к панелям серверов", desc:"Новый API-токен после переустановки ноды (relogin)", args:["nodes","relogin"], mode:"exec"},
+        {title:"Обновить серверы в «Узлах» 3X-UI", desc:"Синхронизация записей без импорта инбаундов", args:["nodes","panel-sync"], mode:"exec"},
+        {title:"Распределение нагрузки", desc:"По очереди / случайно / по задержке / по загрузке", args:["nodes","strategy"], mode:"exec"},
+        {title:"Настройка скорости TCP на сервере", desc:"Показать / сбросить / применить (tune)", args:["nodes","tune"], mode:"exec"},
+        {title:"Продлить wildcard-сертификаты серверов", desc:"Линейджи мастера + пере-раздача нодам (cert-renew)", args:["nodes","cert-renew"], mode:"exec"},
+        {title:"Реквизиты серверов в файл", desc:"Обновить /root/xkit-node-ИМЯ.txt (0600)", args:["nodes","credentials"], mode:"exec"},
         {title:"Удалить сервер", desc:"Снять туннель и убрать из распределения", args:["nodes"], mode:"exec"}
       ]},
       {id:"monitoring", title:"Состояние и уведомления", items:[
         {title:"Проверка сервера и доступности", desc:"Службы, порты, nginx и панель", args:["health"], mode:"exec"},
+        {title:"Службы, порты, маршруты", desc:"Что работает и что светится наружу (status)", args:["status"], mode:"exec"},
         {title:"Проверить подключение как клиент", desc:"Реальный клиент по нашим ссылкам", args:["health","deep"], mode:"exec"},
         {title:"Telegram: бот управления + уведомления", desc:"Бот v8 (inline-меню), транспорты через ноды, алерты", args:["telegram"], mode:"exec"},
         {title:"Telegram-бот: включить / выключить / перезапустить", desc:"systemd-сервис бота управления", args:["telegram","bot","status"], mode:"exec"},
@@ -9326,7 +9338,7 @@ xkit_menu_json() {
         {title:"Данные для доступа", desc:"Пароли только в /root/xkit-info.txt", args:["info"], mode:"exec"}
       ]},
       {id:"service", title:"Обслуживание и безопасность", items:[
-        {title:"Сертификат: выпустить заново", desc:"Домен / IP / самоподписанный", args:[], fn:"menu_service_cert", mode:"exec"},
+        {title:"Сертификат: выпустить заново", desc:"Домен / IP / самоподписанный", args:[], fn:"menu_service_cert", mode:"fn"},
         {title:"Резервная копия", desc:"Создать, проверить, восстановить", args:["backup"], mode:"exec"},
         {title:"Обновить XKIT", desc:"Проверка файла и резервная копия", args:["update"], mode:"exec"},
         {title:"Версии 3X-UI/Xray", desc:"Доступные релизы, выбор номером, последние, откат", args:["versions"], mode:"exec"},
@@ -9335,7 +9347,13 @@ xkit_menu_json() {
         {title:"BBR и настройки TCP", desc:"Пропускная способность и задержка", args:["bbr"], mode:"exec"},
         {title:"Журнал действий", desc:"Последние 50 записей", args:["audit"], mode:"exec"},
         {title:"Перезапустить всё: 3X-UI / Xray / nginx", desc:"Кратковременный обрыв соединений; после — чек в Telegram", args:["services","restart"], mode:"exec"},
-        {title:"Перезагрузить сервер целиком (reboot)", desc:"Доступ пропадёт на 1-3 мин; после загрузки — чек готовности в Telegram", args:["services","reboot"], mode:"exec"}
+        {title:"Перезагрузить сервер целиком (reboot)", desc:"Доступ пропадёт на 1-3 мин; после загрузки — чек готовности в Telegram", args:["services","reboot"], mode:"exec"},
+        {title:"Проброс инбаундов за nginx", desc:"Все inbound через nginx 443 + подписки (route)", args:["route"], mode:"exec"},
+        {title:"Починить ссылки панели", desc:"externalProxy/host-группы: корректные ссылки в UI панели", args:["extfix"], mode:"exec"},
+        {title:"Восстановить из резервной копии", desc:"Выбор копии, проверка, восстановление", args:["restore"], mode:"exec"},
+        {title:"Настройки TCP (TFO/NODELAY)", desc:"TCP Fast Open + TCP_NODELAY на инбаундах", args:["sockopt"], mode:"exec"},
+        {title:"Отложенные перезапуски", desc:"Очередь: состояние / применить / отложить", args:["restart"], mode:"exec"},
+        {title:"Учёт трафика (ledger)", desc:"Монотонный учёт: собрать / показать / лимиты", args:["ledger"], mode:"exec"}
       ]},
       {id:"testing", title:"Тестирование сервера", desc:"Проверка самого сервера (железо, диск, канал, геолокация IP), не VPN-туннеля", items:[
         {title:"Паспорт VPS (bench)", desc:"Система, диск, сырая скорость канала; нагрузка ~6 ГБ + канал, с подтверждением", args:["test","bench"], mode:"exec"},
@@ -9344,7 +9362,7 @@ xkit_menu_json() {
         {title:"Результаты замеров заморозки", desc:"Показать сохранённые вердикты последних проверок", args:["test","freeze"], mode:"exec"}
       ]},
       {id:"settings", title:"Настройки", items:[
-        {title:"Открывать меню при входе по SSH", desc:"Автоматический запуск xkit", args:[], fn:"ssh_hook_toggle", mode:"exec"},
+        {title:"Открывать меню при входе по SSH", desc:"Автоматический запуск xkit", args:[], fn:"ssh_hook_toggle", mode:"fn"},
         {title:"Резервные копии: расписание", desc:"Интервал и хранение", args:["backup","settings"], mode:"exec"},
         {title:"Автоматическое обслуживание", desc:"Очистка журналов и таймеры", args:["maintenance"], mode:"exec"},
         {title:"Прокси для Telegram", desc:"MTProto / веб-прокси", args:["telegram-proxy"], mode:"exec"}
@@ -9510,10 +9528,18 @@ xkit_main_impl() {
                *) err "xkit client add|all|del|list|reset|show|bind|disable|enable|toggle"; exit 1 ;;
              esac ;;
     reality) shift; require_root; load_xkit_env || true
-             if [ "${1:-}" = scan-csv ]; then reality_scan_csv "${2:-${XKIT_DIR}/reality-scan.tsv}" "${3:-${XKIT_DIR}/reality-scan.csv}"; else reality_wizard; fi ;;
+             case "${1:-}" in
+               scan) reality_scan_menu ;;
+               scan-csv) reality_scan_csv "${2:-${XKIT_DIR}/reality-scan.tsv}" "${3:-${XKIT_DIR}/reality-scan.csv}" ;;
+               *) reality_wizard ;;
+             esac ;;
     sockopt) shift; sockopt_cmd "${1:-status}" ;;
     nodes)   shift; require_root
              case "${1:-menu}" in
+               list) nodes_list ;;
+               health) nodes_health ;;
+               strategy) nodes_strategy ;;
+               add) node_add ;;
                repair) nodes_repair ;;
                repin)  shift; node_repin "${1:-all}" ;;
                metrics) nodes_metrics_collect >/dev/null && ok "Метрики нод обновлены: $XKIT_NODES_METRICS" ;;
@@ -9609,6 +9635,9 @@ xkit_main_impl() {
                setup) telegram_setup ;;
                bot) shift
                     case "${1:-status}" in once) telegram_bot_once ;; run) telegram_bot_run ;; on|off|status|restart) telegram_bot_service "${1:-status}" ;; notify) shift; tg_bot_notify_result "${1:-}" "${2:-}" ;; check) shift; tg_bot_check_notify "${1:-}" ;; *) err "telegram bot once|run|on|off|status|restart|notify|check"; exit 1 ;; esac ;;
+               # v9.1.8: алиас — tg_bot_run_long зовёт `telegram bot-notify` в ExecStartPost
+               # (отчёты длинных операций); без алиаса падал в telegram_menu без TTY и отчёт терялся.
+               bot-notify) shift; tg_bot_notify_result "${1:-}" "${2:-}" ;;
                check) load_xkit_env >/dev/null 2>&1 || true; notify_check ;;
                transport) shift
                     case "${1:-list}" in
@@ -14518,6 +14547,20 @@ tg_bot_state_del() { # $1 key
   [ -r "$XKIT_TG_BOT_STATE" ] && cur="$(cat "$XKIT_TG_BOT_STATE")"
   jq -c --arg k "$1" 'del(.[$k])' <<<"$cur" | _xkit_atomic_write "$XKIT_TG_BOT_STATE"
 }
+# v9.1.8: полный сброс диалоговых ожиданий чата (кнопка «Меню»/m:main) —
+# confirm:* привязаны к chat внутри значения; чужие чаты не трогаем.
+# Запущенные длинные операции (systemd-run) не отменяются — пришлют отчёт.
+tg_bot_state_reset() { # $1 chat-id
+  local cur='{}'
+  [ -r "$XKIT_TG_BOT_STATE" ] && cur="$(cat "$XKIT_TG_BOT_STATE")"
+  jq -c --arg c "$1" 'with_entries(select((.value.chat // "") != $c))' <<<"$cur" \
+    | _xkit_atomic_write "$XKIT_TG_BOT_STATE"
+}
+# v9.1.8: системная кнопка «Меню» внизу чата (setChatMenuButton) — шлёт /menu.
+tg_bot_menu_button() { # -> rc API; идемпотентно, вызывается при setup и старте бота
+  [ -n "${XKIT_TG_TOKEN:-}" ] || return 1
+  tg_api setChatMenuButton '{"menu_button":{"type":"commands"}}' 1 >/dev/null 2>&1
+}
 
 # --- inline-клавиатуры ---
 # кнопка: {text, callback_data}
@@ -14565,6 +14608,7 @@ tg_bot_reply() { # $1 chat, $2 text, [$3 reply_markup-json]
 
 # --- главное меню ---
 tg_bot_show_main() { # $1 chat
+  tg_bot_state_reset "$1"   # v9.1.8: сброс ожиданий чата при возврате в главное меню
   tg_bot_reply "$1" "🏠 XKIT v${XKIT_VERSION} — главное меню" "$(tg_bot_main_menu)"
 }
 
@@ -15011,6 +15055,10 @@ telegram_bot_run() {
   # идёт быстрым путём через ноду, без таймаута direct на РФ-мастере
   tg_transports_sync_nodes >/dev/null 2>&1 || true
   tg_transport_check_all >/dev/null 2>&1 || true
+  # v9.1.8: системная кнопка «Меню» внизу чата (сброс стейтов -> главное меню).
+  # Идемпотентно; при недоступности API не блокирует старт — повтор при след. рестарте.
+  tg_bot_menu_button || true
+  tg_api setMyCommands '{"commands":[{"command":"menu","description":"Главное меню (сброс текущих шагов)"},{"command":"status","description":"Статус сервера"},{"command":"users","description":"Пользователи"},{"command":"nodes","description":"Ноды"},{"command":"expiry","description":"Сроки аренды"},{"command":"transport","description":"TG транспорты"}]}' 1 >/dev/null 2>&1 || true
   # v8.0.3: после ребута сервера / рестарта сервиса — короткий чек «мастер активен»
   tg_bot_check_notify >/dev/null 2>&1 || true
   # v8.0.9: фон перепроверки dead-транспортов (каждые 20с). Если все dead —

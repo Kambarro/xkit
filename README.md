@@ -4,7 +4,7 @@
 
 **Ваш VPN-сервер под ключ: панель 3X-UI за nginx, все протоколы, одна подписка на пользователя — и управление из Telegram.**
 
-![Version](https://img.shields.io/badge/version-9.1.7-blue?style=flat-square)
+![Version](https://img.shields.io/badge/version-9.1.8-blue?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Ubuntu%2024.04%2B-orange?style=flat-square)
 ![Shell](https://img.shields.io/badge/core-Bash-4EAA25?style=flat-square&logo=gnubash&logoColor=white)
 ![TUI](https://img.shields.io/badge/TUI-Go%20%2B%20Bubble%20Tea-00ADD8?style=flat-square&logo=go&logoColor=white)
@@ -285,6 +285,56 @@ xkit expiry set|list|check
 xkit camo status|regenerate
 xkit audit | doctor export | info | status
 ```
+
+---
+
+## 🗺️ Карта команд: где что доступно
+
+Не нужно писать команды руками — почти всё есть в TUI (`xkit`), классическом
+меню (`xkit --classic`) и Telegram-боте. Таблица показывает, где доступна
+каждая группа команд; ✅ — есть пункт/кнопка, — — только через CLI.
+Редкие служебные команды сознательно оставлены только в CLI.
+
+| Команда | Назначение | TUI | Меню | Бот |
+|---|---|---|---|---|
+| `client add / list / show / del / reset / bind / toggle` | Пользователи: создать, список, ссылки, удалить, сброс, привязка, вкл/выкл | ✅ | ✅ | ✅ |
+| `sub / sub qr` | Подписки: пересборка, QR (SVG/PNG/Amnezia) | ✅ | ✅ | ✅ |
+| `reality / reality scan / scan-csv` | REALITY: мастер, скан сайтов-прикрытий, CSV-отчёт | ✅ | ✅ | — |
+| `protocols xhttp / ws / awg / hy2 / panel` | Мастера протоколов | ✅ | ✅ | — |
+| `protocols list / toggle / remove / ports` | Протоколы: сводка, вкл/выкл, удалить, порты | ✅ | ✅ | — |
+| `nodes / nodes add / list / del / health / strategy` | Ноды: добавить, список, удалить, состояние, балансировка | ✅ | ✅ | — |
+| `nodes check / metrics` | Ноды: проверка SSH/API/ресурсов, метрики | ✅ | ✅ | — |
+| `nodes repair / repin / relogin / panel-sync / token` | Ноды: починка, доверие серту, токены, «Узлы» 3X-UI | ✅ | ✅ | — |
+| `nodes plan / apply` | Ноды: drift-план, canary-применение | — | ✅ | — |
+| `nodes cert / cert-renew / hide / ufw` | Ноды: сертификаты, продление, скрытие панели, firewall | ✅ | ✅ | ✅ |
+| `nodes camo / camo-off` | Ноды: сайт-прикрытие | ✅ | ✅ | ✅ |
+| `nodes versions / upgrade / latest` | Ноды: версии 3X-UI/Xray, обновление | ✅ | ✅ | ✅ |
+| `nodes profile / tune / readdress` | Ноды: способ соединения, TCP-тюнинг, смена IP | ✅ | ✅ | ✅ |
+| `nodes freeze (алиас test freeze)` | Замер «заморозки» ТСПУ | ✅ | ✅ | ✅ |
+| `nodes pool-link / credentials` | Техн. ссылка каскада, реквизиты нод в файл | ✅* | — | — |
+| `health / health deep / status` | Диагностика: службы, порты, клиентский тест | ✅ | ✅ | ✅ |
+| `test bench / ipregion / freeze` | Тест САМОГО сервера (не туннеля) | ✅ | ✅ | ✅ |
+| `backup / backup settings / restore` | Бэкапы: создать, расписание, восстановить | ✅ | ✅ | ✅ |
+| `versions list / install / latest / rollback` | Связки 3X-UI + Xray | ✅ | ✅ | — |
+| `update / update --check` | Обновление xkit | ✅ | ✅ | ✅ |
+| `camo status / files / regenerate` | Сайт-заглушка мастера | ✅ | ✅ | — |
+| `route / extfix` | Проброс за nginx / починка ссылок панели | ✅ | ✅ | — |
+| `sockopt / bbr` | TCP Fast Open / BBR+fq | ✅ | ✅ | — |
+| `services restart / reboot` | Перезапуск стека / сервера | ✅ | ✅ | ✅ |
+| `restart defer / apply / status` | Отложенные перезапуски | ✅ | ✅ | — |
+| `expiry set / list / check / del` | Сроки аренды серверов | ✅ | ✅ | ✅ |
+| `telegram setup / bot / transport / check / off` | Бот управления, уведомления, транспорты | ✅ | ✅ | ✅ |
+| `telegram-proxy mtproto / web / list / link` | Прокси Telegram для клиентов | ✅ | ✅ | — |
+| `ledger collect / show / quota-check` | Монотонный учёт трафика | ✅ | ✅ | — |
+| `audit / doctor export / info` | Журнал, архив диагностики, реквизиты | ✅ | ✅ | — |
+| `maintenance install / run` | Logrotate + ежедневный таймер | ✅ | ✅ | — |
+| `geodata update / auto / timer` | Geo-файлы с SHA-пинами (только CLI) | — | — | — |
+| `core-pin [версия]` | Закрепить ядро Xray (только CLI) | — | — | — |
+| `install / reinstall / uninstall` | Установка/переустановка/удаление | — | ✅ | — |
+
+*В TUI только credentials; pool-link — только CLI (техническая ссылка каскада).
+
+Полный синтаксис каждой команды — `xkit help`.
 
 ---
 
