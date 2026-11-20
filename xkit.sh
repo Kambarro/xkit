@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.1.9"
+XKIT_VERSION="9.2.0"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -9300,6 +9300,7 @@ xkit_menu_json() {
         {title:"AmneziaWG 3.1 (AWG 2.0)", desc:"Панель или служба, UDP 51820", args:["protocols","awg"], mode:"exec"},
         {title:"Hysteria 2", desc:"QUIC/UDP 443, TLS и ссылка", args:["protocols","hy2"], mode:"exec"},
         {title:"Добавить AWG/Hysteria2 в панель", desc:"Инбаунды для единой подписки", args:["protocols","panel"], mode:"exec"},
+        {title:"Telegram-прокси для клиентов (MTProto/Web)", desc:"FakeTLS-прокси Telegram: инбаунд и ссылка; не бот", args:["telegram-proxy"], mode:"exec"},
         {title:"Выключить / включить протокол", desc:"Инбаунд остаётся в панели, уходит из подписок (как ползунок)", args:["protocols","toggle"], mode:"exec"},
         {title:"Удалить протокол", desc:"Удалить выбранный inbound + обновить nginx/подписки (с подтверждением)", args:["protocols","remove"], mode:"exec"},
         {title:"REALITY: ключи и ссылки", desc:"Показать параметры существующего inbound", args:[], fn:"reality_show_keys", mode:"fn"},
@@ -9364,8 +9365,7 @@ xkit_menu_json() {
       {id:"settings", title:"Настройки", items:[
         {title:"Открывать меню при входе по SSH", desc:"Автоматический запуск xkit", args:[], fn:"ssh_hook_toggle", mode:"fn"},
         {title:"Резервные копии: расписание", desc:"Интервал и хранение", args:["backup","settings"], mode:"exec"},
-        {title:"Автоматическое обслуживание", desc:"Очистка журналов и таймеры", args:["maintenance"], mode:"exec"},
-        {title:"Прокси для Telegram", desc:"MTProto / веб-прокси", args:["telegram-proxy"], mode:"exec"}
+        {title:"Автоматическое обслуживание", desc:"Очистка журналов и таймеры", args:["maintenance"], mode:"exec"}
       ]}
     ]
   }'
