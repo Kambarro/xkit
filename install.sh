@@ -26,7 +26,7 @@ XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kambarro/xkit/main}"
 
 # (K-02, аудит №2) pin-хэши релиза: подставляются при сборке. Placeholder =
 # dev-режим — тогда сумма берётся из xkit.sh.sha256; нет ни того ни другого — отказ
-XKIT_PIN_SHA256="0859d9eeb6fb76747d60973f6605e6587c7f0cbda1e29871728d87c641e2a71c"
+XKIT_PIN_SHA256="b89a22f79a51dc87c7ddfdc909b858f3a5c181c90552dda5f931a7b7dda0f284"
 XKIT_PIN_MENU_SHA256="f34f0a17860ecfb70afc828996ac63b4793973fa6d160e02f88c9f30e491c990"
 XKIT_PIN_PROTOCOLS_SHA256="8fade514e4337594a278dd2119d005055bf1c11290831d36c6010d33a15108a2"
 XKIT_PIN_TUI_AMD64_SHA256="e222ed20d7d0428ba3d6e81bc925bb8f6bc375810162361347de91641fea16e7"

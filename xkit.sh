@@ -168,7 +168,7 @@ confirm() {
 # Определение в ядре делает безопасным ЛЮБОЙ путь вызова; xkit_menu.sh
 # определяет то же тело — дубль безобиден (позднейшее определение выигрывает).
 # `|| true`: EOF (Ctrl-D) на паузе — не роняем возврат функции.
-pause_enter() { echo ""; read -r -p "Нажмите Enter для возврата в меню..." _ || true; }
+pause_enter() { echo ""; read_choice "Нажмите Enter для возврата в меню..." _ || true; }
 
 # шаги установки: [n/7] + 10-клеточный индикатор (non-TTY — просто текст)
 STEP=0; STEPS=7
@@ -449,6 +449,24 @@ input_clean_ascii() { # $1 сырой ввод -> ASCII-очищенный в st
   printf '%s' "$s"
 }
 
+# v9.1.7 (живой баг): числовой выбор меню читался голым `read -r` без очистки —
+# невидимый остаток ввода (backspace/escape/кириллица после удаления, как в
+# багах 8.2.2) ломал `case "2<cntrl>"` -> «Нет такого пункта» при верном вводе.
+# read_choice читает выбор и чистит его (цифры/латиница, без cntrl/escape/non-ASCII).
+# ВАЖНО: read напрямую в переменную (без subshell на read — иначе pipe-ввод
+# теряется); очистка через sed/tr в $(...) уже ПОСЛЕ read, stdin не трогает.
+# Использование: read_choice "Выбор [1]: " a || a=""   (var — имя переменной).
+read_choice() { # $1 prompt, $2 имя переменной -> очищенный ввод в переменную; rc read
+  local __prompt="$1" __var="$2" __raw __clean
+  read -r -p "$__prompt" __raw || return 1
+  # очистка без subshell на read: escape-хвосты, cntrl, non-ASCII, пробелы по краям
+  __clean="$(printf '%s' "$__raw" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s/\x1b[()][0-9A-B]//g' | tr -d '[:cntrl:]' | LC_ALL=C tr -d '\200-\377')"
+  __clean="${__clean#"${__clean%%[![:space:]]*}"}"
+  __clean="${__clean%"${__clean##*[![:space:]]}"}"
+  printf -v "$__var" '%s' "$__clean"
+  return 0
+}
+
 is_domain() {
   [[ "$1" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$ ]] || return 1
   # TLD должен содержать букву: иначе "999.999.999.999" проходит как домен
@@ -550,7 +568,7 @@ normalize_panel_path() {
 read_host() {
   local prompt="$1" v
   while true; do
-    if ! read -r -p "$prompt" v; then
+    if ! read_choice "$prompt" v; then
       # EOF/прерванный ввод: не роняем установку — пустой результат, вызывающий
       # (choose_host) сделает fallback на IP. В интерактиве пустая строка = переспрос.
       echo; return 1
@@ -578,7 +596,7 @@ choose_host() {
   echo "1) IP этого сервера — $myip (определён автоматически)"
   echo "2) Свой домен или другой IP (ввести вручную)"
   while true; do
-    read -r -p "Ваш выбор [1]: " a || { echo; a="1"; }
+    read_choice "Ваш выбор [1]: " a || { echo; a="1"; }
     case "${a:-1}" in
       1) CHOSEN_HOST="$myip"; return 0 ;;
       2) CHOSEN_HOST="$(read_host "Домен или IP -> " || true)"
@@ -595,7 +613,7 @@ choose_host() {
 read_port() {
   local prompt="$1" v
   while true; do
-    read -r -p "$prompt" v || die "Ввод прерван"
+    read_choice "$prompt" v || die "Ввод прерван"
     v="$(input_clean_ascii "$v")"
     if is_port "$v"; then printf '%s' "$v"; return 0; fi
     err "Порт должен быть числом 1-65535"
@@ -605,7 +623,7 @@ read_port() {
 read_path() {
   local prompt="$1" v
   while true; do
-    read -r -p "$prompt" v || die "Ввод прерван"
+    read_choice "$prompt" v || die "Ввод прерван"
     v="$(input_clean_ascii "$v")"
     if is_path "$v"; then printf '%s' "$v"; return 0; fi
     err "Путь: начинается с /, буквы/цифры/._~/- (без пробелов)"
@@ -1028,7 +1046,7 @@ choose_certificate() {
       echo "3) Let's Encrypt — для IP (сначала авто-обновление certbot; если не выйдет — пункт 4)"
     fi
     echo "4) Самоподписанный — домен или IP (10 лет, allowInsecure=true)"
-    if ! read -r -p "Ваш выбор (${found:+0-}4): " CERT_MODE; then
+    if ! read_choice "Ваш выбор (${found:+0-}4): " CERT_MODE; then
       echo
       if [ -n "$found" ]; then
         warn "Ввод прерван (EOF) — использую найденный действующий серт (без перевыпуска)"
@@ -1046,7 +1064,7 @@ choose_certificate() {
     LE_EMAIL=""
     case "$CERT_MODE" in
       1|3)
-        read -r -p "Email для Let's Encrypt (Enter — пропустить): " LE_EMAIL || { echo; LE_EMAIL=""; }
+        read_choice "Email для Let's Encrypt (Enter — пропустить): " LE_EMAIL || { echo; LE_EMAIL=""; }
         if [ -n "$LE_EMAIL" ] && ! is_email "$LE_EMAIL"; then
           warn "Email выглядит некорректно — продолжаю без него"; LE_EMAIL=""
         fi ;;
@@ -1586,7 +1604,7 @@ read_panel_settings() {
     if [ "${IS_TTY:-0}" = "1" ]; then
       if [ -z "$PANEL_PORT" ]; then
         while :; do
-          read -r -p "Порт панели 3X-UI не определён автоматически${_hint:+ (похоже, слушает ${_hint})}. Введите порт: " PANEL_PORT || return 1
+          read_choice "Порт панели 3X-UI не определён автоматически${_hint:+ (похоже, слушает ${_hint})}. Введите порт: " PANEL_PORT || return 1
           is_port "$PANEL_PORT" && break
           err "Некорректный порт: '${PANEL_PORT:0:20}' (1-65535)"
           PANEL_PORT=""
@@ -1594,7 +1612,7 @@ read_panel_settings() {
         ok "Порт панели принят вручную: ${PANEL_PORT}"
       fi
       if [ -z "$PANEL_WBP" ]; then
-        read -r -p "webBasePath панели (обычно /; если задан свой — введите как в панели): " PANEL_WBP || return 1
+        read_choice "webBasePath панели (обычно /; если задан свой — введите как в панели): " PANEL_WBP || return 1
         [ -n "$PANEL_WBP" ] || PANEL_WBP="/"
       fi
     else
@@ -3040,7 +3058,7 @@ list_inbounds_menu() { # показывает нумерованный спис�
       "$(jq -r '.port' <<<"$ib")" "$([ "$rmode" = "local" ] && echo "за nginx" || echo "direct")"
   done < <(jq -c '.[]' <<<"$INBOUNDS")
   [ "$i" -eq 0 ] && { warn "Активных инбаундов нет — создайте в панели (пункт 2 потом их пробросит)"; return 1; }
-  read -r -p "Номер инбаунда [1-$i]: " n
+  read_choice "Номер инбаунда [1-$i]: " n
   [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { err "Нет такого номера"; return 1; }
   PICK_IB="${rows[$((n-1))]}"
   return 0
@@ -3060,18 +3078,18 @@ client_add() {
   local settings email uuid subid total=0 days=0 flow=""
   settings="$(jq -r '.settings' <<<"$ib")"
   jq -e . <<<"$settings" >/dev/null 2>&1 || { err "settings инбаунда #$id не парсятся как JSON — обновите 3x-ui"; return 1; }
-  read -r -p "Имя (email) пользователя [u$(rand_hex 2)]: " email
+  read_choice "Имя (email) пользователя [u$(rand_hex 2)]: " email
   email="${email:-u$(rand_hex 2)}"
   # v9.1.1: structured email — ASCII-чистка (кириллица из русской раскладки долой);
   # таб/перевод строки ломают subs.index (awk -F'\t') — input_clean_ascii убирает cntrl
   email="$(input_clean_ascii "$email")"
   [[ "$email" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]] || warn "Имя содержит нестандартные символы — лучше только A-Za-z0-9._@+-"
-  read -r -p "Квота трафика, ГБ (0 = без лимита) [0]: " total; total="${total:-0}"
-  read -r -p "Срок жизни, дней (0 = бессрочно) [0]: " days; days="${days:-0}"
+  read_choice "Квота трафика, ГБ (0 = без лимита) [0]: " total; total="${total:-0}"
+  read_choice "Срок жизни, дней (0 = бессрочно) [0]: " days; days="${days:-0}"
   local vnet
   vnet="$(jq -r '.streamSettings|if type=="string" then (fromjson? // {}) else . end | .network // "tcp"' <<<"$ib")"
   if [ "$sec" = "reality" ] && [ "$proto" = "vless" ] && { [ "$vnet" = "tcp" ] || [ "$vnet" = "raw" ]; }; then
-    read -r -p "Flow [xtls-rprx-vision]: " flow; flow="${flow:-xtls-rprx-vision}"
+    read_choice "Flow [xtls-rprx-vision]: " flow; flow="${flow:-xtls-rprx-vision}"
   fi
   uuid="$(new_uuid)"
   subid="$(rand_str 16)"
@@ -3135,7 +3153,7 @@ client_del() {
   else
     printf '%-3s %s\n' "#" "ПОЛЬЗОВАТЕЛЬ"
     for email in "${users[@]}"; do i=$((i+1)); printf '%-3s %s\n' "$i" "$email"; done
-    read -r -p "Номер пользователя для удаления [1-$i] (Enter — отмена): " n
+    read_choice "Номер пользователя для удаления [1-$i] (Enter — отмена): " n
     [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { warn "Отменено"; return 0; }
     email="${users[$((n-1))]}"
   fi
@@ -3238,14 +3256,14 @@ client_add_all() {
   if [ "$#" -ge 1 ]; then
     email="$1"; total="${2:-0}"; days="${3:-0}"
   else
-    read -r -p "Имя (email) пользователя [u$(rand_hex 2)]: " email
+    read_choice "Имя (email) пользователя [u$(rand_hex 2)]: " email
   fi
   email="${email:-u$(rand_hex 2)}"
   email="$(input_clean_ascii "$email")"
   [[ "$email" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]] || warn "Имя содержит нестандартные символы — лучше только A-Za-z0-9._@+-"
   if [ "$#" -lt 1 ]; then
-    read -r -p "Квота трафика, ГБ (0 = без лимита) [0]: " total; total="${total:-0}"
-    read -r -p "Срок жизни, дней (0 = бессрочно) [0]: " days; days="${days:-0}"
+    read_choice "Квота трафика, ГБ (0 = без лимита) [0]: " total; total="${total:-0}"
+    read_choice "Срок жизни, дней (0 = бессрочно) [0]: " days; days="${days:-0}"
   fi
   # Валидация на границе доверия: форма TUI/CI не должна ломать арифметику ниже.
   [[ "$total" =~ ^[0-9]+$ ]] || { err "Квота трафика: целое число ГБ (получено: $total)"; return 1; }
@@ -3395,10 +3413,10 @@ client_toggle_menu() {
     cur="$(jq -r --arg e "$n" '[.[] | (.settings|if type=="string" then (fromjson? // {}) else (. // {}) end|.clients[]?)|select(.email==$e)|(.enable != false)]|if all then "вкл" else "выкл/частично" end' <<<"$INBOUNDS")"
     printf '  %-26s %s\n' "$n" "$cur"
   done <<<"$names"
-  read -r -p "Email пользователя: " email
+  read_choice "Email пользователя: " email
   email="$(input_clean_ascii "$email")"
   [ -n "$email" ] || { warn "Отменено"; return 0; }
-  read -r -p "Действие: 1) выключить  2) включить [1]: " en
+  read_choice "Действие: 1) выключить  2) включить [1]: " en
   case "${en:-1}" in
     1) client_set_enable "$email" false ;;
     2) client_set_enable "$email" true ;;
@@ -3411,7 +3429,7 @@ client_toggle_menu() {
 add_relay_route() {
   load_xkit_env || die "Сначала установка (пункт 1)"
   echo "Транспорт: 1) gRPC  2) WebSocket  3) XHTTP"
-  read -r -p "Выбор: " t
+  read_choice "Выбор: " t
   case "$t" in 1) net=grpc ;; 2) net=ws ;; 3) net=xhttp ;; *) die "1-3" ;; esac
   path="$(read_path "Внешний путь (например /relay1/) -> ")"
   [ -n "$path" ] || die "Путь обязателен"
@@ -3419,7 +3437,7 @@ add_relay_route() {
   [ -n "$rh" ] || die "Хост обязателен"
   rp=443
   if [ "$net" != "grpc" ]; then
-    read -r -p "Порт backend [443]: " rp; rp="${rp:-443}"; is_port "$rp" || die "Порт некорректен"
+    read_choice "Порт backend [443]: " rp; rp="${rp:-443}"; is_port "$rp" || die "Порт некорректен"
   fi
   routes_upsert "m$(rand_hex 3)" relay "$net" "$path" "${rh}:${rp}" "manual"
   regen_conf_and_apply || return 1
@@ -3951,12 +3969,12 @@ backup_setup_on_install() {
   echo "  2) раз в 2 суток (48 ч)"
   echo "  3) раз в неделю (168 ч)"
   echo "  4) свой интервал (в часах)"
-  read -r -p "Выбор [1]: " a || a=""
+  read_choice "Выбор [1]: " a || a=""
   case "${a:-1}" in
     2) BACKUP_INTERVAL_H="48" ;;
     3) BACKUP_INTERVAL_H="168" ;;
     4) local h
-       read -r -p "Часов между бэкапами (1-8760): " h || h=""
+       read_choice "Часов между бэкапами (1-8760): " h || h=""
        case "$h" in ''|*[!0-9]*) h="24" ;; esac
        [ "$h" -ge 1 ] && [ "$h" -le 8760 ] || h="24"
        BACKUP_INTERVAL_H="$h" ;;
@@ -3980,7 +3998,7 @@ backup_settings_menu() {
     echo " 7) Создать резервную копию сейчас"
     echo " 0) Назад"
     local c
-    read -r -p "Выбор: " c || return 0
+    read_choice "Выбор: " c || return 0
     case "$c" in
       1) if [ "${BACKUP_ENABLED:-1}" = "1" ]; then
            backup_settings_set 0 "${BACKUP_INTERVAL_H:-24}" && warn "Авто-бэкапы отключены"
@@ -3990,11 +4008,11 @@ backup_settings_menu() {
       2) backup_settings_set 1 24; pause_enter ;;
       3) backup_settings_set 1 48; pause_enter ;;
       4) backup_settings_set 1 168; pause_enter ;;
-      5) local h; read -r -p "Часов между бэкапами (1-8760): " h || h=""
+      5) local h; read_choice "Часов между бэкапами (1-8760): " h || h=""
          backup_settings_set 1 "$h"; pause_enter ;;
       6) local kd km
-         read -r -p "Хранить дней [${BACKUP_KEEP_DAYS:-14}]: " kd || kd=""
-         read -r -p "Минимум копий [${BACKUP_KEEP_MIN:-3}]: " km || km=""
+         read_choice "Хранить дней [${BACKUP_KEEP_DAYS:-14}]: " kd || kd=""
+         read_choice "Минимум копий [${BACKUP_KEEP_MIN:-3}]: " km || km=""
          backup_settings_set "${BACKUP_ENABLED:-1}" "${BACKUP_INTERVAL_H:-24}" "${kd:-${BACKUP_KEEP_DAYS:-14}}" "${km:-${BACKUP_KEEP_MIN:-3}}"; pause_enter ;;
       7) backup_now; pause_enter ;;
       0) return 0 ;;
@@ -4031,7 +4049,7 @@ backup_stage() { # $1 архив; проверенная распаковка в
     *)
       if [ "${XKIT_ALLOW_UNTRUSTED_BACKUP:-0}" != "1" ]; then
         warn "Файл вне ${BACKUP_DIR}: $(basename -- "$file")"
-        read -r -p "Чужой бэкап может выполнить команды от root. Точно восстановить? Введите YES (регистр не важен): " a || { echo; return 1; }
+        read_choice "Чужой бэкап может выполнить команды от root. Точно восстановить? Введите YES (регистр не важен): " a || { echo; return 1; }
         [ "${a^^}" = "YES" ] || { log "Отменено"; return 1; }
       fi ;;
   esac
@@ -4075,7 +4093,7 @@ install_backup_offer() {
   echo "  4) Дополнительные серверы и сроки аренды"
   echo "  5) Полный перенос главного сервера (всё перечисленное)"
   echo "  0) Не восстанавливать"
-  read -r -p "Выбор [5]: " choice || { echo; return 1; }
+  read_choice "Выбор [5]: " choice || { echo; return 1; }
   case "${choice:-5}" in
     1) INSTALL_RESTORE_CERT=1 ;;
     2) INSTALL_RESTORE_PANEL=1 ;;
@@ -4297,7 +4315,7 @@ setup_ufw() {
     if [ -n "$ssh_port" ] && ! is_port "$ssh_port"; then ssh_port=""; fi
     if [ -z "$ssh_port" ]; then
       if [ -t 0 ]; then
-        read -r -p "Не смог определить порт SSH. Укажите его вручную (Enter — пропустить ufw): " ssh_port || ssh_port=""
+        read_choice "Не смог определить порт SSH. Укажите его вручную (Enter — пропустить ufw): " ssh_port || ssh_port=""
       fi
       is_port "${ssh_port:-}" 2>/dev/null || ssh_port=""
     fi
@@ -4340,7 +4358,7 @@ preflight_installed_menu() { # 0 = продолжать установку по�
   echo "  2) Чистая переустановка: бэкап -> полное удаление -> установка с нуля"
   echo "  3) Починить поверх: пакеты/панель/конфиг заново, состояние сохраняется"
   echo "  0) Выход"
-  read -r -p "Выбор [0]: " a || { echo; return 1; }   # EOF (cron/pipe) — безопасный выход
+  read_choice "Выбор [0]: " a || { echo; return 1; }   # EOF (cron/pipe) — безопасный выход
   case "${a:-0}" in
     1) xkit_self_update; return 1 ;;
     2) xkit_reinstall; return 1 ;;
@@ -4461,10 +4479,10 @@ xkit_uninstall() {
 
   if [ "${XKIT_YES:-0}" != "1" ]; then
     if [ "$purge" = "1" ]; then
-      read -r -p "Вычистить ВСЁ без сохранения? Введите PURGE (регистр не важен): " a || { echo; log "Отменено"; return 2; }
+      read_choice "Вычистить ВСЁ без сохранения? Введите PURGE (регистр не важен): " a || { echo; log "Отменено"; return 2; }
       [ "${a^^}" = "PURGE" ] || { log "Отменено"; return 2; } # rc=2 — отмена пользователем, не сбой
     else
-      read -r -p "Удалить xkit? Введите YES (регистр не важен): " a || { echo; log "Отменено"; return 2; }
+      read_choice "Удалить xkit? Введите YES (регистр не важен): " a || { echo; log "Отменено"; return 2; }
       [ "${a^^}" = "YES" ] || { log "Отменено"; return 2; } # rc=2 — отмена пользователем, не сбой
     fi
   fi
@@ -4834,7 +4852,7 @@ xkit_install_body() {
   if [ "${XKIT_YES:-0}" = "1" ]; then
     a="3"
   else
-    read -r -p "Выбор [1]: " a || a=""
+    read_choice "Выбор [1]: " a || a=""
   fi
   case "${a:-1}" in
     1|"") auto_route
@@ -5341,7 +5359,7 @@ reality_scan_choose() { # $1 tsv; результат в RDEST / RSNI
   local out="$1" n row
   reality_scan_print "$out" || return 1
   ok "Полный технический отчёт сохранён: $out"
-  read -r -p "Номер кандидата из таблицы (Enter — отмена): " n || return 1
+  read_choice "Номер кандидата из таблицы (Enter — отмена): " n || return 1
   [ -n "$n" ] || return 1
   row="$(reality_scan_candidate_row "$out" "$n")"
   [ -n "$row" ] || { err "Нет кандидата с таким номером"; return 1; }
@@ -5358,7 +5376,7 @@ reality_known_pick() {
   echo "3) www.samsung.com:443        SNI: www.samsung.com"
   echo "4) www.lovelive-anime.jp:443  SNI: www.lovelive-anime.jp"
   echo "5) www.icloud.com:443         SNI: www.icloud.com"
-  read -r -p "Выбор [1-5]: " k
+  read_choice "Выбор [1-5]: " k
   case "$k" in
     1) RDEST="1.1.1.1:443";              RSNI="cloudflare-dns.com" ;;
     2) RDEST="www.tesla.com:443";        RSNI="www.tesla.com" ;;
@@ -5414,7 +5432,7 @@ reality_dest_menu() { # $1 mode, $2 mdest, $3 msni, $4 node-rec, $5 host-kind
     echo "  6) Как на мастере (${mdest}, SNI ${msni}) — единая маскировка кластера"
   fi
   echo "  7) Вручную (свой dest + SNI)"
-  local c; read -r -p "Выбор [1]: " c; c="${c:-1}"
+  local c; read_choice "Выбор [1]: " c; c="${c:-1}"
   # нормализуем выбор: для домена пункт 1 = свой сайт, пункт 2 = 1.1.1.1
   if [ "$own_ok" = 1 ]; then
     case "$c" in
@@ -5441,7 +5459,7 @@ reality_dest_menu() { # $1 mode, $2 mdest, $3 msni, $4 node-rec, $5 host-kind
        fi ;;
     7) local dh dp
        dh="$(read_host "dest (домен/IP) -> ")" || return 1
-       read -r -p "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
+       read_choice "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
        RSNI="$(read_host "SNI -> ")" || return 1
        RDEST="${dh}:${dp}" ;;
     *) if [ "$own_ok" = 1 ]; then RDEST="127.0.0.1:8444"; RSNI="__OWN_DOMAIN__"; else RDEST="1.1.1.1:443"; RSNI="cloudflare-dns.com"; fi ;;
@@ -5454,7 +5472,7 @@ reality_scan_pick() {
   local myip def t targets
   myip="$(pubip)"
   def=""; [ -n "$myip" ] && def=" (Enter = ${myip%.*}.0/24 — подсеть этого сервера)"
-  read -r -p "Что сканируем? CIDR или список IP/доменов через пробел${def} -> " t
+  read_choice "Что сканируем? CIDR или список IP/доменов через пробел${def} -> " t
   t="${t:-${myip%.*}.0/24}"
   targets="$(reality_expand_targets "$t")"
   case "$targets" in ERR:*) err "$targets"; return 1 ;; esac
@@ -5546,7 +5564,7 @@ reality_wizard() {
   echo "4) Скан подсети — найти подходящие сайты рядом (тихий скан)"
   echo "5) Готовый список проверенных сайтов"
   echo "6) Ввести адрес сайта и SNI вручную"
-  read -r -p "Выбор [1]: " c; c="${c:-1}"
+  read_choice "Выбор [1]: " c; c="${c:-1}"
   local dest="" sni=""
   case "$c" in
     2)
@@ -5571,7 +5589,7 @@ reality_wizard() {
     6)
       local dh dp
       dh="$(read_host "dest (IP или домен) -> ")"
-      read -r -p "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
+      read_choice "Порт dest [443]: " dp; dp="${dp:-443}"; is_port "$dp" || { err "Порт"; return 1; }
       sni="$(read_host "SNI (домен из сертификата dest) -> ")"
       dest="${dh}:${dp}" ;;
     *) dest="1.1.1.1:443"; sni="cloudflare-dns.com" ;;
@@ -5587,7 +5605,7 @@ reality_scan_menu() {
   myip="$(pubip)"
   def=""; [ -n "$myip" ] && def=" (Enter = ${myip%.*}.0/24)"
   echo ""
-  read -r -p "CIDR (например 5.6.7.0/24) или список IP/доменов через пробел${def} -> " t
+  read_choice "CIDR (например 5.6.7.0/24) или список IP/доменов через пробел${def} -> " t
   t="${t:-${myip%.*}.0/24}"
   targets="$(reality_expand_targets "$t")"
   case "$targets" in ERR:*) err "$targets"; return 1 ;; esac
@@ -6251,7 +6269,7 @@ node_reality_scan_pick() { # $1 rec ноды
   local rec="$1" t tlist
   local out="${XKIT_DIR}/reality-scan-node.tsv"
   mkdir -p "$XKIT_DIR" 2>/dev/null || true
-  read -r -p "Что сканируем С НОДЫ? CIDR/список через пробел (Enter = /24 самой ноды) -> " t
+  read_choice "Что сканируем С НОДЫ? CIDR/список через пробел (Enter = /24 самой ноды) -> " t
   tlist=""
   if [ -n "$t" ]; then
     tlist="$(reality_expand_targets "$t")"
@@ -6456,7 +6474,7 @@ node_add() {
   # EOF (Ctrl-D) на любом вводе — отмена, а не молчаливое продолжение
   # (симметрия с v3.2.1, ревью v4.7.0: на порту/юзере EOF давал дефолты
   # 22/root и попытку коннекта к ноде)
-  read -r -p "Имя ноды (латиница, например de1): " nname || { echo; return 1; }
+  read_choice "Имя ноды (латиница, например de1): " nname || { echo; return 1; }
   nname="$(input_clean_ascii "$nname")"
   [[ "$nname" =~ ^[a-zA-Z0-9_-]{1,20}$ ]] || { err "Имя: латиница/цифры/-/_ до 20 символов (получено: $(printf '%q' "$nname"))"; return 1; }
   if jq -e --arg n "$nname" 'any(.[]; .name==$n)' <(nodes_load) >/dev/null 2>&1; then
@@ -6469,16 +6487,16 @@ node_add() {
     confirm "Этот адрес уже записан как '$existing_name'. Переподключить без нового туннеля? [Y/n] " y && node_reconnect_existing "$existing_name"
     return $?
   fi
-  read -r -p "SSH порт [22]: " nport || { echo; return 1; }
+  read_choice "SSH порт [22]: " nport || { echo; return 1; }
   nport="$(input_clean_ascii "$nport")"; nport="${nport:-22}"; is_port "$nport" || { err "Порт"; return 1; }
-  read -r -p "SSH пользователь [root]: " nuser || { echo; return 1; }
+  read_choice "SSH пользователь [root]: " nuser || { echo; return 1; }
   nuser="$(input_clean_ascii "$nuser")"; nuser="${nuser:-root}"
   # аудит №4: без валидации «a"b» уезжало в ssh/jq-реестр; допускаем то, что
   # легитимно для useradd: латиница/цифры/._-, не с цифры, до 32 символов
   [[ "$nuser" =~ ^[a-zA-Z_][a-zA-Z0-9_.-]{0,31}$ ]] || { err "SSH-пользователь: только латиница/цифры/._- (до 32 симв., не с цифры)"; return 1; }
 
   echo "Доступ: 1) пароль (один раз — поставим наш SSH-ключ, пароль не сохраняется)  2) путь к ключу"
-  read -r -p "Выбор [1]: " am || { echo; return 1; }
+  read_choice "Выбор [1]: " am || { echo; return 1; }
   am="${am:-1}"
   local NODE_SSH_PASS="" nkey=""
   local rec_auth="key"
@@ -6496,7 +6514,7 @@ node_add() {
     nkey="$(node_own_key)"
   else
     nkey="$(node_own_key)"
-    read -r -p "Путь к приватному ключу [${nkey}]: " nkey_in || { echo; return 1; }
+    read_choice "Путь к приватному ключу [${nkey}]: " nkey_in || { echo; return 1; }
     [ -n "$nkey_in" ] && nkey="$nkey_in"
     [ -f "$nkey" ] || { err "Ключ не найден: $nkey"; return 1; }
   fi
@@ -6558,7 +6576,7 @@ node_add() {
       warn "На ноде ${nhost} уже установлена рабочая панель 3X-UI."
       echo "  1) Подключить сервер к существующей панели (новые доступы, inbound сохранятся)"
       echo "  2) Переустановить панель (прежние настройки сохранятся в резервной копии)"
-      read -r -p "Что делать? [1]: " _ra || { echo; return 1; }
+      read_choice "Что делать? [1]: " _ra || { echo; return 1; }
       _ra="${_ra:-1}"
       if [ "$_ra" = "2" ]; then
         node_xui_purge "$rec" || return 1
@@ -6570,7 +6588,7 @@ node_add() {
       warn "На ноде ${nhost} найдены куски прежней установки 3X-UI (рабочей панели нет)."
       echo "  1) Очистить и поставить заново (рекомендуется)"
       echo "  2) Отменить добавление сервера"
-      read -r -p "Что делать? [1]: " _ra || { echo; return 1; }
+      read_choice "Что делать? [1]: " _ra || { echo; return 1; }
       _ra="${_ra:-1}"
       [ "$_ra" = "1" ] || { warn "Добавление ноды отменено — куски прежней установки не тронуты"; return 1; }
       node_xui_purge "$rec" || return 1
@@ -6921,7 +6939,7 @@ EOS
       [ -n "$plink" ] && { echo ""; ok "Ссылка ПОЛА (трафик балансируется по нодам):"; printf '  %s\n' "$plink"; }
     fi
   fi
-  read -r -p "Срок аренды ноды '${nname}' (DD.MM.YYYY или YYYY-MM-DD, Enter — пропустить): " dex
+  read_choice "Срок аренды ноды '${nname}' (DD.MM.YYYY или YYYY-MM-DD, Enter — пропустить): " dex
   if [ -n "$dex" ]; then
     if expiry_set node "$nname" "$dex" ""; then
       ok "Срок аренды сохранён: ${dex} (виден в веб-дашборде и xkit expiry list)"
@@ -6963,7 +6981,7 @@ EOS
     local _cm=""
     echo ""
     if is_ip "$nhost"; then
-      read -r -p "Сертификат панели ноды: Enter = самоподписанный (уже стоит) | ip = Let's Encrypt на IP (~6.5 дней, автопродление): " _cm || _cm=""
+      read_choice "Сертификат панели ноды: Enter = самоподписанный (уже стоит) | ip = Let's Encrypt на IP (~6.5 дней, автопродление): " _cm || _cm=""
       case "${_cm,,}" in
         ip|le|letsencrypt) node_cert_one "$nname" ip "" || true ;;
         *) ok "Панель ноды остаётся на самоподписанном серте (xkit nodes cert ${nname} ip — когда понадобится)" ;;
@@ -6974,7 +6992,7 @@ EOS
       echo "  2) свой сертификат — пути к fullchain/privkey на этом сервере"
       echo "  3) Домен и все поддомены через Cloudflare (для сайта-прикрытия)"
       echo "  4) самоподписанный (уже стоит — пропустить)"
-      read -r -p "Выбор [1]: " _cm || _cm=""
+      read_choice "Выбор [1]: " _cm || _cm=""
       case "${_cm:-1}" in
         1|le|domain|letsencrypt) node_cert_one "$nname" domain "" || true ;;
         2|own) node_cert_one "$nname" own "" || true ;;
@@ -7222,7 +7240,7 @@ nodes_strategy() {
   echo "2) Случайно (random)"
   echo "3) По наименьшей задержке (leastPing): выбирается самый быстрый ответ"
   echo "4) По наименьшей загрузке (leastLoad): проверка каждые 5 минут (по умолчанию)"
-  read -r -p "Выбор [1-4, Enter = 4]: " s
+  read_choice "Выбор [1-4, Enter = 4]: " s
   s="${s:-4}"
   case "$s" in
     1) XKIT_BAL_STRATEGY="roundRobin" ;;
@@ -7245,7 +7263,7 @@ nodes_del() {
   [ "$cnt" -eq 0 ] && { warn "Нод нет"; return 0; }
   nodes_list
   local n rec
-  read -r -p "Имя ноды для удаления (Enter — отмена): " n
+  read_choice "Имя ноды для удаления (Enter — отмена): " n
   n="$(input_clean_ascii "$n")"
   [ -z "$n" ] && return 0
   rec="$(nodes_load | jq -c --arg n "$n" '[.[]|select(.name==$n)][0] // empty')"
@@ -7366,7 +7384,7 @@ nodes_menu() {
     echo "    (Замер «заморозки» ТСПУ перенесён в меню «Тестирование сервера»)"
     echo " 0) Назад"
     local c
-    read -r -p "Выбор: " c || return 0
+    read_choice "Выбор: " c || return 0
     case "$c" in
       1) node_add; pause_enter ;;
       2) nodes_list; pause_enter ;;
@@ -7374,23 +7392,23 @@ nodes_menu() {
       4) nodes_strategy; pause_enter ;;
       5) nodes_del; pause_enter ;;
       6) nodes_repair; pause_enter ;;
-      7) local _rw; read -r -p "Имя ноды (Enter — все): " _rw; node_repin "${_rw:-all}"; pause_enter ;;
+      7) local _rw; read_choice "Имя ноды (Enter — все): " _rw; node_repin "${_rw:-all}"; pause_enter ;;
       8) pool_remove; pause_enter ;;
       9) node_cert_menu; pause_enter ;;
       10) node_camo_menu; pause_enter ;;
-      11) local _ck; read -r -p "Имя ноды (Enter — все): " _ck; nodes_check "${_ck:-all}"; pause_enter ;;
-      12) nodes_plan; local _ca; read -r -p "Canary нода (Enter — отмена): " _ca; [ -z "$_ca" ] || { nodes_apply_canary "$_ca" && confirm "Применить остальным? [y/N]" && nodes_apply_remaining; }; pause_enter ;;
-      13) local _tn; read -r -p "Нода: " _tn; node_token_set "$_tn"; node_token_expiry_check; pause_enter ;;
-      14) local _rl; read -r -p "Нода: " _rl; node_relogin "$_rl"; pause_enter ;;
-      15) local _ps; read -r -p "Нода (Enter — все): " _ps; node_panel_sync "${_ps:-all}"; pause_enter ;;
-      16) local _hd; read -r -p "Нода (Enter — все): " _hd; node_hide_one "${_hd:-all}"; pause_enter ;;
+      11) local _ck; read_choice "Имя ноды (Enter — все): " _ck; nodes_check "${_ck:-all}"; pause_enter ;;
+      12) nodes_plan; local _ca; read_choice "Canary нода (Enter — отмена): " _ca; [ -z "$_ca" ] || { nodes_apply_canary "$_ca" && confirm "Применить остальным? [y/N]" && nodes_apply_remaining; }; pause_enter ;;
+      13) local _tn; read_choice "Нода: " _tn; node_token_set "$_tn"; node_token_expiry_check; pause_enter ;;
+      14) local _rl; read_choice "Нода: " _rl; node_relogin "$_rl"; pause_enter ;;
+      15) local _ps; read_choice "Нода (Enter — все): " _ps; node_panel_sync "${_ps:-all}"; pause_enter ;;
+      16) local _hd; read_choice "Нода (Enter — все): " _hd; node_hide_one "${_hd:-all}"; pause_enter ;;
       17) nodes_versions all
           local _un
-          read -r -p "Обновить ноду (Enter — отмена, all — все): " _un || _un=""
+          read_choice "Обновить ноду (Enter — отмена, all — все): " _un || _un=""
           [ -z "$_un" ] || nodes_upgrade "$_un" ""
           pause_enter ;;
-      18) local _uf; read -r -p "Нода (Enter — все): " _uf; node_ufw_one "${_uf:-all}" status
-          local _uo; read -r -p "Включить UFW на ноде (Enter — отмена, all — все): " _uo || _uo=""
+      18) local _uf; read_choice "Нода (Enter — все): " _uf; node_ufw_one "${_uf:-all}" status
+          local _uo; read_choice "Включить UFW на ноде (Enter — отмена, all — все): " _uo || _uo=""
           [ -z "$_uo" ] || node_ufw_one "$_uo" on
           pause_enter ;;
       0) return 0 ;;
@@ -7406,10 +7424,10 @@ node_cert_menu() {
   [ "$(jq 'length' <<<"$arr" 2>/dev/null || echo 0)" -gt 0 ] || { warn "Нод нет — сначала добавьте ноду"; return 0; }
   node_cert_show all
   local n m d
-  read -r -p "Имя ноды (Enter — отмена): " n || return 0
+  read_choice "Имя ноды (Enter — отмена): " n || return 0
   [ -n "$n" ] || return 0
   echo "Режим: 1) self-signed  2) ip (LE shortlived)  3) domain (http-01)  4) subdomain+wildcard (dns-01, мастер)"
-  read -r -p "Режим [1]: " m || return 0
+  read_choice "Режим [1]: " m || return 0
   m="${m:-1}"
   d=""
   if [ "$m" = "3" ] || [ "$m" = "4" ]; then
@@ -7424,15 +7442,15 @@ node_camo_menu() {
   node_camo_status
   echo " 1) Установить/обновить сайт-прикрытие   2) Удалить сайт-прикрытие (имя|all)   0) Назад"
   local c n
-  read -r -p "Выбор: " c || return 0
+  read_choice "Выбор: " c || return 0
   case "$c" in
-    1) read -r -p "Имя ноды (Enter — все): " n || return 0
+    1) read_choice "Имя ноды (Enter — все): " n || return 0
        if [ -n "$n" ]; then node_camo_deploy_one "$n"; else
          local nn; jq -r '.[].name' <(nodes_load) 2>/dev/null | while IFS= read -r nn; do
            node_camo_deploy_one "$nn" || true
          done
        fi ;;
-    2) read -r -p "Имя ноды | all: " n || return 0; [ -n "$n" ] && node_camo_off_one "$n" ;;
+    2) read_choice "Имя ноды | all: " n || return 0; [ -n "$n" ] && node_camo_off_one "$n" ;;
     0) return 0 ;;
     *) warn "Нет такого пункта" ;;
   esac
@@ -7809,7 +7827,7 @@ client_reset() {
     for cl in "${cls[@]}"; do
       i=$((i+1)); printf '%-3s %s\n' "$i" "$(jq -r '.email // "-"' <<<"$cl" | cut -c1-40)"
     done
-    read -r -p "Номер пользователя [1-$i] (Enter — отмена): " n
+    read_choice "Номер пользователя [1-$i] (Enter — отмена): " n
     [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { warn "Отменено"; return 0; }
     cl="${cls[$((n-1))]}"
     email="$(jq -r '.email // empty' <<<"$cl" | tr -dc 'A-Za-z0-9._@-')"
@@ -7960,11 +7978,11 @@ expiry_check() {
 
 expiry_menu_set() {
   echo "Кому задать срок:  1) главный сервер   2) дополнительный сервер"
-  read -r -p "Выбор [1]: " w; w="${w:-1}"
+  read_choice "Выбор [1]: " w; w="${w:-1}"
   local scope id
   if [ "$w" = "2" ]; then
     nodes_list || true
-    read -r -p "Имя ноды: " id
+    read_choice "Имя ноды: " id
     jq -e --arg n "$id" 'any(.[]; .name==$n)' <(nodes_load) >/dev/null 2>&1 \
       || { err "Нода '$id' не найдена"; return 1; }
     scope="node"
@@ -7972,8 +7990,8 @@ expiry_menu_set() {
     scope="master"; id="-"
   fi
   local d note
-  read -r -p "Дата окончания аренды (DD.MM.YYYY или YYYY-MM-DD): " d
-  read -r -p "Заметка (провайдер/тариф, Enter — нет): " note
+  read_choice "Дата окончания аренды (DD.MM.YYYY или YYYY-MM-DD): " d
+  read_choice "Заметка (провайдер/тариф, Enter — нет): " note
   expiry_set "$scope" "$id" "$d" "$note" || return 1
   xkit_summary_save >/dev/null 2>&1 || true
   ok "Сохранено. Текущие сроки:"
@@ -7984,7 +8002,7 @@ expiry_menu_set() {
 expiry_menu_del() {
   [ -s "$XKIT_EXPIRY" ] || { warn "Записей нет"; return 0; }
   expiry_list
-  read -r -p "Удалить запись для (master или имя ноды, Enter — отмена): " id
+  read_choice "Удалить запись для (master или имя ноды, Enter — отмена): " id
   [ -z "$id" ] && return 0
   if [ "$id" = "master" ]; then expiry_del master "-"; else expiry_del node "$id"; fi
   ok "Запись удалена (если была)"
@@ -8003,7 +8021,7 @@ expiry_menu() {
     echo " 3) Проверка: что скоро истекает"
     echo " 0) Назад"
     local c
-    read -r -p "Выбор: " c || return 0
+    read_choice "Выбор: " c || return 0
     case "$c" in
       1) expiry_menu_set; pause_enter ;;
       2) expiry_menu_del; pause_enter ;;
@@ -8523,15 +8541,15 @@ telegram_setup() {
   echo "(ssh -D SOCKS5 поверх управляющего SSH, DPI не палит). Нужна хотя бы одна"
   echo "нода или прокси. Транспорты: xkit telegram transport."
   local tok chat px admins
-  read -r -p "Bot token (от @BotFather, вид 123456:ABC-...): " tok
+  read_choice "Bot token (от @BotFather, вид 123456:ABC-...): " tok
   [[ "$tok" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,46}$ ]] || { err "Токен не похож на валидный"; return 1; }
-  read -r -p "Chat ID (число от @userinfobot, или @имя_канала): " chat
+  read_choice "Chat ID (число от @userinfobot, или @имя_канала): " chat
   [[ "$chat" =~ ^-?[0-9]+$|^@[A-Za-z0-9_]{4,64}$ ]] || { err "Chat ID: число (личка/группа) или @имя_канала"; return 1; }
-  read -r -p "Admin IDs (числовые Telegram ID админов через запятую; Enter = chat): " admins
+  read_choice "Admin IDs (числовые Telegram ID админов через запятую; Enter = chat): " admins
   admins="${admins:-$chat}"
   # валидация: только числа/запятые/минус
   [[ "$admins" =~ ^-?[0-9]+(,-?[0-9]+)*$ ]] || { err "Admin IDs: числа через запятую (от @userinfobot)"; return 1; }
-  read -r -p "Прокси для api.telegram.org (http://... или socks5://...; Enter — через ноды): " px
+  read_choice "Прокси для api.telegram.org (http://... или socks5://...; Enter — через ноды): " px
   XKIT_TG_TOKEN="$tok"; XKIT_TG_CHAT="$chat"; XKIT_TG_PROXY="$px"; XKIT_TG_ADMINS="$admins"
   save_xkit_env
   notify_cron_install
@@ -8579,7 +8597,7 @@ telegram_menu() {
     echo " 6) Транспорты TG (через ноды/прокси): список / проверка / добавить"
     echo " 0) Назад"
     local c
-    read -r -p "Выбор: " c || return 0
+    read_choice "Выбор: " c || return 0
     case "$c" in
       1) telegram_setup; pause_enter ;;
       2) load_xkit_env >/dev/null 2>&1 || true; notify_check; pause_enter ;;
@@ -8588,7 +8606,7 @@ telegram_menu() {
          pause_enter ;;
       4) telegram_off; pause_enter ;;
       5) echo " 1) Включить бота (systemd)  2) Выключить  3) Статус  4) Перезапустить  0) Назад"
-         local b; read -r -p "Выбор: " b
+         local b; read_choice "Выбор: " b
          case "$b" in
            1) telegram_bot_service on ;;
            2) telegram_bot_service off ;;
@@ -10610,7 +10628,7 @@ protocol_toggle() {
   done < <(jq -c '.[]' <<<"$INBOUNDS")
   [ "$i" -eq 0 ] && { warn "Инбаундов нет"; return 1; }
   local n
-  read -r -p "Номер инбаунда [1-$i]: " n
+  read_choice "Номер инбаунда [1-$i]: " n
   [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -ge 1 ] && [ "$n" -le "$i" ] || { err "Нет такого номера"; return 1; }
   ib="${rows[$((n-1))]}"; id="$(jq -r '.id' <<<"$ib")"; en="$(jq -r '(.enable != false)' <<<"$ib")"
   local target
@@ -10970,11 +10988,11 @@ version_pick() { # $1 kind, $2 default-tag (необязательно)
     echo "  0) ввести версию вручную" >&2
     local dprompt="Номер [1=последняя]"
     [ -n "$def" ] && dprompt="Номер [Enter=${def}]"
-    read -r -p "${dprompt}: " choice || return 1
+    read_choice "${dprompt}: " choice || return 1
     if [ -z "$choice" ]; then
       tag="${def:-$(head -n1 <<<"$rel")}"
     elif [ "$choice" = 0 ]; then
-      read -r -p "Версия (например 3.11.0 или 26.6.27): " tag || return 1
+      read_choice "Версия (например 3.11.0 или 26.6.27): " tag || return 1
     elif [[ "$choice" =~ ^[0-9]+$ ]]; then
       tag="$(sed -n "${choice}p" <<<"$rel" | tr -d '[:space:]')"
       [ -n "$tag" ] || { err "Нет такого номера в списке"; return 1; }
@@ -10983,7 +11001,7 @@ version_pick() { # $1 kind, $2 default-tag (необязательно)
     fi
   else
     warn "Список релизов недоступен (GitHub API лимит/сеть) — введите версию вручную"
-    read -r -p "Версия ${hint} (например 3.11.0): " tag || return 1
+    read_choice "Версия ${hint} (например 3.11.0): " tag || return 1
   fi
   tag="$(version_norm "$tag")" || { err "'$tag' не похож на версию (пример: 3.11.0)"; return 1; }
   printf 'v%s' "$tag"
@@ -11001,7 +11019,7 @@ versions_installer_select() {
   echo "  1) Последние официальные версии 3X-UI и Xray [Enter]"
   echo "  2) Выбрать версии номером из списка GitHub"
   echo "  3) Ввести версии вручную"
-  read -r -p "Ваш выбор: " a || return 0
+  read_choice "Ваш выбор: " a || return 0
   a="${a:-1}"
   case "$a" in
     1)
@@ -11018,10 +11036,10 @@ versions_installer_select() {
       ok "Выбрано: 3X-UI ${XKIT_3XUI_TAG} + Xray ${XKIT_XRAY_VERSION}"
       ;;
     3)
-      read -r -p "Версия 3X-UI (например 3.11.0): " u || return 1
+      read_choice "Версия 3X-UI (например 3.11.0): " u || return 1
       u="$(version_norm "$u")" || return 1
       XKIT_3XUI_TAG="v$u"
-      read -r -p "Версия Xray (Enter = бандл панели): " x || return 1
+      read_choice "Версия Xray (Enter = бандл панели): " x || return 1
       if [ -n "$x" ]; then XKIT_XRAY_VERSION="$(version_norm "$x")" || return 1; XKIT_CORE_PIN="$XKIT_XRAY_VERSION"; fi
       ;;
     *) return 0 ;;
@@ -11479,7 +11497,7 @@ backup_export() {
   [ -n "$src" ] || src="$(ls -1t "$BACKUP_DIR"/xkit-*.tar.gz 2>/dev/null | head -n1)"
   [ -f "$src" ] || { err "Бэкап не найден"; return 1; }
   backup_archive_check "$src" || return 1
-  if [ -z "$recipient" ]; then read -r -p "Публичный age recipient: " recipient || return 1; fi
+  if [ -z "$recipient" ]; then read_choice "Публичный age recipient: " recipient || return 1; fi
   [[ "$recipient" =~ ^age1[023456789acdefghjklmnpqrstuvwxyz]{20,100}$ ]] || { err "Неверный age recipient"; return 1; }
   out="${src%.tar.gz}-$(date +%Y%m%d-%H%M%S).tar.gz.age"
   age -r "$recipient" -o "$out" "$src" || { rm -f "$out"; return 1; }
@@ -11699,7 +11717,7 @@ server_reboot() { # $1: --yes (для бота, confirm уже пройден к
   if [ "${1:-}" != "--yes" ]; then
     echo "Перезагрузка сервера ЦЕЛИКОМ: все соединения оборвутся, доступ пропадёт на 1-3 минуты."
     local a
-    read -r -p "Введите REBOOT для подтверждения: " a || { log "Отменено"; return 0; }
+    read_choice "Введите REBOOT для подтверждения: " a || { log "Отменено"; return 0; }
     [ "${a^^}" = "REBOOT" ] || { log "Отменено"; return 0; }
   fi
   audit_event server.reboot master ok 2>/dev/null || true
@@ -12002,7 +12020,7 @@ sub_qr() { # локальный SVG/PNG или родной animated HTML для
   if [ -z "$fmt" ]; then
     if [ -t 0 ]; then
       printf 'Формат QR: 1) SVG  2) PNG  3) AmneziaVPN (animated HTML)\n'
-      local c; read -r -p "Выбор [1]: " c
+      local c; read_choice "Выбор [1]: " c
       case "${c:-1}" in 2) fmt=png ;; 3) fmt=awg ;; *) fmt=svg ;; esac
     else
       fmt=svg
@@ -12133,7 +12151,7 @@ node_token_set() {
   read -r -s -p "Scoped API token для $want: " token || { echo; return 1; }; echo
   token="$(input_clean_ascii "$token")"
   [[ "$token" =~ ^[A-Za-z0-9._~-]{20,512}$ ]] || { err "Токен пуст или имеет неподдерживаемый формат"; return 1; }
-  read -r -p "Истекает DD.MM.YYYY или YYYY-MM-DD (Enter — не задан): " expires || return 1
+  read_choice "Истекает DD.MM.YYYY или YYYY-MM-DD (Enter — не задан): " expires || return 1
   expires="$(input_clean_ascii "$expires")"
   if [ -n "$expires" ] && ! [[ "$expires" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then err "Формат даты"; return 1; fi
   ck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)" || return 1
@@ -13008,7 +13026,7 @@ except Exception: print("")' "$d" 2>/dev/null)"
 node_cert_cf_token_set() { # -> 0/1; создаёт/освежает cf-dns.ini
   local ini; ini="$(node_cert_cf_ini)"
   local tok
-  read -r -p "Cloudflare API-токен (Zone:DNS:Edit на зону базы; ввод скроется): " tok || return 1
+  read_choice "Cloudflare API-токен (Zone:DNS:Edit на зону базы; ввод скроется): " tok || return 1
   [ -n "$tok" ] || { err "Пустой токен"; return 1; }
   log "Проверяю токен через Cloudflare API (verify)..."
   local v
@@ -13300,7 +13318,7 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
     echo "  4) subdomain+wildcard — база + *.база, выпускает мастер по dns-01 (Cloudflare),"
     echo "                        раздаётся ноде; открывает vhost api./dev./login. (camo-сьют)"
     echo "  5) own              — свой сертификат: пути к fullchain/privkey на этом сервере"
-    read -r -p "Режим [1]: " mode || return 1
+    read_choice "Режим [1]: " mode || return 1
     mode="${mode:-1}"
     case "$mode" in
       1|self) mode="self" ;;
@@ -13325,7 +13343,7 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
     domain)
       # v7.7.6: Enter (и EOF) на промпте = домен ноды — он уже в подсказке;
       # раньше пустой ввод давал «'' не похож на домен» и серт не ставился
-      [ -n "$d" ] || { read -r -p "Домен панели ноды [${nhost}]: " d || true; d="${d:-$nhost}"; }
+      [ -n "$d" ] || { read_choice "Домен панели ноды [${nhost}]: " d || true; d="${d:-$nhost}"; }
       is_domain "$d" || { err "'$d' не похож на домен"; return 1; }
       local aip; aip="$(node_cert_a_record "$d")"
       [ -n "$aip" ] || { err "A-запись $d не нашлась — выпуск отменён (пропишите и повторите)"; return 1; }
@@ -13335,7 +13353,7 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       lineage="$d"
       ;;
     wildcard)
-      [ -n "$d" ] || { read -r -p "База wildcard (пример: n1.example.com — сама база + *.база): " d || return 1; }
+      [ -n "$d" ] || { read_choice "База wildcard (пример: n1.example.com — сама база + *.база): " d || return 1; }
       is_domain "$d" || { err "'$d' не похож на домен"; return 1; }
       [[ "$d" == *"*"* ]] && { err "Пишите БЕЗ '*.' — выпуск покроет $d и *.$d"; return 1; }
       if [ ! -s "$(node_cert_cf_ini)" ]; then
@@ -13355,9 +13373,9 @@ node_cert_one() { # $1 имя, $2 режим(пусто = меню), $3 доме
       # на МАСТЕРЕ (куда пользователь их и положил); проверяем соответствие
       # пары (pubkey серта == pubkey ключа), доставляем на ноду с sha256-сверкой.
       local cf kf
-      read -r -p "Путь к сертификату (fullchain.pem) на этом сервере: " cf || return 1
+      read_choice "Путь к сертификату (fullchain.pem) на этом сервере: " cf || return 1
       [ -s "$cf" ] || { err "Файл не найден или пуст: $cf"; return 1; }
-      read -r -p "Путь к приватному ключу (privkey.pem): " kf || return 1
+      read_choice "Путь к приватному ключу (privkey.pem): " kf || return 1
       [ -s "$kf" ] || { err "Файл не найден или пуст: $kf"; return 1; }
       openssl x509 -in "$cf" -noout >/dev/null 2>&1 || { err "$cf — это не сертификат X.509"; return 1; }
       local cm km
@@ -14449,12 +14467,12 @@ tg_transport_menu() {
     echo " 4) Удалить транспорт"
     echo " 5) Синхронизировать ноды (ssh -D туннели)"
     echo " 0) Назад"
-    local c; read -r -p "Выбор: " c || return 0
+    local c; read_choice "Выбор: " c || return 0
     case "$c" in
       1) tg_transports_load | jq -r '.[]|"\(.type)  \(.node//.url//"direct")  статус=\(.status)"' ;;
       2) tg_transport_check_all ;;
-      3) local t u; read -r -p "Тип (socks5|http): " t; read -r -p "URL (socks5://host:port): " u; tg_transport_add_proxy "$t" "$u" ;;
-      4) local k; read -r -p "Имя ноды или URL: " k; tg_transport_remove "$k" ;;
+      3) local t u; read_choice "Тип (socks5|http): " t; read_choice "URL (socks5://host:port): " u; tg_transport_add_proxy "$t" "$u" ;;
+      4) local k; read_choice "Имя ноды или URL: " k; tg_transport_remove "$k" ;;
       5) tg_transports_sync_nodes; ok "Транспорты нод синхронизированы" ;;
       0) return 0 ;;
       *) warn "Нет такого пункта" ;;
@@ -15220,7 +15238,7 @@ xkit_test_pick_target() { # $1 цель (""=интерактивно, master, и
   names="$(jq -r '.[].name' <<<"$arr" 2>/dev/null)"
   local i=1
   while IFS= read -r n; do [ -n "$n" ] && { echo "  ${i}) Нода ${n}" >&2; i=$((i+1)); }; done <<<"$names"
-  local choice; read -r -p "Выбор [0]: " choice || return 1
+  local choice; read_choice "Выбор [0]: " choice || return 1
   choice="${choice:-0}"
   if [ "$choice" = "0" ]; then printf ''; return 0; fi
   [[ "$choice" =~ ^[0-9]+$ ]] || { err "Неверный выбор"; return 1; }
