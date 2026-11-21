@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v9.2.5 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v9.3.0 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -161,12 +161,12 @@ proto_xhttp_create() {
   local settings stream ib so
   so='{}'; sockopt_enabled && so="$(sockopt_obj)"   # v7.4.3: TFO+TCP_NODELAY
   settings='{"clients":[],"decryption":"none","fallbacks":[]}' 
-  stream="$(jq -nc --arg dest "$PROTO_DEST" --arg sni "$PROTO_SNI" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" --arg path "$path" --argjson so "$so" '
+  stream="$(jq -nc --arg dest "$PROTO_DEST" --arg sni "$PROTO_SNI" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" --arg path "$path" --arg fp "$(xkit_fp)" --argjson so "$so" '
     {network:"xhttp",security:"reality",
      xhttpSettings:{path:$path,host:"",mode:"auto"},
      realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$priv,
        minClient:"",maxClient:"",maxTimeDiff:0,shortIds:[$sid],
-       settings:{publicKey:$pub,fingerprint:"chrome",serverName:""}}}
+       settings:{publicKey:$pub,fingerprint:$fp,serverName:""}}}
     + (if (($so|length) > 0) then {sockopt:$so} else {} end)')"
   ib="$(jq -nc --arg port "$p" --arg tag "inbound-${p}" --arg remark "xhttp-reality-${PROTO_SNI}" --arg s "$settings" --arg st "$stream" '
     {up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,listen:"",port:($port|tonumber),protocol:"vless",settings:$s,streamSettings:$st,

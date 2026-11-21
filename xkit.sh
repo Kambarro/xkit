@@ -16,11 +16,16 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.2.5"
+XKIT_VERSION="9.3.0"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
 XKIT_CORE_PIN="${XKIT_XRAY_VERSION:-26.6.27}"
+# v9.3.0: TLS-отпечаток браузера (uTLS) для маскировки клиентских подключений.
+# Один источник истины для ссылок/подписок/туннелей нод. Дефолт chrome —
+# гарантированная совместимость со всеми клиентами. Смена: xkit fp set <имя>.
+# Разнообразие fp усложняет кластеризацию ТСПУ (chrome у всех = сигнатура VPN).
+XKIT_FP="${XKIT_FP:-chrome}"
 # необязательный пин SHA-256 установщика 3X-UI (задаётся окружением
 # XKIT_XUI_SHA256=... перед установкой; актуальное значение — check-upstream.sh)
 XKIT_XUI_SHA256=""
@@ -1659,6 +1664,67 @@ force_panel_localhost() {
 }
 
 #=========================== СОСТОЯНИЕ XKIT ===================================
+# v9.3.0: TLS-отпечаток (uTLS) — один источник истины для ссылок/подписок/туннелей.
+# Дефолт chrome (гарантия совместимости). Разнообразие fp усложняет детект ТСПУ.
+xkit_fp() { printf '%s' "${XKIT_FP:-chrome}"; }
+xkit_fp_valid() { # $1 имя -> rc 0 если поддерживается xray uTLS
+  case "${1:-}" in
+    chrome|firefox|safari|ios|android|edge|random|randomized|randomizednoalpn|360|qq) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+xkit_fp_warn() { # $1 имя -> предупреждение о негарантированных fp (stderr)
+  case "${1:-}" in
+    randomized|randomizednoalpn)
+      warn "fp '${1}': синтетический случайный отпечаток. Крайняя мера (если блокируют браузерные fp). Баг xray #6714: некоторые запуски клиента могут не подключаться к REALITY (X25519MLKEM768 без key share). chrome/firefox/safari гарантированы." ;;
+    random)
+      warn "fp 'random': случайный браузер на каждый запуск клиента (не на соединение). Совместимость не гарантирована для всех выпавших fp; chrome/firefox/safari надёжнее." ;;
+    360|qq|ios|android|edge)
+      warn "fp '${1}': поддерживается xray, но для REALITY гарантированы только chrome/firefox/safari. Проверьте подключение клиентом." ;;
+  esac
+}
+fp_show() {
+  load_xkit_env 2>/dev/null || true
+  echo "Текущий TLS-отпечаток (uTLS): $(xkit_fp)"
+  echo "Доступные: chrome firefox safari ios android edge random randomized randomizednoalpn"
+  echo "Гарантированы для REALITY: chrome firefox safari"
+  echo "Смена: xkit fp set <имя> (пересоберёт все подписки и туннели нод)"
+}
+fp_set() { # $1 имя fp
+  require_root
+  load_xkit_env || die "Сначала установка XKIT"
+  local fp="${1:-}"
+  if [ -z "$fp" ]; then
+    echo "Доступные отпечатки:"
+    echo "  chrome (дефолт)  firefox  safari  ios  android  edge"
+    echo "  random  randomized  randomizednoalpn"
+    read_choice "Отпечаток (Enter = отмена): " fp || return 0
+    [ -n "$fp" ] || { log "Отменено"; return 0; }
+  fi
+  xkit_fp_valid "$fp" || { err "Неизвестный отпечаток: '$fp' (chrome firefox safari ios android edge random randomized randomizednoalpn)"; return 1; }
+  local old; old="$(xkit_fp)"
+  if [ "$fp" = "$old" ]; then ok "Отпечаток уже '$fp' — ничего не меняю"; return 0; fi
+  xkit_fp_warn "$fp"
+  confirm "Сменить отпечаток '$old' -> '$fp' для ВСЕХ протоколов и пересобрать подписки? [y/N] " n || { warn "Отменено"; return 0; }
+  XKIT_FP="$fp"
+  save_xkit_env || return 1
+  log "Пересобираю подписки с отпечатком '$fp'..."
+  sub_regen_quiet || warn "Подписки не пересобраны — выполните: xkit sub"
+  # туннели мастер->нода: outbound использует fp из шаблона; repair переприменит
+  if [ -s "$XKIT_NODES" ] && [ "$(nodes_load | jq 'length')" -gt 0 ]; then
+    log "Обновляю туннели нод (fp='$fp')..."
+    nodes_repair >/dev/null 2>&1 || warn "Туннели нод не обновлены — выполните: xkit nodes repair"
+  fi
+  ok "Отпечаток '$fp' применён. Клиенты получат новый fp при обновлении подписки (сервер REALITY принимает любой валидный fp — старые подключения не рвутся)."
+}
+fp_cmd() { # $1 subcommand
+  case "${1:-show}" in
+    show|status) fp_show ;;
+    set) shift; fp_set "${1:-}" ;;
+    *) err "xkit fp show | fp set <chrome|firefox|safari|ios|android|edge|random|randomized|randomizednoalpn>"; return 1 ;;
+  esac
+}
+
 save_xkit_env() {
   mkdir -p "$(dirname "$XKIT_ENV")" 2>/dev/null || true
   chmod 700 "$(dirname "$XKIT_ENV")" 2>/dev/null || true
@@ -1680,6 +1746,7 @@ save_xkit_env() {
       printf 'XKIT_PANEL_SUB_PATH=%q\n' "${XKIT_PANEL_SUB_PATH:-}"
       printf 'XKIT_REALITY_INTERNAL=%q\n' "${XKIT_REALITY_INTERNAL:-0}"
       printf 'XKIT_BAL_STRATEGY=%q\n' "${XKIT_BAL_STRATEGY:-leastLoad}"
+      printf 'XKIT_FP=%q\n' "${XKIT_FP:-chrome}"
       printf 'XKIT_POOL_INBOUND=%q\n' "${XKIT_POOL_INBOUND:-}"
       printf 'XKIT_POOL_TAG=%q\n' "${XKIT_POOL_TAG:-}"
       printf 'XKIT_REPO_URL=%q\n' "${XKIT_REPO_URL:-}"
@@ -1709,6 +1776,7 @@ load_xkit_env() {
     : "${XKIT_HOST:=}" "${XKIT_CRT:=}" "${XKIT_KEY:=}" "${XKIT_CERT_MODE:=}" "${XKIT_SUB_TOKEN:=}"
     : "${XKIT_UFW:=0}" "${XKIT_PANEL_SUB_PORT:=}" "${XKIT_PANEL_SUB_PATH:=}" "${XKIT_REALITY_INTERNAL:=0}"
     : "${XKIT_BAL_STRATEGY:=leastLoad}" "${XKIT_POOL_INBOUND:=}" "${XKIT_POOL_TAG:=}"
+    : "${XKIT_FP:=chrome}"
     : "${XKIT_TG_TOKEN:=}" "${XKIT_TG_CHAT:=}" "${XKIT_TG_PROXY:=}" "${XKIT_TG_ADMINS:=}" "${XKIT_XUI_API_TOKEN:=}"
     : "${BACKUP_ENABLED:=1}" "${BACKUP_INTERVAL_H:=24}" "${BACKUP_KEEP_DAYS:=14}" "${BACKUP_KEEP_MIN:=3}"
     : "${XKIT_REPO_URL:=}"
@@ -1721,6 +1789,7 @@ load_xkit_env() {
   XKIT_HOST=""; XKIT_CRT=""; XKIT_KEY=""; XKIT_CERT_MODE=""; XKIT_SUB_TOKEN=""; XKIT_UFW="0"
   XKIT_PANEL_SUB_PORT=""; XKIT_PANEL_SUB_PATH=""; XKIT_REALITY_INTERNAL="0"
   XKIT_BAL_STRATEGY="leastLoad"; XKIT_POOL_INBOUND=""; XKIT_POOL_TAG=""
+  XKIT_FP="${XKIT_FP:-chrome}"   # v9.3.0: fp не сбрасываем на chrome если задан env (сохраняем выбор)
   XKIT_TG_TOKEN=""; XKIT_TG_CHAT=""; XKIT_TG_PROXY=""; XKIT_TG_ADMINS=""
   XKIT_XUI_API_TOKEN=""   # v7.2.5: API-токен панели (Bearer); read_panel_settings дополнит из install-result.env
   # v7.2.0: политика бэкапов — дефолты ДО чтения xkit.env (env переопределит)
@@ -2604,9 +2673,9 @@ _link_proto() { # proto email host port net sec path svc sni pbk sid fp flow cli
         tcp)         [ -n "$path" ] && q+="&headerType=http&path=$(enc_uri_path "$path")&host=$(enc_uri "$host")" ;;
       esac
       if [ "$sec" = "tls" ]; then
-        q+="&sni=$(enc_uri "${sni:-$host}")&fp=${fp:-chrome}"
+        q+="&sni=$(enc_uri "${sni:-$host}")&fp=${fp:-$(xkit_fp)}"
       elif [ "$sec" = "reality" ]; then
-        q+="&sni=$(enc_uri "$sni")&fp=${fp:-chrome}&pbk=$(enc_uri "$pbk")"
+        q+="&sni=$(enc_uri "$sni")&fp=${fp:-$(xkit_fp)}&pbk=$(enc_uri "$pbk")"
         [ -n "$sid" ] && q+="&sid=$(enc_uri "$sid")"
         [ -n "$flow" ] && q+="&flow=$(enc_uri "$flow")"
       fi
@@ -3630,12 +3699,13 @@ health_deep() {
 
   # --- клиентский конфиг из ссылки (REALITY tcp/xhttp | hysteria2) ---
   deep_client_config() { # ссылка порт -> JSON на stdout; не 0 = проверять нечем
-    python3 - "$1" "$2" <<'PY'
-import json, sys
+    XKIT_FP="$(xkit_fp)" python3 - "$1" "$2" <<'PY'
+import json, sys, os
 from urllib.parse import urlparse, parse_qs, unquote
+_fp = os.environ.get("XKIT_FP", "chrome") or "chrome"
 u = urlparse(sys.argv[1]); q = {k: v[0] for k, v in parse_qs(u.query).items()}
 if u.scheme == "hysteria2":
-    tls = {"serverName": q.get("sni", ""), "alpn": ["h3"], "fingerprint": q.get("fp", "chrome")}
+    tls = {"serverName": q.get("sni", ""), "alpn": ["h3"], "fingerprint": q.get("fp", _fp)}
     pin = q.get("pinSHA256", "")
     if pin: tls["pinnedPeerCertSha256"] = pin
     if q.get("insecure") == "1": tls["allowInsecure"] = True
@@ -3650,7 +3720,7 @@ if u.scheme != "vless" or q.get("security") != "reality":
 net = q.get("type", "tcp")
 if net == "splithttp": net = "xhttp"
 st = {"network": net, "security": "reality", "realitySettings": {
-    "serverName": q.get("sni", ""), "fingerprint": q.get("fp", "chrome"), "publicKey": q.get("pbk", ""),
+    "serverName": q.get("sni", ""), "fingerprint": q.get("fp", _fp), "publicKey": q.get("pbk", ""),
     "shortId": q.get("sid", ""), "spiderX": unquote(q.get("spx", "/"))}}
 if net == "xhttp":
     st["xhttpSettings"] = {"path": unquote(q.get("path", "/")), "mode": q.get("mode", "auto")}
@@ -5510,11 +5580,11 @@ reality_create_inbound() {
   local settings stream ib so
   so='{}'; sockopt_enabled && so="$(sockopt_obj)"   # v7.4.3: TFO+TCP_NODELAY (xkit sockopt off — отключить)
   settings='{"clients":[],"decryption":"none","fallbacks":[]}' 
-  stream="$(jq -nc --arg dest "$dest" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" --argjson so "$so" '
+  stream="$(jq -nc --arg dest "$dest" --arg sni "$sni" --arg priv "$priv" --arg sid "$sid" --arg pub "$pub" --arg fp "$(xkit_fp)" --argjson so "$so" '
     {network:"tcp", security:"reality",
      realitySettings:{show:false, xver:0, dest:$dest, serverNames:[$sni],
                       privateKey:$priv, minClient:"", maxClient:"", maxTimeDiff:0,
-                      shortIds:[$sid], settings:{publicKey:$pub, fingerprint:"chrome", serverName:""}}}
+                      shortIds:[$sid], settings:{publicKey:$pub, fingerprint:$fp, serverName:""}}}
     + (if (($so|length) > 0) then {sockopt:$so} else {} end)')"
   ib="$(jq -nc --arg port "$p" --arg tag "inbound-${p}" --arg remark "reality-${sni}" \
         --arg s "$settings" --arg st "$stream" '
@@ -6057,6 +6127,9 @@ strategy = sys.argv[4] if sys.argv[4] in ("roundRobin", "random", "leastPing", "
 # заворачивать в балансир ВСЕ клиентские входы, а не только pool-демо-вход —
 # иначе не-RU трафик клиентов уходил в catch-all direct (выход с РФ-мастера).
 client_tags = [t for t in (sys.argv[5] or "").split(",") if t.strip()]
+# v9.3.0: TLS-отпечаток (uTLS) туннелей мастер->нода — из XKIT_FP (один источник
+# со ссылками клиентов). Дефолт chrome. Сервер reality fp не проверяет строго.
+fp = os.environ.get("XKIT_FP", "chrome") or "chrome"
 
 outb = tpl.get("outbounds") or []
 outb = [o for o in outb if not str(o.get("tag", "")).startswith("node-")]
@@ -6090,7 +6163,7 @@ for n in nodes:
             # Спрятан за сайтом; REALITY-ключи не нужны. flow пустой (WS не Vision).
             stream = {"network": "ws", "security": "tls",
                       "tlsSettings": {"serverName": t.get("sni") or n.get("host"),
-                                      "fingerprint": "chrome", "alpn": ["http/1.1"]},
+                                      "fingerprint": fp, "alpn": ["http/1.1"]},
                       "wsSettings": {"path": t.get("ws_path", t.get("path", "/")), "headers": {}}}
             generated.append({
                 "tag": tag, "protocol": "vless",
@@ -6101,7 +6174,7 @@ for n in nodes:
         else:
             stream = {"network": net, "security": "reality",
                       "realitySettings": {"serverName": t.get("sni", ""),
-                                          "fingerprint": "chrome", "publicKey": t.get("pbk", ""),
+                                          "fingerprint": fp, "publicKey": t.get("pbk", ""),
                                           "shortId": t.get("sid", ""), "spiderX": ""}}
             if net in ("xhttp", "splithttp"):
                 stream["xhttpSettings"] = {"path": t.get("path", "/"), "mode": "auto"}
@@ -6301,7 +6374,7 @@ nodes_apply_template() {
   local _bal_strategy
   _bal_strategy="$(jq -r --arg t "${XKIT_POOL_TAG:-XKIT_POOL}" '.routing.balancers[]? | select(.tag==$t) | .strategy.type // empty' <<<"$cur" 2>/dev/null | head -n1)"
   case "$_bal_strategy" in roundRobin|random|leastPing|leastLoad) ;; *) _bal_strategy="${XKIT_BAL_STRATEGY:-leastLoad}" ;; esac
-  merged="$(nodes_merge_template "$cur" "$nodes_file" "${XKIT_POOL_TAG:-}" "$_bal_strategy" "$client_tags")" || mrc=$?
+  merged="$(XKIT_FP="$(xkit_fp)" nodes_merge_template "$cur" "$nodes_file" "${XKIT_POOL_TAG:-}" "$_bal_strategy" "$client_tags")" || mrc=$?
   rm -f "$nodes_file"
   [ "$mrc" -eq 0 ] || { err "Не удалось собрать шаблон xray"; return 1; }
   master_xray_template_set "$merged"
@@ -6862,10 +6935,10 @@ EOS
     {clients:[{id:$id, flow:"xtls-rprx-vision", email:("tunnel-"+$sn), limitIp:0, totalGB:0,
                expiryTime:0, enable:true, tgId:"", subId:$sub, reset:0}],
      decryption:"none", fallbacks:[]}')"
-  nstream="$(jq -nc --arg dest "$ndest" --arg sni "$nsni" --arg priv "$priv" --arg sid "$tsid" --arg pub "$pub" '
+  nstream="$(jq -nc --arg dest "$ndest" --arg sni "$nsni" --arg priv "$priv" --arg sid "$tsid" --arg pub "$pub" --arg fp "$(xkit_fp)" '
     {network:"tcp", security:"reality",
      realitySettings:{show:false, xver:0, dest:$dest, serverNames:[$sni], privateKey:$priv,
-                      shortIds:[$sid], settings:{publicKey:$pub, fingerprint:"chrome", serverName:""}}}')"
+                      shortIds:[$sid], settings:{publicKey:$pub, fingerprint:$fp, serverName:""}}}')"
   nib="$(jq -nc --arg port "$tport" --arg tag "inbound-${tport}" --arg remark "xkit-tunnel-${nname}" \
         --arg s "$nsettings" --arg st "$nstream" '
     {up:0, down:0, total:0, remark:$remark, enable:true, expiryTime:0, listen:"",
@@ -9376,7 +9449,8 @@ xkit_menu_json() {
         {title:"Выключить / включить протокол", desc:"Инбаунд остаётся в панели, уходит из подписок (как ползунок)", args:["protocols","toggle"], mode:"exec"},
         {title:"Удалить протокол", desc:"Удалить выбранный inbound + обновить nginx/подписки (с подтверждением)", args:["protocols","remove"], mode:"exec"},
         {title:"REALITY: ключи и ссылки", desc:"Показать параметры существующего inbound", args:[], fn:"reality_show_keys", mode:"fn"},
-        {title:"REALITY: найти сайты-прикрытия рядом", desc:"Тихий скан подсети: TLS/ALPN/задержка, выбор dest", args:["reality","scan"], mode:"exec"}
+        {title:"REALITY: найти сайты-прикрытия рядом", desc:"Тихий скан подсети: TLS/ALPN/задержка, выбор dest", args:["reality","scan"], mode:"exec"},
+        {title:"Отпечаток браузера (TLS fingerprint)", desc:"Маскировка uTLS: chrome/firefox/safari/random; смена для всех протоколов", args:["fp","set"], mode:"exec"}
       ]},
       {id:"nodes", title:"Дополнительные серверы", items:[
         {title:"Добавить сервер и распределить нагрузку", desc:"Установка, туннель и проверка подключения", args:["nodes"], mode:"exec"},
@@ -9476,6 +9550,10 @@ XKIT v${XKIT_VERSION} — nginx(TLS 443) + 3X-UI одним шагом, меню
   xkit sockopt [on|off|status] — TCP Fast Open + TCP_NODELAY на TCP-инбаундах
                          (on — sysctl net.ipv4.tcp_fastopen=3 + sockopt всем
                          vless/vmess/trojan; off — снять наш sockopt)
+  xkit fp [show|set <имя>] — TLS-отпечаток браузера (uTLS) для маскировки:
+                         chrome (дефолт) firefox safari ios android edge random
+                         randomized randomizednoalpn; set меняет для ВСЕХ протоколов
+                         и пересобирает подписки/туннели нод
   xkit nodes            — меню нод (добавить/список/health/стратегия/удалить)
   xkit nodes repair     — переприменить конфигурацию нод (после сбоя apply)
   xkit nodes repin [имя|all] — перепинить сертификат панели ноды (MITM-защита)
@@ -9606,6 +9684,7 @@ xkit_main_impl() {
                *) reality_wizard ;;
              esac ;;
     sockopt) shift; sockopt_cmd "${1:-status}" ;;
+    fp)      shift; require_root; fp_cmd "${1:-show}" ;;
     nodes)   shift; require_root
              case "${1:-menu}" in
                list) nodes_list ;;
@@ -9854,7 +9933,7 @@ clash_proxy_entry() { # $1 inbound JSON, $2 client JSON, $3 email
       [ -n "$flow" ] && body+="    flow: $(clash_q "$flow")"$'\n'
       [ "$tls_sec" != "none" ] && body+="    tls: true"$'\n'
       [ -n "$sni" ] && body+="    servername: $(clash_q "$sni")"$'\n'
-      body+="    client-fingerprint: chrome"$'\n'
+      body+="    client-fingerprint: $(xkit_fp)"$'\n'
       case "$net" in
         ws)    body+="    network: ws"$'\n'
                [ -n "$path" ] && body+="    ws-opts:"$'\n'"      path: $(clash_q "$path")"$'\n' ;;
@@ -11861,9 +11940,10 @@ server_reboot() { # $1: --yes (для бота, confirm уже пройден к
 #=========================== XKIT 7: SING-BOX И SUBSCRIPTION UX ===============
 
 singbox_json_gen() { # $1 base64 links file, $2 output JSON; unsupported links skipped
-  python3 - "$1" "$2" <<'PY'
-import base64,json,sys
+  XKIT_FP="$(xkit_fp)" python3 - "$1" "$2" <<'PY'
+import base64,json,sys,os
 from urllib.parse import urlparse,parse_qs,unquote
+_fp=os.environ.get('XKIT_FP','chrome') or 'chrome'
 src,dst=sys.argv[1:3]
 raw=open(src,'rb').read()
 try: text=base64.b64decode(raw,validate=True).decode()
@@ -11884,7 +11964,7 @@ for line in text.splitlines():
             sec=q.get('security','none'); typ=q.get('type','tcp')
             if typ=='splithttp': typ='xhttp'
             tls={'enabled':sec in ('tls','reality'),'server_name':q.get('sni',u.hostname),
-                 'utls':{'enabled':True,'fingerprint':q.get('fp','chrome')}}
+                 'utls':{'enabled':True,'fingerprint':q.get('fp',_fp)}}
             if q.get('insecure')=='1' or q.get('allowInsecure')=='1': tls['insecure']=True
             if sec=='reality': tls['reality']={'enabled':True,'public_key':q.get('pbk',''),'short_id':q.get('sid','')}
             if tls['enabled']: o['tls']=tls
@@ -11900,7 +11980,7 @@ for line in text.splitlines():
             if q.get('obfs')=='salamander': o['obfs']={'type':'salamander','password':q.get('obfs-password','')}
         elif u.scheme=='trojan':
             o={'type':'trojan','tag':name,'server':u.hostname,'server_port':u.port,'password':unquote(u.username or ''),
-               'tls':{'enabled':True,'server_name':q.get('sni',u.hostname),'utls':{'enabled':True,'fingerprint':'chrome'}}}
+               'tls':{'enabled':True,'server_name':q.get('sni',u.hostname),'utls':{'enabled':True,'fingerprint':q.get('fp',_fp)}}}
         elif u.scheme=='ss':
             # ss://base64(method:password)@host:port и ss://method:password@host:port
             userinfo=unquote(u.username or '')
@@ -12467,8 +12547,8 @@ node_profile_inbound_vless() { # rec profile port private-key -> JSON
   settings="$(jq -nc --arg id "$(jq -r '.tunnel.uuid' <<<"$rec")" --arg n "$(jq -r '.name' <<<"$rec")" --arg f "$flow" --arg s "$(rand_hex 3)" \
     '{clients:[{id:$id,flow:$f,email:("tunnel-"+$n+"-"+$s),enable:true,limitIp:0,totalGB:0,expiryTime:0,reset:0}],decryption:"none",fallbacks:[]}')"
   stream="$(jq -nc --arg net "$net" --arg dest "$(jq -r '.tunnel.dest' <<<"$rec")" --arg sni "$(jq -r '.tunnel.sni' <<<"$rec")" \
-    --arg priv "$priv" --arg sid "$(jq -r '.tunnel.sid' <<<"$rec")" --arg pub "$(jq -r '.tunnel.pbk' <<<"$rec")" --arg path "$path" \
-    '{network:$net,security:"reality",realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$priv,shortIds:[$sid],settings:{publicKey:$pub,fingerprint:"chrome",serverName:""}}} + (if $net=="xhttp" then {xhttpSettings:{path:$path,mode:"auto"}} else {} end)')"
+    --arg priv "$priv" --arg sid "$(jq -r '.tunnel.sid' <<<"$rec")" --arg pub "$(jq -r '.tunnel.pbk' <<<"$rec")" --arg path "$path" --arg fp "$(xkit_fp)" \
+    '{network:$net,security:"reality",realitySettings:{show:false,xver:0,dest:$dest,serverNames:[$sni],privateKey:$priv,shortIds:[$sid],settings:{publicKey:$pub,fingerprint:$fp,serverName:""}}} + (if $net=="xhttp" then {xhttpSettings:{path:$path,mode:"auto"}} else {} end)')"
   jq -nc --argjson port "$port" --arg remark "xkit-tunnel-$(jq -r '.name' <<<"$rec")" --arg s "$settings" --arg st "$stream" \
     '{up:0,down:0,total:0,remark:$remark,enable:true,expiryTime:0,listen:"",port:$port,protocol:"vless",settings:$s,streamSettings:$st,sniffing:"{\"enabled\":false}",allocate:"{\"strategy\":\"always\",\"refresh\":5,\"concurrency\":-1}",tag:("inbound-"+($port|tostring))}'
 }
@@ -15260,7 +15340,7 @@ proto_ws_create() { # клиентский VLESS WS TLS за nginx (443)
   else
     local fresh; fresh="$(api_get_inbound "$ibid" 2>/dev/null)" || true
     if [ -n "$fresh" ]; then
-      fresh="$(jq -c --arg d "$XKIT_HOST" '.externalProxy = [{"dest":$d,"port":443,"forceTls":"tls","fingerprint":"chrome","alpn":["http/1.1"],"remark":"xkit"}]' <<<"$fresh")"
+      fresh="$(jq -c --arg d "$XKIT_HOST" --arg fp "$(xkit_fp)" '.externalProxy = [{"dest":$d,"port":443,"forceTls":"tls","fingerprint":$fp,"alpn":["http/1.1"],"remark":"xkit"}]' <<<"$fresh")"
       api_update_inbound "$ibid" "$fresh" >/dev/null 2>&1 || true
     fi
   fi
