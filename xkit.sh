@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.3.2"
+XKIT_VERSION="9.3.3"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -12163,7 +12163,7 @@ sub_qr_awg_gif() { # $1 subId, $2 каталог -> путь к GIF (или PNG 
   link="$(link_for_client "$ib" "$cl")"; [ -n "$link" ] || return 1
   _qr_ensure_tool || return 1
   AWG_QR_LINK="$link" AWG_QR_DIR="$dir" AWG_QR_SUB="$sub" python3 - <<'AWGQR'
-import base64,configparser,io,json,os,struct,subprocess,sys,zlib
+import base64,configparser,io,json,os,shutil,struct,subprocess,sys,zlib
 link=os.environ['AWG_QR_LINK']; d=os.environ['AWG_QR_DIR']; sub=os.environ['AWG_QR_SUB']
 try: conf=base64.b64decode(link[6:],validate=True).decode()
 except Exception: sys.exit(1)
@@ -12209,11 +12209,18 @@ frames=[png(x) for x in payloads]
 if len(frames)==1:
  out=os.path.join(d,f'qr-{sub}-awg.png')
  open(out,'wb').write(frames[0]); os.chmod(out,0o600); print(out); sys.exit(0)
+# v9.3.3: надёжный Pillow — apt python3-pil приоритетнее pip (PEP668/нет pip ломали GIF).
 try:
  from PIL import Image
 except ImportError:
- subprocess.run([sys.executable,'-m','pip','install','--quiet','--break-system-packages','Pillow'],capture_output=True)
- from PIL import Image
+ # сначала apt (системный пакет, не ломается о PEP668), потом pip fallback
+ if shutil.which('apt-get'):
+  subprocess.run(['apt-get','-o','DPkg::Lock::Timeout=300','install','-y','-qq','python3-pil'],capture_output=True)
+ try:
+  from PIL import Image
+ except ImportError:
+  subprocess.run([sys.executable,'-m','pip','install','--quiet','--break-system-packages','Pillow'],capture_output=True)
+  from PIL import Image
 imgs=[]
 for b in frames:
  im=Image.open(io.BytesIO(b)).convert('L').point(lambda x:0 if x<128 else 255,'1')
@@ -15145,12 +15152,12 @@ tg_bot_handle_callback() { # $1 callback-json
     s:fp) tg_bot_fp_menu "$cid" ;;
     fp:*) tg_bot_set_fp "$cid" "${data#fp:}" ;;
     s:sub) tg_bot_run_long "$cid" "sub" "${XKIT_BIN} sub -q" "пересборка подписок" ;;
-    ptg:*) local _rest="${data#ptg:}" _pid="${_rest%%:*}" _pen="${_rest#*:}"; tg_bot_confirm "$cid" "ptg:${_pid}:${_pen}" "Переключить протокол #${_pid} -> $([ "$_pen" = true ] && echo ВКЛ || echo ВЫКЛ)" ;;
-    uen:*) local _rest="${data#uen:}" _ue="${_rest%:*}" _uen="${_rest##*:}"; tg_bot_confirm "$cid" "uen:${_ue}:${_uen}" "Переключить пользователя ${_ue} -> $([ "$_uen" = true ] && echo ВКЛ || echo ВЫКЛ)" ;;
+    ptg:*) local _rest _pid _pen; _rest="${data#ptg:}"; _pid="${_rest%%:*}"; _pen="${_rest#*:}"; tg_bot_confirm "$cid" "ptg:${_pid}:${_pen}" "Переключить протокол #${_pid} -> $([ "$_pen" = true ] && echo ВКЛ || echo ВЫКЛ)" ;;
+    uen:*) local _rest _ue _uen; _rest="${data#uen:}"; _ue="${_rest%:*}"; _uen="${_rest##*:}"; tg_bot_confirm "$cid" "uen:${_ue}:${_uen}" "Переключить пользователя ${_ue} -> $([ "$_uen" = true ] && echo ВКЛ || echo ВЫКЛ)" ;;
     s:restart) tg_bot_confirm "$cid" "restart" "Перезапустить 3X-UI/Xray/nginx (соединения кратковременно оборвутся)" ;;
     s:reboot) tg_bot_confirm "$cid" "reboot" "Перезагрузить сервер ЦЕЛИКОМ (доступ пропадёт на 1-3 минуты)" ;;
     sv:*) tg_bot_run_long "$cid" "survey-${data#sv:}" "${XKIT_BIN} nodes profile survey ${data#sv:}" "survey ${data#sv:}" ;;
-    sw:*) local _n="${data#sw:}" _prof="${_n#*:}" _node="${_n%%:*}"; tg_bot_confirm "$cid" "switch:${_node}:${_prof}" "Сменить транспорт ${_node} -> ${_prof}" ;;
+    sw:*) local _n _prof _node; _n="${data#sw:}"; _prof="${_n#*:}"; _node="${_n%%:*}"; tg_bot_confirm "$cid" "switch:${_node}:${_prof}" "Сменить транспорт ${_node} -> ${_prof}" ;;
     cd:*) tg_bot_run_long "$cid" "cert-${data#cd:}" "${XKIT_BIN} nodes cert ${data#cd:} domain" "cert domain ${data#cd:}" ;;
     ci:*) tg_bot_run_long "$cid" "cert-${data#ci:}" "${XKIT_BIN} nodes cert ${data#ci:} ip" "cert ip ${data#ci:}" ;;
     cs:*) tg_bot_run_long "$cid" "cert-${data#cs:}" "${XKIT_BIN} nodes cert ${data#cs:} self" "cert self ${data#cs:}" ;;
@@ -15172,7 +15179,7 @@ tg_bot_do_confirm() { # $1 chat, $2 action-key
     camo:*) tg_bot_run_long "$chat" "camo-${key#camo:}" "${XKIT_BIN} nodes camo ${key#camo:}" "camo ${key#camo:}" ;;
     hide:*) tg_bot_run_long "$chat" "hide-${key#hide:}" "${XKIT_BIN} nodes hide ${key#hide:}" "hide ${key#hide:}" ;;
     upgrade:*) tg_bot_run_long "$chat" "upgrade-${key#upgrade:}" "${XKIT_BIN} nodes upgrade ${key#upgrade:}" "upgrade ${key#upgrade:}" ;;
-    switch:*) local _rest="${key#switch:}" _node="${_rest%%:*}" _prof="${_rest#*:}"; tg_bot_run_long "$chat" "switch-${_node}" "${XKIT_BIN} nodes profile switch ${_node} ${_prof}" "switch ${_node} -> ${_prof}" ;;
+    switch:*) local _rest _node _prof; _rest="${key#switch:}"; _node="${_rest%%:*}"; _prof="${_rest#*:}"; tg_bot_run_long "$chat" "switch-${_node}" "${XKIT_BIN} nodes profile switch ${_node} ${_prof}" "switch ${_node} -> ${_prof}" ;;
     ufw:*) tg_bot_run_long "$chat" "ufw-${key#ufw:}" "${XKIT_BIN} nodes ufw ${key#ufw:} on" "ufw on ${key#ufw:}" ;;
     backup) tg_bot_run_long "$chat" "backup" "${XKIT_BIN} backup now" "бэкап" ;;
     restart) tg_bot_run_long "$chat" "restart" "${XKIT_BIN} services restart --yes" "перезапуск стека (чек придёт отдельно)" ;;
@@ -15210,36 +15217,41 @@ tg_bot_user_sub() { # $1 chat, $2 email
   else
     kb="$(tg_bot_main_menu)"
   fi
-  # v9.1.6 (D1): каждая ссылка — ОТДЕЛЬНОЕ сообщение, содержащее ТОЛЬКО URL
-  # (без подписи). Telegram на мобильном «Копировать» копирует ВСЁ сообщение;
-  # если в сообщении подпись+URL — копируется и подпись. Сообщение = только URL
-  # -> тап-копирование даёт чистую ссылку. Подписи — в заголовке выше.
-  tg_bot_reply_html "$1" "🔗 Подписка $(tg_html_escape "$2") — ниже ссылки, каждая отдельным сообщением (копируется чистый URL):" "$kb"
+  # v9.3.3: ОДНО HTML-сообщение вместо кучи отдельных. Каждая ссылка в своём
+  # <pre> блоке — Telegram даёт кнопку «копировать» на каждый <pre> отдельно
+  # (чистый URL, не всё сообщение). Компактный красивый вывод как отчёт.
+  local nl=$'\n'
+  local msg="🔗 <b>Подписка $(tg_html_escape "$2")</b>"
   if [ -n "${XKIT_PANEL_SUB_PATH:-}" ] && [ -n "${XKIT_PANEL_SUB_PORT:-}" ]; then
-    tg_bot_reply_html "$1" "🌐 Страница подписки (браузер: QR, ссылки, импорт):"
-    tg_bot_reply_html "$1" "<pre>https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}${subid}</pre>"
+    msg+="${nl}🌐 <b>Страница подписки</b> (браузер: QR, ссылки, импорт):${nl}<pre>https://${XKIT_HOST}${XKIT_PANEL_SUB_PATH}${subid}</pre>"
   fi
-  tg_bot_reply_html "$1" "📲 Прямой импорт в приложение:"
-  tg_bot_reply_html "$1" "<pre>https://${XKIT_HOST}${sp}${subid}</pre>"
-  tg_bot_reply_html "$1" "Clash:"
-  tg_bot_reply_html "$1" "<pre>https://${XKIT_HOST}${sp}${subid}.yaml</pre>"
-  tg_bot_reply_html "$1" "sing-box:"
-  tg_bot_reply_html "$1" "<pre>https://${XKIT_HOST}${sp}${subid}.json</pre>"
+  msg+="${nl}${nl}📲 <b>Прямой импорт</b> в приложение:${nl}<pre>https://${XKIT_HOST}${sp}${subid}</pre>"
+  msg+="${nl}${nl}⚔️ <b>Clash</b> (Mihomo/Clash Verge/FlClash):${nl}<pre>https://${XKIT_HOST}${sp}${subid}.yaml</pre>"
+  msg+="${nl}${nl}📦 <b>sing-box</b>:${nl}<pre>https://${XKIT_HOST}${sp}${subid}.json</pre>"
+  msg+="${nl}${nl}💡 Каждая ссылка копируется кнопкой на блоке (чистый URL)."
+  tg_bot_reply_html "$1" "$msg" "$kb"
 }
 
 tg_bot_user_awg_qr() { # $1 chat, $2 email — GIF из QR-фрагментов Amnezia (или PNG)
   load_xkit_env >/dev/null 2>&1 || true
   kit_session >/dev/null 2>&1 || { tg_bot_reply "$1" "Нет сессии панели"; return; }
-  local subid f method
+  local subid f method err
   subid="$(jq -r --arg email "$2" '[.[].settings|if type=="string" then fromjson? else . end|.clients[]?|select(.email==$email)|.subId // empty][0] // empty' <<<"${INBOUNDS:-[]}" 2>/dev/null)"
   [ -n "$subid" ] || { tg_bot_reply "$1" "Подписка не найдена"; return; }
   tg_bot_reply "$1" "Генерирую QR Amnezia..." >/dev/null 2>&1 || true
-  f="$(sub_qr_awg_gif "$subid" "$XKIT_DIR" 2>/dev/null)" || f=""
+  # v9.3.3: ловим stderr для диагностики (раньше молча падало — «не работало»)
+  err="$(mktemp /tmp/.xkit-awgqr-err.XXXXXX)"
+  f="$(sub_qr_awg_gif "$subid" "$XKIT_DIR" 2>"$err")" || f=""
   if [ -z "$f" ]; then
-    tg_bot_reply_html "$1" "Не удалось собрать QR Amnezia. Запасной путь — страница:
+    local why; why="$(tail -c 300 "$err" 2>/dev/null)"
+    rm -f "$err"
+    tg_bot_reply_html "$1" "⚠️ Не удалось собрать QR Amnezia.
+Причина: <pre>$(tg_html_escape "${why:-неизвестно (проверьте qrencode/python3-pil)}")</pre>
+Запасной путь — страница с QR и конфигом:
 <pre>https://${XKIT_HOST}$(sub_path)${subid}/amnezia</pre>" "$(tg_bot_main_menu)"
     return
   fi
+  rm -f "$err"
   case "$f" in *.gif) method=sendAnimation ;; *) method=sendPhoto ;; esac
   if tg_api_file "$method" "$1" "$f" "📱 AmneziaWG ${2}: сканируйте через AmneziaVPN до завершения импорта" >/dev/null 2>&1; then
     tg_bot_reply_html "$1" "Если анимация не читается — страница с QR и конфигом:

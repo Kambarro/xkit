@@ -26,7 +26,7 @@ XKIT_BASE="${XKIT_BASE:-https://raw.githubusercontent.com/kambarro/xkit/main}"
 
 # (K-02, аудит №2) pin-хэши релиза: подставляются при сборке. Placeholder =
 # dev-режим — тогда сумма берётся из xkit.sh.sha256; нет ни того ни другого — отказ
-XKIT_PIN_SHA256="3d5de70822c718327971ff7babc996deec981281dd3d85d7f15142c5ac0b9637"
+XKIT_PIN_SHA256="2c363462503e4673a81c41c4a3c1c9a8a9d8478f41c140614cb9e6aa46fed804"
 XKIT_PIN_MENU_SHA256="e0bdef1d3af2cdd66004447f44da99015ecc82db849c98fc0e9f3242e1f3615b"
 XKIT_PIN_PROTOCOLS_SHA256="7272a2b4a2a360607a5fa95dc8cf8199d24e2d8d73f91f7aa2c78497a0cd280f"
 XKIT_PIN_TUI_AMD64_SHA256="62fe5c448449410b86210027ba2ae3c50bdbae2d4bce28e93029fec005cb782f"
@@ -41,7 +41,7 @@ XKIT_PIN_IPREGION_SHA256="14d0ced7771aba1e721054fec3dfbfcb0a8455158e0b7966125345
 # Ротация ключа: в переходный релиз вшиваем СТАРЫЙ ключ во вторую переменную,
 # в следующем — убираем (см. §14 CHANGES.md).
 XKIT_SIGN_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIONDF2O6OM2hoByRNYEV43lEc0RFyO2mlUMQruOPRVgn"
-XKIT_SIGN_PUBKEY_PREV="@@XKIT_SIGN_PUBKEY_PREV@@"
+XKIT_SIGN_PUBKEY_PREV="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMpowu79lG2coUAsh2a2lkWI2llOw511RFF3UzWFsxwz"
 
 # проверка подписанного SHA256SUMS: 0 = ок; 1 = подписи/ключа нет (фолбэк на пины); 2 = БИТАЯ
 sig_verify_dir() { # $1 каталог с SHA256SUMS(+.sig) и файлами
