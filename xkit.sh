@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.3.3"
+XKIT_VERSION="9.3.4"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -15118,7 +15118,10 @@ tg_bot_handle_callback() { # $1 callback-json
     m:service) tg_bot_service_menu "$cid" ;;
     m:testing) tg_bot_testing_menu "$cid" ;;
     m:transport) tg_bot_reply "$cid" "$(printf '🔀 TG транспорты (статусы обновляются при проверке):\n%s' "$(tg_transports_load | jq -r '.[]|"\(.type) \(.node//.url) — \(.status)"')")" "$(tg_bot_main_menu)" ;;
-    u:add) tg_bot_reply "$cid" "Создать: /adduser <email> [дней] [ГБ]" ;;
+    u:add) tg_bot_adduser_start "$cid" ;;
+    au:days:*) local _rest _d; _rest="${data#au:days:}"; _d="${_rest##*:}"; tg_bot_adduser_days "$cid" "$_d" ;;
+    au:gb:*) local _rest _g; _rest="${data#au:gb:}"; _g="${_rest##*:}"; tg_bot_adduser_gb "$cid" "$_g" ;;
+    au:cancel) tg_bot_state_del "adduser:$cid"; tg_bot_reply "$cid" "Создание отменено." "$(tg_bot_main_menu)" ;;
     u:*) tg_bot_user_card "$cid" "${data#u:}" ;;
     n:*) tg_bot_node_card "$cid" "${data#n:}" ;;
     sub:*) tg_bot_user_sub "$cid" "${data#sub:}" ;;
@@ -15302,6 +15305,69 @@ tg_bot_strategy_menu() { # $1 chat
   tg_bot_reply "$1" "⚖️ Стратегия балансировки (текущая: ${XKIT_BAL_STRATEGY:-leastLoad}):" "$kb"
 }
 
+# --- пошаговый мастер создания пользователя (v9.3.4, для не-технарей) ---
+# УРОК XKIT: бот НЕ должен требовать точную команду «/adduser email days gb».
+# Пошаговый диалог: кнопка «Создать» → email → дни (кнопки) → ГБ (кнопки) → результат.
+# Ошибки client_add_all НЕ глушатся — показываются пользователю.
+tg_bot_adduser_start() { # $1 chat
+  tg_bot_state_set "adduser:$1" "$(jq -nc --arg c "$1" '{chat:$c,step:"email"}')"
+  tg_bot_reply "$1" "👤 Создание пользователя.
+
+Шаг 1/3: введите имя (email) пользователя, например ivan@mail.ru
+(только латиница, цифры и . _ @ + -)" "$(jq -nc '[[{text:"❌ Отмена",callback_data:"au:cancel"}]]' | _tg_kb)"
+}
+
+tg_bot_adduser_email() { # $1 chat, $2 email-text — шаг 1: приняли email, спрашиваем дни
+  local email; email="$(input_clean_ascii "$2")"
+  if ! [[ "$email" =~ ^[A-Za-z0-9._@+-]{1,64}$ ]]; then
+    tg_bot_reply "$1" "⚠️ Имя содержит недопустимые символы. Только латиница, цифры и . _ @ + -
+Введите ещё раз (например ivan@mail.ru):" "$(jq -nc '[[{text:"❌ Отмена",callback_data:"au:cancel"}]]' | _tg_kb)"
+    return
+  fi
+  tg_bot_state_set "adduser:$1" "$(jq -nc --arg c "$1" --arg e "$email" '{chat:$c,step:"days",email:$e}')"
+  tg_bot_reply "$1" "👤 $email
+
+Шаг 2/3: срок действия (дней):" "$(jq -nc '[[{text:"30 дней",callback_data:"au:days:30"},{text:"90 дней",callback_data:"au:days:90"}],[{text:"365 дней",callback_data:"au:days:365"},{text:"♾ Бессрочно",callback_data:"au:days:0"}],[{text:"❌ Отмена",callback_data:"au:cancel"}]]' | _tg_kb)"
+}
+
+tg_bot_adduser_days() { # $1 chat, $2 days — шаг 2: приняли дни, спрашиваем ГБ
+  local st email days
+  st="$(tg_bot_state_get "adduser:$1")"
+  email="$(jq -r '.email // empty' <<<"$st")"
+  [ -n "$email" ] || { tg_bot_adduser_start "$1"; return; }
+  days="$2"; [[ "$days" =~ ^[0-9]+$ ]] || days=0
+  tg_bot_state_set "adduser:$1" "$(jq -nc --arg c "$1" --arg e "$email" --arg d "$days" '{chat:$c,step:"gb",email:$e,days:($d|tonumber)}')"
+  local dlabel="$days дней"; [ "$days" = 0 ] && dlabel="бессрочно"
+  tg_bot_reply "$1" "👤 $email · $dlabel
+
+Шаг 3/3: лимит трафика (ГБ):" "$(jq -nc '[[{text:"50 ГБ",callback_data:"au:gb:50"},{text:"100 ГБ",callback_data:"au:gb:100"}],[{text:"200 ГБ",callback_data:"au:gb:200"},{text:"♾ Безлимит",callback_data:"au:gb:0"}],[{text:"❌ Отмена",callback_data:"au:cancel"}]]' | _tg_kb)"
+}
+
+tg_bot_adduser_gb() { # $1 chat, $2 gb — шаг 3: создаём пользователя, показываем результат
+  local st email days gb out rc
+  st="$(tg_bot_state_get "adduser:$1")"
+  email="$(jq -r '.email // empty' <<<"$st")"
+  days="$(jq -r '.days // 0' <<<"$st")"
+  [ -n "$email" ] || { tg_bot_adduser_start "$1"; return; }
+  gb="$2"; [[ "$gb" =~ ^[0-9]+$ ]] || gb=0
+  tg_bot_state_del "adduser:$1"
+  tg_bot_reply "$1" "⏳ Создаю $email…" >/dev/null 2>&1 || true
+  # client_add_all: аргументы email GB days (порядок важен! $2=GB $3=days).
+  # УРОК: НЕ глушим вывод — ловим ошибку и показываем пользователю.
+  out="$(client_add_all "$email" "$gb" "$days" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    tg_bot_reply_html "$1" "⚠️ Не удалось создать $email.
+Причина: <pre>$(tg_html_escape "$(tail -c 400 <<<"$out")")</pre>
+Попробуйте снова: кнопка «👥 Пользователи» → «Создать»." "$(tg_bot_main_menu)"
+    return
+  fi
+  local dlabel="$days дней"; [ "$days" = 0 ] && dlabel="бессрочно"
+  local glabel="$gb ГБ"; [ "$gb" = 0 ] && glabel="безлимит"
+  tg_bot_reply_html "$1" "✅ Пользователь <b>$(tg_html_escape "$email")</b> создан.
+Срок: $dlabel · Трафик: $glabel
+Подписка и QR — в карточке пользователя." "$(jq -nc --arg e "$email" '[[{text:"🔗 Подписка",callback_data:("sub:"+$e)}],[{text:"🏠 Меню",callback_data:"m:main"}]]' | _tg_kb)"
+}
+
 # --- обработчик текстовых команд (алиасы) ---
 tg_bot_handle_command() { # $1 message-json
   local msg="$1" cid uid text
@@ -15311,19 +15377,33 @@ tg_bot_handle_command() { # $1 message-json
   telegram_bot_allowed "$uid" || return 0
   telegram_bot_allowed "$cid" || return 0
   audit_event tg.bot "cmd:$text" ok 2>/dev/null || true
+  # v9.3.4: если идёт пошаговый мастер создания (step=email) — текст = email, не команда.
+  local _au_step
+  _au_step="$(tg_bot_state_get "adduser:$cid" | jq -r '.step // empty' 2>/dev/null)"
+  if [ "$_au_step" = email ] && [[ "$text" != /* ]]; then
+    tg_bot_adduser_email "$cid" "$text"
+    return
+  fi
   case "$text" in
     /start|/help|/menu) tg_bot_show_main "$cid" ;;
     /status) tg_bot_status "$cid" ;;
     /users) tg_bot_users_list "$cid" ;;
     /nodes) tg_bot_nodes_list "$cid" ;;
     /expiry) tg_bot_expiry "$cid" ;;
+    /adduser) tg_bot_adduser_start "$cid" ;;
     /adduser\ *)
-      local args email days gb
+      # быстрый путь (для продвинутых): /adduser email [ГБ] [дней] — порядок как client_add_all.
+      local args email days gb out rc
       args="${text#/adduser }"; email="$(awk '{print $1}' <<<"$args")"
-      days="$(awk '{print $2}' <<<"$args")"; gb="$(awk '{print $3}' <<<"$args")"
-      [ -n "$email" ] || { tg_bot_reply "$cid" "Формат: /adduser <email> [дней] [ГБ]"; return; }
-      client_add_all "$email" "${days:-0}" "${gb:-0}" >/dev/null 2>&1
-      tg_bot_reply "$cid" "Пользователь $email создан." "$(tg_bot_main_menu)" ;;
+      gb="$(awk '{print $2}' <<<"$args")"; days="$(awk '{print $3}' <<<"$args")"
+      [ -n "$email" ] || { tg_bot_adduser_start "$cid"; return; }
+      out="$(client_add_all "$email" "${gb:-0}" "${days:-0}" 2>&1)"; rc=$?
+      if [ "$rc" -ne 0 ]; then
+        tg_bot_reply_html "$cid" "⚠️ Не удалось создать $email.
+Причина: <pre>$(tg_html_escape "$(tail -c 400 <<<"$out")")</pre>" "$(tg_bot_main_menu)"
+      else
+        tg_bot_reply "$cid" "✅ Пользователь $email создан." "$(tg_bot_main_menu)"
+      fi ;;
     /expire\ *)
       local args scope item date
       args="${text#/expire }"
