@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.3.1"
+XKIT_VERSION="9.3.2"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -1043,28 +1043,40 @@ choose_certificate() {
       ok "Найден действующий серт для ${host}: ${found} (бэкап/прошлая установка)"
       echo "0) Использовать найденный серт — БЕЗ перевыпуска (адрес тот же; лимиты LE и клиенты не трогаются)"
     fi
-    echo "1) Let's Encrypt — для ДОМЕНА (90 дней, авто-продление)"
+    echo "1) Let's Encrypt — для ДОМЕНА (90 дней, авто-продление) — РЕКОМЕНДУЕТСЯ"
     echo "2) Свои файлы в /root/cert/$host/ (fullchain.pem + privkey.pem)"
     if certbot_supports_ip; then
       echo "3) Let's Encrypt — для IP (shortlived, 6 дней, авто-продление)"
     else
-      echo "3) Let's Encrypt — для IP (сначала авто-обновление certbot; если не выйдет — пункт 4)"
+      echo "3) Let's Encrypt — для IP (сначала авто-обновление certbot)"
     fi
-    echo "4) Самоподписанный — домен или IP (10 лет, allowInsecure=true)"
-    if ! read_choice "Ваш выбор (${found:+0-}4): " CERT_MODE; then
+    # v9.3.2: self-signed УБРАН для домена — он ломает TLS-подписки (ws-tls/security=tls
+    # клиенты не доверяют самоподписанному серту → подписки не работают, живая диагностика).
+    # Для IP оставляем как последний резерв (LE на IP может быть недоступен).
+    if [ "$kind" != "domain" ]; then
+      echo "4) Самоподписанный — ТОЛЬКО для IP, резерв (10 лет, allowInsecure=true; TLS-подписки НЕ работают)"
+    fi
+    local maxopt=3; [ "$kind" != "domain" ] && maxopt=4
+    if ! read_choice "Ваш выбор (${found:+0-}${maxopt}): " CERT_MODE; then
       echo
       if [ -n "$found" ]; then
         warn "Ввод прерван (EOF) — использую найденный действующий серт (без перевыпуска)"
         CERT_MODE="0"
+      elif [ "$kind" = "domain" ]; then
+        warn "Ввод прерван (EOF) — пробую Let's Encrypt для домена (пункт 1)"
+        CERT_MODE="1"
       else
-        warn "Ввод прерван (EOF) — беру самоподписанный (пункт 4)"
+        warn "Ввод прерван (EOF) — беру самоподписанный резерв (пункт 4, TLS-подписки не работают)"
         CERT_MODE="4"
       fi
     fi
     case "$CERT_MODE" in
       0) [ -n "$found" ] || { warn "Пункт 0 доступен, только когда найден действующий серт"; continue; } ;;
-      1|2|3|4) ;;
-      *) warn "Нет такого пункта — выберите ${found:+0-}4"; continue ;;
+      1|2|3) ;;
+      4) if [ "$kind" = "domain" ]; then
+           err "Самоподписанный сертификат для ДОМЕНА недоступен — он ломает TLS-подписки (ws-tls/security=tls). Выберите 1 (Let's Encrypt) или 2 (свои файлы)"; continue
+         fi ;;
+      *) warn "Нет такого пункта — выберите ${found:+0-}${maxopt}"; continue ;;
     esac
     LE_EMAIL=""
     case "$CERT_MODE" in
@@ -1094,7 +1106,8 @@ choose_certificate() {
          issue_cert_le_ip "$host" "$LE_EMAIL" || { err "Не вышло — выберите другой вариант"; continue; }
          FINAL_CRT="/etc/letsencrypt/live/$host/fullchain.pem"
          FINAL_KEY="/etc/letsencrypt/live/$host/privkey.pem" ;;
-      4) issue_cert_selfsigned "$host" "$kind" || { err "Не вышло — попробуйте снова"; continue; }
+      4) warn "Самоподписанный сертификат (резерв для IP): TLS-подписки (ws-tls/security=tls) работать НЕ будут — клиенты не доверяют серту. Для рабочих подписок используйте Let's Encrypt (пункт 3) или домен"
+         issue_cert_selfsigned "$host" "$kind" || { err "Не вышло — попробуйте снова"; continue; }
          FINAL_CRT="/etc/nginx/ssl/$host/fullchain.pem"
          FINAL_KEY="/etc/nginx/ssl/$host/privkey.pem" ;;
     esac
@@ -12909,18 +12922,22 @@ tgproxy_mtproto_ib() { # target port listen domain secret
 tgproxy_mtproto_install() {
   local target="${1:-}" mode="${2:-direct}" port="${3:-}" domain="${4:-}" public="${5:-}" rec ib secret listen out arr ck="" host link pubhost ibid="" orig="" fwport="" created=0
   [ -n "$target" ] && is_port "${port:-0}" && tgproxy_valid_domain "${domain:-}" || { err "tg-proxy mtproto <master|нода> direct|cascade <port> <fake-domain> [public-port]"; return 1; }
-  [[ "$mode" =~ ^(direct|cascade)$ ]] || return 1
+  [[ "$mode" =~ ^(direct|cascade)$ ]] || { err "Режим должен быть direct или cascade (получено: '${mode}'). Для master — только direct"; return 1; }
   [ "$mode" = direct ] || [ "$target" != master ] || { err "Cascade требует exit-ноду"; return 1; }
   [ "$mode" != cascade ] || is_port "${public:-0}" || { err "Для cascade заранее укажите public-port мастера"; return 1; }
   tgproxy_load | jq -e --arg t "$target" 'all(.[];.type!="mtproto" or .target!=$t)' >/dev/null || { err "MTProto для цели уже управляется XKIT"; return 1; }
-  load_xkit_env || return 1; rec="$(tgproxy_target_rec "$target")"; [ "$target" = master ] || [ -n "$rec" ] || return 1
-  [ "$mode" != cascade ] || orig="$(master_xray_template_get)" || return 1
+  load_xkit_env || { err "Не удалось загрузить окружение XKIT (xkit.env)"; return 1; }
+  rec="$(tgproxy_target_rec "$target")"
+  [ "$target" = master ] || [ -n "$rec" ] || { err "Нода '${target}' не найдена в XKIT. Проверьте имя: xkit nodes list (регистр важен)"; return 1; }
+  [ "$mode" != cascade ] || orig="$(master_xray_template_get)" || { err "Не удалось прочитать Xray-шаблон мастера для cascade"; return 1; }
   secret="$(tgproxy_faketls_secret "$domain")"; listen=""; [ "$mode" = cascade ] && listen=127.0.0.1
   ib="$(tgproxy_mtproto_ib "$target" "$port" "$listen" "$domain" "$secret")"
   if [ "$target" = master ]; then
-    kit_session || return 1; out="$(api_post add "$ib")"
+    kit_session || { err "Не удалось подключиться к API панели мастера (проверьте: systemctl status x-ui)"; return 1; }
+    out="$(api_post add "$ib")"
   else
-    ck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)" || return 1; node_login "$rec" "$ck" || { rm -f "$ck"; return 1; }
+    ck="$(mktemp /tmp/.xkit-node-ck.XXXXXX)" || { err "Не удалось создать временный cookie-файл"; return 1; }
+    node_login "$rec" "$ck" || { rm -f "$ck"; err "Не удалось войти в панель ноды '${target}' (проверьте доступность ноды и логин/пароль)"; return 1; }
     out="$(node_api "$rec" panel/api/inbounds/add POST "$ib" "$ck")"
   fi
   jq -e '.success==true' <<<"$out" >/dev/null || { [ -z "$ck" ] || rm -f "$ck"; err "3X-UI не приняла MTProto FakeTLS — проверьте pinned capability"; return 1; }
@@ -12934,6 +12951,7 @@ tgproxy_mtproto_install() {
   fi
   if [ "$mode" = cascade ] && [ -z "$fwport" ] || [ "$mode" = direct ] && [ -z "$fwport" ]; then
     warn "Не удалось завершить firewall/relay — откатываю MTProto inbound"
+    err "Firewall/relay не настроен (порт ${public}/${port}). Проверьте ufw/nftables и повторите"
     [ -z "$orig" ] || master_xray_template_set "$orig" >/dev/null 2>&1 || true
     tgproxy_mtproto_delete_ib "$target" "$rec" "$port" "$ck" >/dev/null 2>&1 || true
     [ -z "$ck" ] || rm -f "$ck"; return 1
@@ -12941,6 +12959,7 @@ tgproxy_mtproto_install() {
   host="$pubhost"; link="tg://proxy?server=${host}&port=${public}&secret=${secret}"
   arr="$(tgproxy_load | jq -c --arg t mtproto --arg target "$target" --arg mode "$mode" --argjson port "$port" --argjson public "$public" --arg host "$host" --arg secret "$secret" --arg domain "$domain" --arg link "$link" '. + [{type:$t,target:$target,mode:$mode,port:$port,public_port:$public,host:$host,secret:$secret,fake_domain:$domain,link:$link,created:(now|floor)}]')"
   if ! printf '%s' "$arr" | tgproxy_save; then
+    err "Не удалось сохранить telegram-proxies.json (права/диск?) — откатываю MTProto"
     [ -z "$orig" ] || master_xray_template_set "$orig" >/dev/null 2>&1 || true
     tgproxy_mtproto_delete_ib "$target" "$rec" "$port" "$ck" >/dev/null 2>&1 || true
     [ -z "$fwport" ] || { [ "$target" = master ] || [ "$mode" = cascade ]; } && xkit_fw_remove tg-mtproto "$fwport" tcp >/dev/null 2>&1 || true
@@ -12965,8 +12984,8 @@ tgproxy_mtproto_delete_ib() { # target rec port cookie — только XKIT-own
 
 tgproxy_cascade_add() { # public local target-port outbound-tag
   local pub="$1" remote="$2" tag="$3" cur merged
-  cur="$(master_xray_template_get)" || return 1
-  merged="$(printf '%s' "$cur" | python3 -c 'import json,sys; c=json.load(sys.stdin); p=int(sys.argv[1]); r=int(sys.argv[2]); tag=sys.argv[3]; c.setdefault("inbounds",[]).append({"listen":"0.0.0.0","port":p,"protocol":"dokodemo-door","tag":"xkit-tg-mtproto-relay","settings":{"address":"127.0.0.1","port":r,"network":"tcp"}}); c.setdefault("routing",{}).setdefault("rules",[]).insert(0,{"type":"field","inboundTag":["xkit-tg-mtproto-relay"],"outboundTag":tag}); print(json.dumps(c,separators=(",",":")))' "$pub" "$remote" "$tag")" || return 1
+  cur="$(master_xray_template_get)" || { err "cascade: не удалось прочитать Xray-шаблон мастера"; return 1; }
+  merged="$(printf '%s' "$cur" | python3 -c 'import json,sys; c=json.load(sys.stdin); p=int(sys.argv[1]); r=int(sys.argv[2]); tag=sys.argv[3]; c.setdefault("inbounds",[]).append({"listen":"0.0.0.0","port":p,"protocol":"dokodemo-door","tag":"xkit-tg-mtproto-relay","settings":{"address":"127.0.0.1","port":r,"network":"tcp"}}); c.setdefault("routing",{}).setdefault("rules",[]).insert(0,{"type":"field","inboundTag":["xkit-tg-mtproto-relay"],"outboundTag":tag}); print(json.dumps(c,separators=(",",":")))' "$pub" "$remote" "$tag")" || { err "cascade: не удалось собрать relay-конфиг (python3?)"; return 1; }
   master_xray_template_set "$merged"
 }
 
@@ -12987,33 +13006,36 @@ PY
 tgproxy_web_install() {
   local target="${1:-}" mode="${2:-}" hostname="${3:-}" carrier="${4:-websocket-lanes}" commit="${5:-}" sha="${6:-}" rec secret slug link lp cur merged arr
   [ -n "$target" ] && [[ "$mode" =~ ^(direct|cascade)$ ]] && tgproxy_valid_domain "${hostname:-}" || { err "tg-proxy web <нода> direct|cascade <hostname> [carrier] <pinned-commit> <archive-sha256>"; return 1; }
-  [[ "$carrier" =~ ^(https|https-lanes|websocket|websocket-lanes)$ ]] || return 1
+  [[ "$carrier" =~ ^(https|https-lanes|websocket|websocket-lanes)$ ]] || { err "Carrier должен быть https|https-lanes|websocket|websocket-lanes (получено: '${carrier}')"; return 1; }
   [[ "$commit" =~ ^[0-9a-f]{40}$ && "$sha" =~ ^[0-9a-f]{64}$ ]] || { err "Web Proxy требует pinned commit и SHA-256 архива; latest запрещён"; return 1; }
   [ "$mode" = cascade ] && [ "$target" != master ] || [ "$mode" = direct ] || { err "Cascade Web Proxy устанавливается на exit-ноду"; return 1; }
   tgproxy_load | jq -e --arg t "$target" 'all(.[];.type!="web" or .target!=$t)' >/dev/null || { err "Web Proxy для цели уже управляется XKIT"; return 1; }
-  load_xkit_env || return 1; rec="$(tgproxy_target_rec "$target")"; [ "$target" = master ] || [ -n "$rec" ] || return 1
+  load_xkit_env || { err "Не удалось загрузить окружение XKIT (xkit.env)"; return 1; }
+  rec="$(tgproxy_target_rec "$target")"
+  [ "$target" = master ] || [ -n "$rec" ] || { err "Нода '${target}' не найдена в XKIT. Проверьте имя: xkit nodes list (регистр важен)"; return 1; }
   secret="$(rand_hex 16)"; slug="$(head -c 10 /dev/urandom | base32 | tr 'A-Z' 'a-z')"
   if [ "$mode" = direct ]; then
     [ "$target" != master ] || { err "Direct Web Proxy на master используйте как cascade только с exit-нодой; не перехватываем существующий nginx"; return 1; }
     node_ssh "$rec" 'test "$(uname -m)" = x86_64 && ! ss -ltn | grep -Eq ":(80|443) " && ! systemctl is-active --quiet caddy && ! test -e /etc/caddy/Caddyfile' || { err "Direct Web Proxy требует выделенную x86_64 ноду без Caddy/сайтов и со свободными 80/443"; return 1; }
     [ -f /var/www/camo/index.html ] || { err "Direct: сначала создайте camo-сайт на master (/var/www/camo/index.html)"; return 1; }
     tar -C /var/www/camo -cf - . | node_ssh "$rec" 'install -d -m 755 /var/lib/xkit-tproxy-site && tar -C /var/lib/xkit-tproxy-site -xf -' || { err "Не удалось передать camo-сайт на direct-ноду"; return 1; }
-    tgproxy_web_remote_direct "$rec" "$hostname" "$secret" "$slug" "$carrier" "$commit" "$sha" || return 1
+    tgproxy_web_remote_direct "$rec" "$hostname" "$secret" "$slug" "$carrier" "$commit" "$sha" || { err "Удалённая установка Web Proxy на ноде не удалась (см. вывод выше)"; return 1; }
   else
-    tgproxy_web_remote_cascade "$rec" "$hostname" "$secret" "$slug" "$carrier" "$commit" "$sha" || return 1
-    lp="$(rand_free_port 31000 59000)" || { tgproxy_web_remote_uninstall "$rec"; return 1; }
-    cur="$(master_xray_template_get)" || { tgproxy_web_remote_uninstall "$rec"; return 1; }
-    merged="$(printf '%s' "$cur" | python3 -c 'import json,sys; c=json.load(sys.stdin); p=int(sys.argv[1]); tag=sys.argv[2]; c.setdefault("inbounds",[]).append({"listen":"127.0.0.1","port":p,"protocol":"dokodemo-door","tag":"xkit-tg-web-relay","settings":{"address":"127.0.0.1","port":8080,"network":"tcp"}}); c.setdefault("routing",{}).setdefault("rules",[]).insert(0,{"type":"field","inboundTag":["xkit-tg-web-relay"],"outboundTag":tag}); print(json.dumps(c,separators=(",",":")))' "$lp" "$(jq -r '.outbound_tag//("node-"+.name)' <<<"$rec")")" || { tgproxy_web_remote_uninstall "$rec"; return 1; }
-    if ! master_xray_template_set "$merged"; then tgproxy_web_remote_uninstall "$rec"; return 1; fi
+    tgproxy_web_remote_cascade "$rec" "$hostname" "$secret" "$slug" "$carrier" "$commit" "$sha" || { err "Удалённая установка Web Proxy (cascade) на ноде не удалась (см. вывод выше)"; return 1; }
+    lp="$(rand_free_port 31000 59000)" || { tgproxy_web_remote_uninstall "$rec"; err "Не удалось найти свободный порт для relay"; return 1; }
+    cur="$(master_xray_template_get)" || { tgproxy_web_remote_uninstall "$rec"; err "Не удалось прочитать Xray-шаблон мастера"; return 1; }
+    merged="$(printf '%s' "$cur" | python3 -c 'import json,sys; c=json.load(sys.stdin); p=int(sys.argv[1]); tag=sys.argv[2]; c.setdefault("inbounds",[]).append({"listen":"127.0.0.1","port":p,"protocol":"dokodemo-door","tag":"xkit-tg-web-relay","settings":{"address":"127.0.0.1","port":8080,"network":"tcp"}}); c.setdefault("routing",{}).setdefault("rules",[]).insert(0,{"type":"field","inboundTag":["xkit-tg-web-relay"],"outboundTag":tag}); print(json.dumps(c,separators=(",",":")))' "$lp" "$(jq -r '.outbound_tag//("node-"+.name)' <<<"$rec")")" || { tgproxy_web_remote_uninstall "$rec"; err "Не удалось собрать relay-конфиг мастера (python3/jq?)"; return 1; }
+    if ! master_xray_template_set "$merged"; then tgproxy_web_remote_uninstall "$rec"; err "Не удалось записать Xray-шаблон мастера"; return 1; fi
     routes_upsert "tg-web-${target}" relay tgweb "/${slug}/" "127.0.0.1:${lp}" "xkit-tg-web"
     if ! regen_conf_and_apply; then
       master_xray_template_set "$cur" >/dev/null 2>&1 || true; routes_del "tg-web-${target}"; regen_conf_and_apply >/dev/null 2>&1 || true
-      tgproxy_web_remote_uninstall "$rec"; return 1
+      tgproxy_web_remote_uninstall "$rec"; err "regen_conf_and_apply не удался — откатил Web Proxy"; return 1
     fi
   fi
   link="$(printf '%s' "$secret" | tgproxy_web_link "$hostname" "$slug")"
   arr="$(tgproxy_load | jq -c --arg t web --arg target "$target" --arg mode "$mode" --arg host "$hostname" --arg secret "$secret" --arg path "$slug" --arg carrier "$carrier" --arg link "$link" --arg commit "$commit" '. + [{type:$t,target:$target,mode:$mode,host:$host,public_port:443,secret:$secret,base_path:$path,carrier:$carrier,link:$link,commit:$commit,created:(now|floor)}]')"
   if ! printf '%s' "$arr" | tgproxy_save; then
+    err "Не удалось сохранить telegram-proxies.json (права/диск?) — откатываю Web Proxy"
     if [ "$mode" = cascade ]; then [ -z "${cur:-}" ] || master_xray_template_set "$cur" >/dev/null 2>&1 || true; routes_del "tg-web-${target}"; regen_conf_and_apply >/dev/null 2>&1 || true; tgproxy_web_remote_uninstall "$rec"; fi
     return 1
   fi
@@ -13113,9 +13135,9 @@ tgproxy_menu() {
   printf '%s\n' 'Telegram proxy: 1) MTProto FakeTLS  2) Web Proxy  3) Список  0) Назад'
   local a; read -r -p '> ' a || return 1
   case "$a" in
-    1) local t m p d pp; read -r -p 'Нода/master: ' t; read -r -p 'direct/cascade [direct]: ' m; read -r -p 'Порт: ' p; read -r -p 'FakeTLS domain: ' d; [ "$m" = cascade ] && read -r -p 'Public port мастера: ' pp; tgproxy_mtproto_install "$t" "${m:-direct}" "$p" "$d" "$pp" ;;
+    1) local t m p d pp=""; read -r -p 'Нода/master: ' t; read -r -p 'direct/cascade [direct]: ' m; read -r -p 'Порт: ' p; read -r -p 'FakeTLS domain: ' d; [ "$m" = cascade ] && read -r -p 'Public port мастера: ' pp; tgproxy_mtproto_install "$t" "${m:-direct}" "$p" "$d" "${pp:-}" ;;
     2) printf '%s\n' 'Нужны pinned commit и SHA-256 исходного архива telegramdesktop/tproxy-server.'; local t m h c co sh; read -r -p 'Нода: ' t; read -r -p 'direct/cascade: ' m; read -r -p 'Hostname: ' h; read -r -p 'Carrier [websocket-lanes]: ' c; read -r -p 'Commit: ' co; read -r -p 'SHA-256: ' sh; tgproxy_web_install "$t" "$m" "$h" "${c:-websocket-lanes}" "$co" "$sh" ;;
-    3) tgproxy_list ;; 0) return 0 ;; *) return 1 ;;
+    3) tgproxy_list ;; 0) return 0 ;; *) err "Неверный выбор: '${a}' (ожидается 1, 2, 3 или 0)"; return 1 ;;
   esac
 }
 
