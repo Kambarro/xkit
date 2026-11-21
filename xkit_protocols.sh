@@ -1,5 +1,5 @@
 #!/bin/bash
-# XKIT v9.3.0 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
+# XKIT v9.3.1 — профили доступа: REALITY/XHTTP через 3X-UI; AWG/Hy2 — отдельной
 # службой ИЛИ инбаундами панели (панельный режим v6.0.0, src/25_panel_protocols.sh).
 # v7.2.7: AmneziaWG 3.1 (Header Protection) в обоих режимах; панельный режим —
 # рекомендуемый путь для AWG (предлагается первым). Генератор параметров 3.1
@@ -371,7 +371,7 @@ proto_awg_tools_major() { # старший номер amneziawg-tools («v3.1.20
 # клиентский: S1-S4 и H1-H4 (must match), I1-I5, HeaderProtectionKey,
 # ContentPaddingAddition, тайминги и MTU. Единый список — новые ключи AWG
 # начинают наследоваться клиентами без правки proto_awg_add.
-PROTO_AWG_OBF_RE='^(Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|MTU) = '
+PROTO_AWG_OBF_RE='^(Jc|Jmin|Jmax|S1|S2|S3|S4|H1|H2|H3|H4|I1|I2|I3|I4|I5|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies|MTU) = '
 proto_awg_obf_block() { # $1 конфиг сервера -> блок обфускации в stdout
   grep -E "$PROTO_AWG_OBF_RE" "$1" 2>/dev/null || true
 }
@@ -413,6 +413,7 @@ RekeyTimeout = ${AWG31_RT}
 RejectAfterTime = ${AWG31_RJT}
 KeepaliveTimeout = ${AWG31_KAT}
 MaxHandshakeAttempts = ${AWG31_MHA}
+RandomTrailers = on
 EOF
 )"
   tmp="$(mktemp /tmp/.xkit-awg31.XXXXXX)" || return 1
@@ -562,6 +563,7 @@ RekeyTimeout = ${AWG31_RT}
 RejectAfterTime = ${AWG31_RJT}
 KeepaliveTimeout = ${AWG31_KAT}
 MaxHandshakeAttempts = ${AWG31_MHA}
+RandomTrailers = on
 EOF
   else
     cat >>"$tmp" <<EOF

@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.3.0"
+XKIT_VERSION="9.3.1"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -10201,10 +10201,15 @@ xray_wg_pair() { # -> "priv pub"
 #    <= 20 c — под 25 c PersistentKeepalive и NAT-таймауты UDP;
 #  * ContentPaddingAddition: суммарный паддинг <= 64 (едет в полноразмерных
 #    транспортных пакетах в том же MTU-запасе, что ограничивает S4);
-#  * RandomTrailers/DisableCookies ВЫКЛЮЧЕНЫ: RandomTrailers двусторонний и
-#    (до апстрим-фикса классификатора) режет пропускную способность в десятки
-#    раз; DisableCookies ломает cookie-защиту от флуда рукопожатиями.
-#    Отсутствие строки = «выключено», и парсер до 3.1 не спотыкается.
+#  * RandomTrailers ВКЛЮЧЁН (v9.3.1): при H1-H4=1/2/3/4 (одиночные значения,
+#    ширина 0) баг классификатора amneziawg-go#186 НЕ проявляется — транспортные
+#    пакеты не попадают в handshake-ветки. Подтверждено живьём на мастере
+#    (2.2 ГБ трафика, 0 invalid mac1) и 3x-ui#6303 (H=1/2/3/4 + RandomTrailers=on
+#    работает без деградации). Двусторонний: сервер и клиент обязаны совпадать —
+#    генератор пишет randomTrailers:true и в серверный инбаунд, и в клиентскую
+#    ссылку (рендер src/09). Защита handshake от поведенческого ИИ-анализа.
+#  * DisableCookies ВЫКЛЮЧЕН: cookie-защита от флуда рукопожатиями сохраняется
+#    (решение владельца). Отсутствие строки = «выключено», парсер до 3.1 не спотыкается.
 awg31_ri() { local lo="$1" hi="$2"; [ "$hi" -gt "$lo" ] 2>/dev/null || { printf '%s' "$lo"; return; }; printf '%s' "$((RANDOM % (hi - lo + 1) + lo))"; }
 awg31_hpk() { # 32 байта base64 — формат HeaderProtectionKey (как awg genkey)
   if command -v openssl >/dev/null 2>&1; then openssl rand -base64 32; else head -c 32 /dev/urandom | base64; fi
@@ -10304,7 +10309,7 @@ proto_core_supports() { # $1 hysteria|amneziawg, $2 file = проверить fi
           headerProtectionKey:$hpk,contentPaddingAddition:$cpa,
           rekeyAfterTime:$rkat,rekeyTimeout:$rt,rejectAfterTime:$rjt,
           keepaliveTimeout:$kat,maxHandshakeAttempts:$mha,
-          randomTrailers:false,disableCookies:false},
+          randomTrailers:true,disableCookies:false},
           clients:[{email:$probe,enable:true,publicKey:$pub,allowedIPs:["10.8.9.2/32"]}]}')"
       stream='{}' ;;
     *) return 1 ;;
@@ -10458,7 +10463,7 @@ proto_panel_awg_ib() { # $1 порт, $2 clientJSON, $3 профиль: 31|class
               headerProtectionKey:$hpk, contentPaddingAddition:$cpa,
               rekeyAfterTime:$rkat, rekeyTimeout:$rt, rejectAfterTime:$rjt,
               keepaliveTimeout:$kat, maxHandshakeAttempts:$mha,
-              randomTrailers:false, disableCookies:false},
+              randomTrailers:true, disableCookies:false},
       clients:(if $c == {} then [] else [$c] end)}')"
   else
     local jc jmin jmax s1 s2 h1 h2 h3 h4
@@ -14765,9 +14770,9 @@ _tg_kb() { # stdin: массив рядов кнопок -> reply_markup json
 tg_bot_main_menu() { # -> reply_markup json
   jq -nc '[
     [{text:"👥 Пользователи",callback_data:"m:users"},{text:"🖥 Ноды",callback_data:"m:nodes"}],
-    [{text:"⏰ Сроки аренды",callback_data:"m:expiry"},{text:"📊 Статус",callback_data:"m:status"}],
-    [{text:"🛠 Обслуживание",callback_data:"m:service"},{text:"🧪 Тестирование",callback_data:"m:testing"}],
-    [{text:"🔀 Транспорт TG",callback_data:"m:transport"}]
+    [{text:"🔌 Протоколы",callback_data:"m:protocols"},{text:"⏰ Сроки аренды",callback_data:"m:expiry"}],
+    [{text:"📊 Статус",callback_data:"m:status"},{text:"🛠 Обслуживание",callback_data:"m:service"}],
+    [{text:"🧪 Тестирование",callback_data:"m:testing"},{text:"🔀 Транспорт TG",callback_data:"m:transport"}]
   ]' | _tg_kb
 }
 
@@ -14840,11 +14845,19 @@ tg_bot_user_card() { # $1 chat, $2 email
   local txt="👤 ${email}
 Трафик: $(numfmt --to=iec "$total" 2>/dev/null || echo "$total B")
 Срок: ${exp:-не задан}${days:+ (${days} дн.)}"
+  # v9.3.1: статус вкл/выкл + кнопка переключения (блокировка без удаления)
+  local en_all
+  en_all="$(jq -r --arg e "$email" '[.[]?|(.settings|if type=="string" then fromjson? else . end|.clients[]?)|select(.email==$e)|(.enable != false)]|if length>0 and all then "true" else "false" end' <<<"$inbounds" 2>/dev/null)"
+  local en_label="🔴 выкл" en_cb="uen:${email}:true"
+  [ "$en_all" = "true" ] && { en_label="🟢 вкл"; en_cb="uen:${email}:false"; }
+  txt="${txt}
+Статус: ${en_label}"
   local kb
-  kb="$(jq -nc --arg e "$email" '[
+  kb="$(jq -nc --arg e "$email" --arg en "$en_cb" --arg el "$en_label" '[
     [{text:"🔗 Подписка",callback_data:("sub:"+$e)},{text:"🔄 Сброс трафика",callback_data:("reset:"+$e)}],
-    [{text:"📅 Продлить",callback_data:("exp:"+$e)},{text:"🗑 Удалить",callback_data:("del:"+$e)}],
-    [{text:"👥 К списку",callback_data:"m:users"},{text:"🏠 Меню",callback_data:"m:main"}]
+    [{text:$el,callback_data:$en},{text:"📅 Продлить",callback_data:("exp:"+$e)}],
+    [{text:"🗑 Удалить",callback_data:("del:"+$e)},{text:"👥 К списку",callback_data:"m:users"}],
+    [{text:"🏠 Меню",callback_data:"m:main"}]
   ]' | _tg_kb)"
   tg_bot_reply "$1" "$txt" "$kb"
 }
@@ -14886,6 +14899,8 @@ tg_bot_node_card() { # $1 chat, $2 name
     [{text:"🔀 Транспорт",callback_data:("nt:"+$n)},{text:"🧊 Freeze",callback_data:("nf:"+$n)}],
     [{text:"🔐 Серт",callback_data:("nc:"+$n)},{text:"🛡 UFW",callback_data:("nu:"+$n)}],
     [{text:"🎭 Camo",callback_data:("nm:"+$n)},{text:"🙈 Hide",callback_data:("nh:"+$n)}],
+    [{text:"🔧 Repair",callback_data:("nr:"+$n)},{text:"🔑 Relogin",callback_data:("nl:"+$n)}],
+    [{text:"🩺 Check",callback_data:("nk:"+$n)},{text:"📈 Метрики",callback_data:("nmt:"+$n)}],
     [{text:"📅 Продлить аренду",callback_data:("ne:"+$n)},{text:"⬆️ Обновить",callback_data:("nup:"+$n)}],
     [{text:"🖥 К списку",callback_data:"m:nodes"},{text:"🏠 Меню",callback_data:"m:main"}]
   ]' | _tg_kb)"
@@ -14978,10 +14993,65 @@ tg_bot_service_menu() { # $1 chat
   kb="$(jq -nc '[
     [{text:"💾 Бэкап",callback_data:"s:backup"},{text:"📜 Аудит",callback_data:"s:audit"}],
     [{text:"🩺 Health",callback_data:"s:health"},{text:"🔄 Обновить XKIT",callback_data:"s:update"}],
-    [{text:"⚖️ Стратегия",callback_data:"s:strategy"},{text:"🔁 Перезапустить всё",callback_data:"s:restart"}],
+    [{text:"⚖️ Стратегия",callback_data:"s:strategy"},{text:"🎭 Отпечаток TLS",callback_data:"s:fp"}],
+    [{text:"🔗 Пересобрать подписки",callback_data:"s:sub"},{text:"🔁 Перезапустить всё",callback_data:"s:restart"}],
     [{text:"🔄 Ребут сервера",callback_data:"s:reboot"},{text:"🏠 Меню",callback_data:"m:main"}]
   ]' | _tg_kb)"
   tg_bot_reply "$1" "🛠 Обслуживание:" "$kb"
+}
+
+# --- протоколы: список с вкл/выкл (v9.3.1) ---
+tg_bot_protocols_list() { # $1 chat
+  load_xkit_env >/dev/null 2>&1 || true
+  kit_session >/dev/null 2>&1 || { tg_bot_reply "$1" "Нет сессии панели" "$(tg_bot_main_menu)"; return; }
+  local rows='[]' ib id proto port en label
+  while IFS= read -r ib; do
+    [ -z "$ib" ] && continue
+    is_pool_inbound "$ib" && continue
+    id="$(jq -r '.id' <<<"$ib")"
+    proto="$(jq -r '.protocol' <<<"$ib")"
+    port="$(jq -r '.port' <<<"$ib")"
+    en="$(jq -r '(.enable != false)' <<<"$ib")"
+    label="${proto}:${port}"
+    if [ "$en" = "true" ]; then
+      rows="$(jq -c --arg t "🟢 $label" --arg d "ptg:${id}:false" '. + [[{text:$t,callback_data:$d}]]' <<<"$rows")"
+    else
+      rows="$(jq -c --arg t "🔴 $label" --arg d "ptg:${id}:true" '. + [[{text:$t,callback_data:$d}]]' <<<"$rows")"
+    fi
+  done < <(jq -c '.[]' <<<"${INBOUNDS:-[]}")
+  rows="$(jq -c '. + [[{text:"🏠 Меню",callback_data:"m:main"}]]' <<<"$rows")"
+  tg_bot_reply "$1" "🔌 Протоколы (нажмите чтобы вкл/выкл; выкл = уходит из подписок, в панели остаётся):" "$(jq -nc --argjson r "$rows" '{inline_keyboard:$r}')"
+}
+
+# --- отпечаток TLS (v9.3.1, аналог стратегии) ---
+tg_bot_fp_menu() { # $1 chat
+  load_xkit_env >/dev/null 2>&1 || true
+  local kb
+  kb="$(jq -nc '[
+    [{text:"chrome",callback_data:"fp:chrome"},{text:"firefox",callback_data:"fp:firefox"},{text:"safari",callback_data:"fp:safari"}],
+    [{text:"ios",callback_data:"fp:ios"},{text:"android",callback_data:"fp:android"},{text:"edge",callback_data:"fp:edge"}],
+    [{text:"random",callback_data:"fp:random"},{text:"randomized",callback_data:"fp:randomized"}],
+    [{text:"randomizednoalpn",callback_data:"fp:randomizednoalpn"},{text:"🏠 Меню",callback_data:"m:main"}]
+  ]' | _tg_kb)"
+  tg_bot_reply "$1" "🎭 Отпечаток TLS (uTLS, текущий: $(xkit_fp)).
+Смена для ВСЕХ протоколов + пересборка подписок/туннелей.
+chrome/firefox/safari гарантированы для REALITY. random/randomized — крайняя мера (баг xray #6714 может ломать handshake)." "$kb"
+}
+
+tg_bot_set_fp() { # $1 chat, $2 fp
+  load_xkit_env >/dev/null 2>&1 || true
+  local fp="$2"
+  xkit_fp_valid "$fp" || { tg_bot_reply "$1" "Неизвестный отпечаток: $fp" "$(tg_bot_main_menu)"; return; }
+  local old; old="$(xkit_fp)"
+  if [ "$fp" = "$old" ]; then tg_bot_reply "$1" "🎭 Отпечаток уже '$fp'" "$(tg_bot_main_menu)"; return; fi
+  XKIT_FP="$fp"; save_xkit_env >/dev/null 2>&1
+  sub_regen_quiet >/dev/null 2>&1 || true
+  if [ -s "$XKIT_NODES" ] && [ "$(nodes_load 2>/dev/null | jq 'length' 2>/dev/null || echo 0)" -gt 0 ]; then
+    nodes_repair >/dev/null 2>&1 || true
+  fi
+  local warn=""
+  case "$fp" in randomized|randomizednoalpn) warn=" ⚠️ Крайняя мера: баг xray #6714 может ломать REALITY на некоторых запусках.";; random) warn=" ⚠️ Случайный браузер на запуск клиента.";; esac
+  tg_bot_reply "$1" "🎭 Отпечаток TLS: $old -> $fp (подписки пересобраны).$warn" "$(tg_bot_main_menu)"
 }
 
 # --- тестирование сервера (меню, v8.3.0) ---
@@ -15013,6 +15083,7 @@ tg_bot_handle_callback() { # $1 callback-json
     m:main) tg_bot_show_main "$cid" ;;
     m:users) tg_bot_users_list "$cid" ;;
     m:nodes) tg_bot_nodes_list "$cid" ;;
+    m:protocols) tg_bot_protocols_list "$cid" ;;
     m:status) tg_bot_status "$cid" ;;
     m:expiry) tg_bot_expiry "$cid" ;;
     m:service) tg_bot_service_menu "$cid" ;;
@@ -15029,6 +15100,10 @@ tg_bot_handle_callback() { # $1 callback-json
     ne:*) tg_bot_reply "$cid" "Продлить аренду ноды: /expire node ${data#ne:} <DD.MM.YYYY>" ;;
     nt:*) tg_bot_node_transport "$cid" "${data#nt:}" ;;
     nf:*) tg_bot_run_long "$cid" "freeze-${data#nf:}" "${XKIT_BIN} nodes freeze ${data#nf:}" "freeze ${data#nf:}" ;;
+    nr:*) tg_bot_run_long "$cid" "repair-${data#nr:}" "${XKIT_BIN} nodes repair ${data#nr:}" "repair ${data#nr:}" ;;
+    nl:*) tg_bot_run_long "$cid" "relogin-${data#nl:}" "${XKIT_BIN} nodes relogin ${data#nl:}" "relogin ${data#nl:}" ;;
+    nk:*) tg_bot_run_long "$cid" "check-${data#nk:}" "${XKIT_BIN} nodes check ${data#nk:} --deep" "check ${data#nk:}" ;;
+    nmt:*) tg_bot_run_long "$cid" "metrics-${data#nmt:}" "${XKIT_BIN} nodes metrics" "метрики нод" ;;
     t:bench) tg_bot_confirm "$cid" "test-bench" "Паспорт VPS (bench) на мастере: нагрузка ~6 ГБ на диск + канал на 100%" ;;
     t:ipregion) tg_bot_confirm "$cid" "test-ipregion" "Геолокация IP (ipregion) на мастере: IP засветится ~45 сервисам" ;;
     t:freeze) tg_bot_run_long "$cid" "test-freeze" "${XKIT_BIN} test freeze all" "заморозка ТСПУ (все ноды)" ;;
@@ -15045,6 +15120,11 @@ tg_bot_handle_callback() { # $1 callback-json
     s:health) tg_bot_run_long "$cid" "health" "${XKIT_BIN} health" "health" ;;
     s:update) tg_bot_confirm "$cid" "update" "Обновить XKIT" ;;
     s:strategy) tg_bot_strategy_menu "$cid" ;;
+    s:fp) tg_bot_fp_menu "$cid" ;;
+    fp:*) tg_bot_set_fp "$cid" "${data#fp:}" ;;
+    s:sub) tg_bot_run_long "$cid" "sub" "${XKIT_BIN} sub -q" "пересборка подписок" ;;
+    ptg:*) local _rest="${data#ptg:}" _pid="${_rest%%:*}" _pen="${_rest#*:}"; tg_bot_confirm "$cid" "ptg:${_pid}:${_pen}" "Переключить протокол #${_pid} -> $([ "$_pen" = true ] && echo ВКЛ || echo ВЫКЛ)" ;;
+    uen:*) local _rest="${data#uen:}" _ue="${_rest%:*}" _uen="${_rest##*:}"; tg_bot_confirm "$cid" "uen:${_ue}:${_uen}" "Переключить пользователя ${_ue} -> $([ "$_uen" = true ] && echo ВКЛ || echo ВЫКЛ)" ;;
     s:restart) tg_bot_confirm "$cid" "restart" "Перезапустить 3X-UI/Xray/nginx (соединения кратковременно оборвутся)" ;;
     s:reboot) tg_bot_confirm "$cid" "reboot" "Перезагрузить сервер ЦЕЛИКОМ (доступ пропадёт на 1-3 минуты)" ;;
     sv:*) tg_bot_run_long "$cid" "survey-${data#sv:}" "${XKIT_BIN} nodes profile survey ${data#sv:}" "survey ${data#sv:}" ;;
@@ -15076,6 +15156,8 @@ tg_bot_do_confirm() { # $1 chat, $2 action-key
     restart) tg_bot_run_long "$chat" "restart" "${XKIT_BIN} services restart --yes" "перезапуск стека (чек придёт отдельно)" ;;
     reboot) tg_bot_run_long "$chat" "reboot" "${XKIT_BIN} services reboot --yes" "ребут сервера (чек придёт после загрузки)" ;;
     update) tg_bot_run_long "$chat" "update" "${XKIT_BIN} update" "обновление XKIT" ;;
+    ptg:*) local _prest _pid _pen; _prest="${key#ptg:}"; _pid="${_prest%%:*}"; _pen="${_prest#*:}"; load_xkit_env >/dev/null 2>&1; kit_session >/dev/null 2>&1; api_set_inbound_enable "$_pid" "$_pen" >/dev/null 2>&1; regen_conf_and_apply >/dev/null 2>&1 || true; sub_regen_quiet >/dev/null 2>&1 || true; tg_bot_reply "$chat" "🔌 Протокол #${_pid} -> $([ "$_pen" = true ] && echo ВКЛ || echo ВЫКЛ) (подписки обновлены)" "$(tg_bot_main_menu)" ;;
+    uen:*) local _urest _ue _uen; _urest="${key#uen:}"; _ue="${_urest%:*}"; _uen="${_urest##*:}"; client_set_enable "$_ue" "$_uen" >/dev/null 2>&1; tg_bot_reply "$chat" "👤 Пользователь ${_ue} -> $([ "$_uen" = true ] && echo ВКЛ || echo ВЫКЛ)" "$(tg_bot_main_menu)" ;;
     test-bench) XKIT_YES=1 tg_bot_run_long "$chat" "test-bench" "XKIT_YES=1 ${XKIT_BIN} test bench master" "паспорт VPS (bench)" ;;
     test-ipregion) XKIT_YES=1 tg_bot_run_long "$chat" "test-ipregion" "XKIT_YES=1 ${XKIT_BIN} test ipregion master" "геолокация IP (ipregion)" ;;
     *) tg_bot_reply "$chat" "Действие не распознано" "$(tg_bot_main_menu)" ;;
