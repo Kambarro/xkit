@@ -16,7 +16,7 @@
 set -u -o pipefail
 export LC_ALL=C
 
-XKIT_VERSION="9.3.4"
+XKIT_VERSION="9.3.5"
 # v6.0.0 (по образцу 3X-UI_KIT): рекомендованное закреплённое ядро Xray панели
 # (26.6.27 — последняя проверенная в их тест-матрице «протокол × клиент»;
 # более новые ломали клиентов на sing-box). Меняется: xkit core-pin <версия>
@@ -6224,36 +6224,58 @@ rules = r.get("rules") or []
 rules = [x for x in rules if x.get("balancerTag") != "XKIT_POOL"]
 rules = [x for x in rules if not (x.get("outboundTag") == "direct"
          and "geosite:category-ru" in x.get("domain", []) and "geoip:ru" in x.get("ip", []))]
-# существующие RU direct-правила (кастомные ext: или стандартные) сохраняем
-ru_ip = [x for x in rules if x.get("outboundTag") == "direct" and x.get("ip") and not x.get("domain")]
-ru_dom = [x for x in rules if x.get("outboundTag") == "direct" and x.get("domain") and not x.get("ip")]
-# если RU-правил нет вовсе (свежая установка) — ставим дефолт как в рабочем конфиге
-if not ru_ip:
-    ru_ip = [{"type": "field", "outboundTag": "direct", "ip": ["ext:geoip_RU.dat:ru"]}]
-if not ru_dom:
-    ru_dom = [{"type": "field", "outboundTag": "direct",
-               "domain": ["ext:geosite_RU.dat:ru-available-only-inside",
-                          "regexp:.*\\.ru$", "regexp:.*\\.su$", ".рф"]}]
+# v9.3.5 (УРОК: соло за рубежом НЕ должен получать каскадные RU-split правила):
+# RU-правила (geoip_RU/geosite_RU → direct) нужны ТОЛЬКО для КАСКАДА с РФ-мастера
+# (РФ-сайты напрямую с РФ-IP, остальное через зарубежную ноду). На СОЛО-мастере
+# за рубежом (FI/NL/...) эти правила ВРЕДНЫ: РФ-сайты (ru-available-only-inside)
+# видят зарубежный IP мастера и блокируются («доступно только из РФ»). Баг друга:
+# соло FI получил каскадный шаблон → РФ-сайты не открывались. ФИКС: RU-split
+# только если есть ноды (каскад); соло → без RU-правил, весь трафик direct.
+_cascade = bool(pool_tag and nodes)
+if _cascade:
+    # существующие RU direct-правила (кастомные ext: или стандартные) сохраняем
+    ru_ip = [x for x in rules if x.get("outboundTag") == "direct" and x.get("ip") and not x.get("domain")]
+    ru_dom = [x for x in rules if x.get("outboundTag") == "direct" and x.get("domain") and not x.get("ip")]
+    # если RU-правил нет вовсе (свежая установка) — ставим дефолт как в рабочем конфиге
+    if not ru_ip:
+        ru_ip = [{"type": "field", "outboundTag": "direct", "ip": ["ext:geoip_RU.dat:ru"]}]
+    if not ru_dom:
+        ru_dom = [{"type": "field", "outboundTag": "direct",
+                   "domain": ["ext:geosite_RU.dat:ru-available-only-inside",
+                              "regexp:.*\\.ru$", "regexp:.*\\.su$", ".рф"]}]
+else:
+    # соло: RU-split не нужен, убираем любые RU-правила (каскадное наследие)
+    ru_ip = []
+    ru_dom = []
+    rules = [x for x in rules if not (x.get("outboundTag") == "direct"
+             and (("geoip_RU" in ",".join(map(str, x.get("ip", [])))
+                   or "geoip:ru" in x.get("ip", []))
+                  or ("geosite_RU" in ",".join(map(str, x.get("domain", [])))
+                      or "ru-available-only-inside" in ",".join(map(str, x.get("domain", []))))))]
 # порядок (рабочий тест-конфиг): api -> RU-IP -> RU-домены -> каскад -> private -> catch-all
 api_rules = [x for x in rules if x.get("inboundTag") == ["api"] or x.get("outboundTag") == "api"]
 if not api_rules:
     api_rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
-private_rules = [x for x in rules if x.get("ip") == ["geoip:private"]]
-other = [x for x in rules if x not in api_rules and x not in ru_ip
-         and x not in ru_dom and x not in private_rules
-         and not (not x.get("inboundTag") and not x.get("domain") and not x.get("ip")
-                  and x.get("outboundTag") in ("direct", "blocked")
-                  and (x.get("port") == "0-65535" or not x.get("port")))]
-new_rules = api_rules + ru_ip + ru_dom
-if pool_tag and nodes:
+if not _cascade:
+    # v9.3.5 (владелец): СОЛО = стандартный просто direct. Никаких лишних правил
+    # (RU-split/private-block не нужны) — только api (для gRPC) + direct catch-all.
+    # Xray без правил и так шлёт всё в direct; оставляем минимальный стандартный набор.
+    r["rules"] = api_rules + [{"type": "field", "port": "0-65535", "outboundTag": "direct"}]
+else:
+    private_rules = [x for x in rules if x.get("ip") == ["geoip:private"]]
+    other = [x for x in rules if x not in api_rules and x not in ru_ip
+             and x not in ru_dom and x not in private_rules
+             and not (not x.get("inboundTag") and not x.get("domain") and not x.get("ip")
+                      and x.get("outboundTag") in ("direct", "blocked")
+                      and (x.get("port") == "0-65535" or not x.get("port")))]
+    new_rules = api_rules + ru_ip + ru_dom
     # каскад ПОСЛЕ RU-правил: RU отсекается в direct до balancer, не-RU -> ноды
     cascade_tags = [pool_tag] + [t for t in client_tags if t != pool_tag]
     new_rules.append({"type": "field", "inboundTag": cascade_tags, "balancerTag": "XKIT_POOL"})
-new_rules += other + private_rules
-# catch-all: каскад -> blocked (не-RU вне каскада не утекает с РФ-IP), соло -> direct
-_catch = "blocked" if (pool_tag and nodes) else "direct"
-new_rules.append({"type": "field", "port": "0-65535", "outboundTag": _catch})
-r["rules"] = new_rules
+    new_rules += other + private_rules
+    # catch-all каскада -> blocked (не-RU вне каскада не утекает с РФ-IP)
+    new_rules.append({"type": "field", "port": "0-65535", "outboundTag": "blocked"})
+    r["rules"] = new_rules
 
 bal = r.get("balancers") or []
 # v9.2.4: сохраняем СУЩЕСТВУЮЩИЙ XKIT_POOL (стратегия + settings maxRTT/baselines/
@@ -7487,7 +7509,8 @@ pool_remove_force() { # без вопросов — для nodes_del и меню
   # 3) пересобрать nginx и подписки: ссылки пула исчезают — клиенты должны
   # обновить подписку (она обновится сама при следующем запросе клиента)
   regen_conf_and_apply || { err "Конфиг nginx не применился — выполните: xkit nodes repair"; return 1; }
-  # v7.7.1: соло-режим — routing без pool, но RU->direct остаётся
+  # v7.7.1→9.3.5: соло-режим — routing минимальный (api + direct), RU-split убирается
+  # (каскадные RU-правила на соло за рубежом ломали РФ-сайты — баг друга)
   nodes_apply_template || warn "Routing мастера не обновился — повторите: xkit nodes repair"
   sub_regen_quiet || true
   warn "Ссылки пула исчезли из подписок — клиентам нужно обновить подписку (происходит автоматически)"
